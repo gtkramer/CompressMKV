@@ -18,8 +18,14 @@ public static class RestoreFilters
             ContentType.Progressive => ("", null),
 
             // §7.2.3.2: fieldmatch is ffmpeg's equivalent of MPlayer's pullup.
-            // decimate drops the duplicate frame from each 5-frame cycle → 24000/1001.
-            ContentType.Telecined => ($"fieldmatch=order={p},decimate", "24000/1001"),
+            // combmatch=full checks every frame for residual combing (default sc only
+            // checks at scene changes).  An intermediate bwdif with deint=interlaced
+            // cleans up any frames fieldmatch couldn't cleanly match — progressive
+            // frames pass through untouched.  decimate drops the duplicate frame from
+            // each 5-frame cycle → 24000/1001.
+            ContentType.Telecined =>
+                ($"fieldmatch=order={p}:combmatch=full,bwdif=mode=send_frame:parity={p}:deint=interlaced,decimate",
+                 "24000/1001"),
 
             // §7.2.3.3: bwdif is a motion-adaptive deinterlacer (successor to yadif).
             // send_frame mode: one output frame per input frame, preserving native fps.
@@ -27,7 +33,10 @@ public static class RestoreFilters
 
             // §7.2.3.4: fieldmatch handles both progressive and telecined frames.
             // Progressive frames pass through; telecined frames get field-matched.
-            ContentType.MixedProgressiveTelecine => ($"fieldmatch=order={p},decimate", "24000/1001"),
+            // Same IVTC chain as §7.2.3.2 — bwdif cleanup + combmatch=full.
+            ContentType.MixedProgressiveTelecine =>
+                ($"fieldmatch=order={p}:combmatch=full,bwdif=mode=send_frame:parity={p}:deint=interlaced,decimate",
+                 "24000/1001"),
 
             // §7.2.3.5: Deinterlace everything. Progressive frames pass through bwdif
             // with minimal degradation (motion-adaptive → no combing detected → passthrough).
@@ -46,7 +55,9 @@ public static class RestoreFilters
 
         return mode switch
         {
-            RestoreMode.Ivtc => ($"fieldmatch=order={p},decimate", "24000/1001"),
+            RestoreMode.Ivtc =>
+                ($"fieldmatch=order={p}:combmatch=full,bwdif=mode=send_frame:parity={p}:deint=interlaced,decimate",
+                 "24000/1001"),
             RestoreMode.Deinterlace => ($"bwdif=mode=send_frame:parity={p}", null),
             _ => ("", null),
         };

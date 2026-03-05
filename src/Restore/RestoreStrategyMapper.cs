@@ -25,9 +25,9 @@ public static class RestoreStrategyMapper
                 "Per MPlayer guide §7.2.3.1: encode at native frame rate.",
 
             // §7.2.3.2: Telecine can be reversed via inverse-telecine.
-            // fieldmatch (ffmpeg's pullup equivalent) + decimate → 24000/1001 fps.
+            // fieldmatch (ffmpeg's pullup equivalent) + cleanup bwdif + decimate → 24000/1001 fps.
             ContentType.Telecined =>
-                "Hard telecine: IVTC via fieldmatch+decimate to recover original 24p. " +
+                "Hard telecine: IVTC via fieldmatch+bwdif(cleanup)+decimate to recover original 24p. " +
                 "Per MPlayer guide §7.2.3.2: inverse telecine recovers 24000/1001.",
 
             // §7.2.3.3: Interlaced content — deinterlace with bwdif (motion-adaptive).
@@ -39,7 +39,7 @@ public static class RestoreStrategyMapper
             // §7.2.3.4: Mixed progressive+telecine — pullup/fieldmatch handles both.
             // Progressive frames pass through unmodified; telecined sections get matched.
             ContentType.MixedProgressiveTelecine =>
-                "Mixed progressive+telecine: fieldmatch+decimate handles both. " +
+                "Mixed progressive+telecine: fieldmatch+bwdif(cleanup)+decimate handles both. " +
                 "Per MPlayer guide §7.2.3.4: pullup/fieldmatch leaves progressive data " +
                 "alone and inverse-telecines the telecined sections. Output 24000/1001.",
 
