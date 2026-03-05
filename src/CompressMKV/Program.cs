@@ -109,7 +109,6 @@ public static class Program
                 var summary = await ProcessOneAsync(cfg, gpu, file, cts.Token);
                 overall.Videos.Add(summary);
 
-                Console.WriteLine($"  SourceType: {summary.SourceType}");
                 Console.WriteLine($"  HDR: {summary.IsHdr}");
 
                 if (summary.ContentDetection != null)
@@ -167,7 +166,6 @@ public static class Program
         var vstream = probe.Streams?.FirstOrDefault(s => s.CodecType == "video")
                      ?? throw new InvalidOperationException("No video stream found.");
 
-        var sourceType = SourceClassifier.Classify(vstream);
         bool isHdr = SourceClassifier.IsHdr(vstream);
 
         ContentDetectionResult? detection = null;
@@ -231,7 +229,6 @@ public static class Program
             FinalOutputPath = finalOut,
             GeneratedUtc = DateTime.UtcNow,
             Probe = probe,
-            SourceType = sourceType,
             IsHdr = isHdr,
             ContentDetection = detection,
             Restore = restore,

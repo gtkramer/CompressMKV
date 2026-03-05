@@ -8,7 +8,6 @@ public sealed class VideoSummary
     public DateTime GeneratedUtc { get; set; }
 
     public FfprobeRoot? Probe { get; set; }
-    public SourceType SourceType { get; set; }
     public bool IsHdr { get; set; }
 
     public ContentDetectionResult? ContentDetection { get; set; }
