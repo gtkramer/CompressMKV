@@ -1,6 +1,11 @@
 // Program.cs
 // Build: dotnet build
-// Run:   dotnet run -- --input /path/to/mkvs --output /path/to/out --vmaf-model /path/to/vmaf_4k_v0.6.1.json
+// Run:   dotnet run -- --input /path/to/mkvs --output /path/to/out [--vmaf-model-dir /usr/share/model]
+//
+// VMAF models:
+//   On Arch Linux: sudo pacman -S vmaf
+//   Models installed to /usr/share/model/ (vmaf_v0.6.1.json, vmaf_4k_v0.6.1.json).
+//   Standard model used for ≤1080p; 4K model for ≥3840×2160 — selected automatically.
 //
 // Content type detection follows the five NTSC DVD categories from MPlayer guide §7.2:
 //   http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-telecine.html
@@ -13,6 +18,12 @@
 //                            fieldmatch+decimate handles both (progressive passes through).
 //   5. Mixed prog+interlaced — Some sections progressive, some natively interlaced.
 //                            Deinterlace all as a compromise.
+//
+// VMAF-guided tuning pipeline:
+//   Phase 1: Extract lossless FFV1 reference clips with restored cadence (fast seek).
+//   Phase 2: Encode each at candidate CQ levels (high→low, early termination).
+//   VMAF measured per-frame across all samples for robust percentile computation.
+//   Thresholds: mean ≥ 97, p05 ≥ 95 (virtually imperceptible at close viewing).
 //
 // Detection approach (single-pass per-frame):
 //   One ffmpeg call decodes the entire file with idet + metadata=print,
@@ -41,7 +52,7 @@ public static class Program
         string? output = GetArg(args, "--output");
         if (string.IsNullOrWhiteSpace(input))
         {
-            Console.WriteLine("Usage: compress-mkv --input <folder> [--output <folder>] [--vmaf-model <path>]");
+            Console.WriteLine("Usage: compress-mkv --input <folder> [--output <folder>] [--vmaf-model-dir <path>]");
             return 2;
         }
 
@@ -51,30 +62,35 @@ public static class Program
             OutputFolder = output ?? "./out",
             Ffmpeg = "ffmpeg",
             Ffprobe = "ffprobe",
-            VmafModelPath = GetArg(args, "--vmaf-model") ?? "./vmaf_4k_v0.6.1.json",
+
+            // VMAF model directory — auto-selects standard vs 4K based on source resolution.
+            // On Arch Linux: sudo pacman -S vmaf → models at /usr/share/model/
+            VmafModelDir = GetArg(args, "--vmaf-model-dir") ?? "/usr/share/model",
 
             // RTX 5080 scheduling model
             NvencSlots = 2,
             NvdecSlots = 2,
 
-            // VMAF tuning
-            CandidateCq = new() { 16, 18, 20, 22, 24, 26 },
-            SampleCount = 12,
-            SampleWindowSeconds = 8,
+            // VMAF tuning — stratified random sampling + per-frame score aggregation
+            CandidateCq = [16, 18, 20, 22, 24, 26],
+            SampleCount = 16,
+            SampleWindowSeconds = 12,
             RandomSeed = 12345,
-            TargetMeanVmaf = 95.0,
-            TargetP05Vmaf = 92.0,
+
+            // Frame-level VMAF thresholds for imperceptible quality loss.
+            // Calibrated for 27" 16:9 at 2-3 ft and 65" 16:9 at 8-12 ft.
+            TargetMeanVmaf = 97.0,
+            TargetP05Vmaf = 95.0,
 
             // HDR CQ ladder shift (effective CQ = base CQ - delta)
             HdrApplyCqLadderShift = true,
             HdrCqLadderDelta = 2,
             MinCq = 0,
 
-            // NVENC settings
+            // NVENC AV1 — highest quality preset with multipass + AQ (set in Pipelines)
             NvencPreset = "p7",
             RcLookahead = 48,
             UseNvdecForEncode = true,
-            UseNvdecForVmaf = false,
 
             // Content detection (single-pass per-frame idet)
             UseHwaccelForDetection = true,
@@ -88,6 +104,14 @@ public static class Program
         };
 
         Directory.CreateDirectory(cfg.OutputFolder);
+
+        // ---- Validate ffmpeg capabilities at startup ----
+        Console.WriteLine("Validating ffmpeg capabilities...");
+        bool hasZscale = await FfmpegCapabilities.ValidateAsync(cfg, cts.Token);
+        if (!hasZscale)
+            Console.WriteLine("  Warning: zscale (libzimg) not available — HDR content will fail.");
+        else
+            Console.WriteLine("  OK: libvmaf and zscale available.");
 
         var files = Directory.EnumerateFiles(cfg.InputFolder, "*.mkv", SearchOption.AllDirectories)
                              .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
@@ -106,7 +130,7 @@ public static class Program
             Console.WriteLine($"\n[{idx}/{files.Count}] {file}");
             try
             {
-                var summary = await ProcessOneAsync(cfg, gpu, file, cts.Token);
+                var summary = await ProcessOneAsync(cfg, gpu, file, hasZscale, cts.Token);
                 overall.Videos.Add(summary);
 
                 Console.WriteLine($"  HDR: {summary.IsHdr}");
@@ -134,10 +158,11 @@ public static class Program
 
                 if (summary.Tuning?.Selection != null)
                 {
+                    var sel = summary.Tuning.Selection;
                     Console.WriteLine($"  CQ selected (final): {summary.FinalCq}");
                     if (summary.Tuning.HdrCqShiftApplied)
                         Console.WriteLine($"    HDR CQ ladder shift applied: -{summary.Tuning.HdrCqShiftDelta}  Base=[{string.Join(",", summary.Tuning.BaseCqList)}] Effective=[{string.Join(",", summary.Tuning.EffectiveCqList)}]");
-                    Console.WriteLine($"    VMAF: mean={summary.Tuning.Selection.SelectedMeanVmaf:F2}, p05={summary.Tuning.Selection.SelectedP05Vmaf:F2}");
+                    Console.WriteLine($"    VMAF: mean={sel.SelectedMeanVmaf:F2}, harmonic={sel.SelectedHarmonicMeanVmaf:F2}, p05={sel.SelectedP05Vmaf:F2}, p01={sel.SelectedP01Vmaf:F2}, min={sel.SelectedMinVmaf:F2}, frames={sel.TotalFrameCount}");
                 }
 
                 Console.WriteLine($"  Output: {summary.FinalOutputPath}");
@@ -156,7 +181,8 @@ public static class Program
         return 0;
     }
 
-    private static async Task<VideoSummary> ProcessOneAsync(Config cfg, GpuGate gpu, string input, CancellationToken ct)
+    private static async Task<VideoSummary> ProcessOneAsync(
+        Config cfg, GpuGate gpu, string input, bool hasZscale, CancellationToken ct)
     {
         var id = SafeId(Path.GetFileNameWithoutExtension(input));
         var outDir = Path.Combine(cfg.OutputFolder, id);
@@ -167,6 +193,23 @@ public static class Program
                      ?? throw new InvalidOperationException("No video stream found.");
 
         bool isHdr = SourceClassifier.IsHdr(vstream);
+
+        // Fail early if HDR content needs zscale and it's unavailable.
+        if (isHdr && !hasZscale)
+            throw new InvalidOperationException(
+                "HDR content detected but ffmpeg lacks zscale (libzimg). " +
+                "VMAF measurement for HDR requires tone-mapping via zscale. " +
+                "On Arch Linux: install 'zimg' and rebuild ffmpeg with --enable-libzimg.");
+
+        // Select VMAF model based on source resolution: 4K model for ≥3840×2160, standard otherwise.
+        string vmafModelPath = cfg.ResolveVmafModelPath(vstream.Width, vstream.Height);
+        if (!File.Exists(vmafModelPath))
+            throw new InvalidOperationException(
+                $"VMAF model not found: {vmafModelPath}. " +
+                $"On Arch Linux: sudo pacman -S vmaf (models install to /usr/share/model/).");
+
+        Console.WriteLine($"  VMAF model: {Path.GetFileName(vmafModelPath)} " +
+            $"(source {vstream.Width}x{vstream.Height})");
 
         ContentDetectionResult? detection = null;
         RestoreDecision restore;
@@ -214,8 +257,8 @@ public static class Program
             }
         }
 
-        // VMAF tuning (restoration applies to reference and to encode path)
-        var tuning = await VmafTuner.TuneAsync(cfg, gpu, input, outDir, restore, isHdr, ct);
+        // VMAF tuning: two-phase pipeline with pre-extracted reference clips.
+        var tuning = await VmafTuner.TuneAsync(cfg, gpu, input, outDir, restore, isHdr, vmafModelPath, ct);
 
         // Final encode uses selected CQ directly (HDR ladder already shifted during tuning)
         int finalCq = tuning.Selection.SelectedCq;

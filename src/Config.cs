@@ -6,18 +6,25 @@ public sealed class Config
     public string OutputFolder { get; set; } = "";
     public string Ffmpeg { get; set; } = "ffmpeg";
     public string Ffprobe { get; set; } = "ffprobe";
-    public string VmafModelPath { get; set; } = "";
+
+    // --- VMAF model selection ---
+    // On Arch Linux: install 'vmaf' package → models at /usr/share/model/
+    public string VmafModelDir { get; set; } = "/usr/share/model";
+    public string VmafStandardModelName { get; set; } = "vmaf_v0.6.1.json";
+    public string Vmaf4kModelName { get; set; } = "vmaf_4k_v0.6.1.json";
 
     public int NvencSlots { get; set; } = 2;
     public int NvdecSlots { get; set; } = 2;
 
     public List<int> CandidateCq { get; set; } = new();
-    public int SampleCount { get; set; } = 12;
-    public int SampleWindowSeconds { get; set; } = 8;
+    public int SampleCount { get; set; } = 16;
+    public int SampleWindowSeconds { get; set; } = 12;
     public int RandomSeed { get; set; } = 12345;
 
-    public double TargetMeanVmaf { get; set; } = 95.0;
-    public double TargetP05Vmaf { get; set; } = 92.0;
+    // Frame-level VMAF thresholds (computed from per-frame scores across all samples).
+    // mean ≥ 97 + p05 ≥ 95 → quality loss virtually imperceptible at close viewing distances.
+    public double TargetMeanVmaf { get; set; } = 97.0;
+    public double TargetP05Vmaf { get; set; } = 95.0;
 
     public bool HdrApplyCqLadderShift { get; set; } = true;
     public int HdrCqLadderDelta { get; set; } = 2;
@@ -27,7 +34,6 @@ public sealed class Config
     public int RcLookahead { get; set; } = 48;
 
     public bool UseNvdecForEncode { get; set; } = true;
-    public bool UseNvdecForVmaf { get; set; } = false;
 
     // --- Content detection (single-pass full-file idet) ---
 
@@ -47,4 +53,17 @@ public sealed class Config
 
     // --- Output ---
     public string OutputExtension { get; set; } = ".mkv";
+
+    // --- Model resolution helper ---
+
+    /// <summary>
+    /// Selects the appropriate VMAF model based on source resolution.
+    /// 4K model for ≥ 3840×2160; standard model for everything else.
+    /// </summary>
+    public string ResolveVmafModelPath(int? width, int? height)
+    {
+        bool is4k = (width ?? 0) >= 3840 || (height ?? 0) >= 2160;
+        string modelName = is4k ? Vmaf4kModelName : VmafStandardModelName;
+        return Path.Combine(VmafModelDir, modelName);
+    }
 }
