@@ -11,7 +11,7 @@ CompressMKV is a CLI tool that batch-compresses MKV video files using NVIDIA NVE
 - **Sealed data classes:** All data/model types are `public sealed class` with `{ get; set; }` properties and default initializers (`= ""`, `= new()`) — no records
 - **Enums** get XML doc comments per member
 - **Switch expressions** for all enum-to-value mappings (see `RestoreFilters.For()`, `RestoreStrategyMapper.ContentTypeToMode()`)
-- **Source-generated regex** via `[GeneratedRegex]` on `partial class` — see [Detection/ContentDetector.cs](src/CompressMKV/Detection/ContentDetector.cs)
+- **Source-generated regex** via `[GeneratedRegex]` on `partial class` — see [Detection/ContentDetector.cs](src/Detection/ContentDetector.cs)
 - **Collection expressions** (`["-hwaccel", "cuda", ...]`) preferred over `new List<string>`
 - **Nullable reference types** enabled; properties typed `string?` where appropriate
 - Naming: `PascalCase` types/methods/properties, `camelCase` locals, `_camelCase` private fields
@@ -33,8 +33,8 @@ Ffprobe → SourceClassifier → ContentDetector → RestoreStrategyMapper → [
 ## Build and Test
 
 ```bash
-dotnet build src/CompressMKV/CompressMKV.csproj
-dotnet run --project src/CompressMKV -- --input /path/to/mkvs --output /path/to/out --vmaf-model /path/to/vmaf_model.json
+dotnet build CompressMKV.csproj
+dotnet run -- --input /path/to/mkvs --output /path/to/out --vmaf-model /path/to/vmaf_model.json
 ```
 
 Target framework: `net10.0`. No test projects exist. No CI configuration.
