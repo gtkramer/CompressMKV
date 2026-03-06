@@ -74,7 +74,7 @@ public static class Program
             NvdecSlots = 2,
 
             // VMAF tuning — stratified random sampling + per-frame score aggregation
-            CandidateCq = [16, 18, 20, 22, 24, 26],
+            CandidateCq = [16, 18, 20, 22, 24, 26, 28, 30, 32, 34],
             SampleCount = 16,
             SampleWindowSeconds = 12,
             RandomSeed = 12345,
