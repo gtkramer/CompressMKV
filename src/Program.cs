@@ -129,6 +129,35 @@ public static class Program
             async (item, ct) =>
             {
                 var (file, idx) = item;
+                var id = SafeId(Path.GetFileNameWithoutExtension(file));
+                var outDir = Path.Combine(cfg.OutputFolder, id);
+                var logPath = Path.Combine(outDir, "log.json");
+
+                // Resume: if a prior run completed successfully, load its result and skip.
+                if (File.Exists(logPath))
+                {
+                    try
+                    {
+                        var prior = await JsonIO.ReadAsync<VideoSummary>(logPath, ct);
+                        if (prior != null)
+                        {
+                            lock (overall) overall.Videos.Add(prior);
+                            Console.WriteLine($"  [{idx}/{files.Count}] Skipped (already completed): {file}");
+                            return;
+                        }
+                    }
+                    catch
+                    {
+                        // Corrupt log — treat as incomplete and reprocess.
+                    }
+                }
+
+                // Incomplete prior run: wipe partial output and start fresh.
+                if (Directory.Exists(outDir))
+                {
+                    Directory.Delete(outDir, recursive: true);
+                }
+
                 Console.WriteLine($"\n[{idx}/{files.Count}] {file}");
                 try
                 {
