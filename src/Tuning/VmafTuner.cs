@@ -82,39 +82,46 @@ public static class VmafTuner
             ct.ThrowIfCancellationRequested();
             Console.WriteLine($"  Tuning CQ={cq}...");
 
-            var tasks = Enumerable.Range(0, windows.Count).Select(async i =>
+            // GPU encodes run one at a time per file (serial), freeing the other
+            // NVENC slot for the concurrent file.  VMAF tasks (CPU-only) fire off
+            // immediately after each encode and overlap with the next encode.
+            var vmafTasks = new List<Task<SampleMetric>>();
+
+            for (int i = 0; i < windows.Count; i++)
             {
                 string refClip = refClips[i];
                 string tag = $"s{i:00}";
                 string encPath = Path.Combine(samplesDir, $"cq{cq}_{tag}.mkv");
                 string vmafLog = Path.Combine(vmafDir, $"cq{cq}_{tag}.json");
 
-                // Encode: consumes 1 NVENC slot.
+                // GPU encode — one NVENC slot at a time per file.
                 using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, ct))
                 {
                     await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, ct);
                 }
 
-                // VMAF: CPU-only — no GPU gating, runs freely alongside encodes.
-                await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, vmafLog, vmafModelPath, ct);
-
-                var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
-                return new SampleMetric
+                // VMAF — CPU-only, runs concurrently with the next sample's encode.
+                int sampleIdx = i;
+                var window = windows[i];
+                vmafTasks.Add(Task.Run(async () =>
                 {
-                    SampleIndex = i,
-                    Window = windows[i],
-                    ReferenceClipPath = refClip,
-                    EncodedPath = encPath,
-                    VmafLogPath = vmafLog,
-                    VmafMean = vmafResult.Mean,
-                    VmafHarmonicMean = vmafResult.HarmonicMean,
-                    FrameVmafScores = vmafResult.FrameScores,
-                };
-            }).ToList();
+                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, vmafLog, vmafModelPath, ct);
+                    var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
+                    return new SampleMetric
+                    {
+                        SampleIndex = sampleIdx,
+                        Window = window,
+                        ReferenceClipPath = refClip,
+                        EncodedPath = encPath,
+                        VmafLogPath = vmafLog,
+                        VmafMean = vmafResult.Mean,
+                        VmafHarmonicMean = vmafResult.HarmonicMean,
+                        FrameVmafScores = vmafResult.FrameScores,
+                    };
+                }, ct));
+            }
 
-            var metrics = new List<SampleMetric>();
-            foreach (var batch in tasks.Chunk(8))
-                metrics.AddRange(await Task.WhenAll(batch));
+            var metrics = (await Task.WhenAll(vmafTasks)).ToList();
 
             var agg = CqAggregate.From(cq, metrics);
             cqResults.Add(agg);

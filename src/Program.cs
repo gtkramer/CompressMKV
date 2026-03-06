@@ -67,7 +67,9 @@ public static class Program
             // On Arch Linux: sudo pacman -S vmaf → models at /usr/share/model/
             VmafModelDir = GetArg(args, "--vmaf-model-dir") ?? "/usr/share/model",
 
-            // RTX 5080 scheduling model
+            // RTX 5080: 2 NVENC + 2 NVDEC sessions.
+            // GpuGate semaphores are the sole concurrency control for GPU work —
+            // files flow freely through CPU phases and block only on encoder/decoder slots.
             NvencSlots = 2,
             NvdecSlots = 2,
 
@@ -121,58 +123,58 @@ public static class Program
         var gpu = new GpuGate(cfg.NvencSlots, cfg.NvdecSlots);
         var overall = new OverallSummary { StartedUtc = DateTime.UtcNow, Config = cfg };
 
-        int idx = 0;
-        foreach (var file in files)
-        {
-            idx++;
-            if (cts.IsCancellationRequested) break;
-
-            Console.WriteLine($"\n[{idx}/{files.Count}] {file}");
-            try
+        await Parallel.ForEachAsync(
+            files.Select((file, i) => (file, idx: i + 1)),
+            new ParallelOptions { CancellationToken = cts.Token },
+            async (item, ct) =>
             {
-                var summary = await ProcessOneAsync(cfg, gpu, file, hasZscale, cts.Token);
-                overall.Videos.Add(summary);
-
-                Console.WriteLine($"  HDR: {summary.IsHdr}");
-
-                if (summary.ContentDetection != null)
+                var (file, idx) = item;
+                Console.WriteLine($"\n[{idx}/{files.Count}] {file}");
+                try
                 {
-                    var det = summary.ContentDetection;
-                    Console.WriteLine($"  ContentType: {det.ContentType} (confidence={det.Confidence:P0})");
-                    Console.WriteLine($"    Frames: {det.TotalFramesAnalyzed:N0} (P={det.ProgressiveFrameCount:N0}, I={det.InterlacedFrameCount:N0}, U={det.UndeterminedFrameCount:N0})");
-                    Console.WriteLine($"    Progressive fraction: {det.GlobalProgressiveFraction:P2}");
-                    Console.WriteLine($"    Telecine cadence match rate: {det.TelecineCadenceMatchRate:P2}");
-                    Console.WriteLine($"    Parity: {det.DetectedParity} (raw TFF={det.RawIdetTffCount:N0}, BFF={det.RawIdetBffCount:N0})");
-                    if (det.ParityMismatch)
-                        Console.WriteLine($"    PARITY MISMATCH: idet={det.DetectedParity} vs ffprobe={det.FfprobeMappedParity} (ffprobe field_order={det.FfprobeFieldOrder})");
-                    Console.WriteLine($"    Reason: {det.Reason}");
-                }
+                    var summary = await ProcessOneAsync(cfg, gpu, file, hasZscale, ct);
+                    lock (overall) overall.Videos.Add(summary);
 
-                if (summary.Restore != null)
+                    Console.WriteLine($"  [{idx}/{files.Count}] HDR: {summary.IsHdr}");
+
+                    if (summary.ContentDetection != null)
+                    {
+                        var det = summary.ContentDetection;
+                        Console.WriteLine($"  [{idx}/{files.Count}] ContentType: {det.ContentType} (confidence={det.Confidence:P0})");
+                        Console.WriteLine($"    Frames: {det.TotalFramesAnalyzed:N0} (P={det.ProgressiveFrameCount:N0}, I={det.InterlacedFrameCount:N0}, U={det.UndeterminedFrameCount:N0})");
+                        Console.WriteLine($"    Progressive fraction: {det.GlobalProgressiveFraction:P2}");
+                        Console.WriteLine($"    Telecine cadence match rate: {det.TelecineCadenceMatchRate:P2}");
+                        Console.WriteLine($"    Parity: {det.DetectedParity} (raw TFF={det.RawIdetTffCount:N0}, BFF={det.RawIdetBffCount:N0})");
+                        if (det.ParityMismatch)
+                            Console.WriteLine($"    PARITY MISMATCH: idet={det.DetectedParity} vs ffprobe={det.FfprobeMappedParity} (ffprobe field_order={det.FfprobeFieldOrder})");
+                        Console.WriteLine($"    Reason: {det.Reason}");
+                    }
+
+                    if (summary.Restore != null)
+                    {
+                        Console.WriteLine($"  [{idx}/{files.Count}] Restore: {summary.Restore.Mode} → filter=\"{summary.Restore.FilterGraph}\", fps={summary.Restore.OutputFps ?? "native"}");
+                        Console.WriteLine(summary.Restore.Previews is { Count: > 0 }
+                            ? $"  Previews: generated ({summary.Restore.Previews.Count})"
+                            : "  Previews: not generated");
+                    }
+
+                    if (summary.Tuning?.Selection != null)
+                    {
+                        var sel = summary.Tuning.Selection;
+                        Console.WriteLine($"  [{idx}/{files.Count}] CQ selected (final): {summary.FinalCq}");
+                        if (summary.Tuning.HdrCqShiftApplied)
+                            Console.WriteLine($"    HDR CQ ladder shift applied: -{summary.Tuning.HdrCqShiftDelta}  Base=[{string.Join(",", summary.Tuning.BaseCqList)}] Effective=[{string.Join(",", summary.Tuning.EffectiveCqList)}]");
+                        Console.WriteLine($"    VMAF: mean={sel.SelectedMeanVmaf:F2}, harmonic={sel.SelectedHarmonicMeanVmaf:F2}, p05={sel.SelectedP05Vmaf:F2}, p01={sel.SelectedP01Vmaf:F2}, min={sel.SelectedMinVmaf:F2}, frames={sel.TotalFrameCount}");
+                    }
+
+                    Console.WriteLine($"  [{idx}/{files.Count}] Output: {summary.FinalOutputPath}");
+                }
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"  Restore: {summary.Restore.Mode} → filter=\"{summary.Restore.FilterGraph}\", fps={summary.Restore.OutputFps ?? "native"}");
-                    Console.WriteLine(summary.Restore.Previews is { Count: > 0 }
-                        ? $"  Previews: generated ({summary.Restore.Previews.Count})"
-                        : "  Previews: not generated");
+                    Console.WriteLine($"  [{idx}/{files.Count}] ERROR: {ex.Message}");
+                    lock (overall) overall.Errors.Add(new RunError { File = file, Error = ex.ToString() });
                 }
-
-                if (summary.Tuning?.Selection != null)
-                {
-                    var sel = summary.Tuning.Selection;
-                    Console.WriteLine($"  CQ selected (final): {summary.FinalCq}");
-                    if (summary.Tuning.HdrCqShiftApplied)
-                        Console.WriteLine($"    HDR CQ ladder shift applied: -{summary.Tuning.HdrCqShiftDelta}  Base=[{string.Join(",", summary.Tuning.BaseCqList)}] Effective=[{string.Join(",", summary.Tuning.EffectiveCqList)}]");
-                    Console.WriteLine($"    VMAF: mean={sel.SelectedMeanVmaf:F2}, harmonic={sel.SelectedHarmonicMeanVmaf:F2}, p05={sel.SelectedP05Vmaf:F2}, p01={sel.SelectedP01Vmaf:F2}, min={sel.SelectedMinVmaf:F2}, frames={sel.TotalFrameCount}");
-                }
-
-                Console.WriteLine($"  Output: {summary.FinalOutputPath}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  ERROR: {ex.Message}");
-                overall.Errors.Add(new RunError { File = file, Error = ex.ToString() });
-            }
-        }
+            });
 
         overall.FinishedUtc = DateTime.UtcNow;
         var overallPath = Path.Combine(cfg.OutputFolder, $"overall_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
@@ -216,7 +218,11 @@ public static class Program
 
         // Source-agnostic content detection per MPlayer guide §7.2.2.
         // Runs on all content regardless of source type (DVD, Blu-ray, etc.)
-        detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct);
+        // Gate NVDEC slot when hardware-accelerated detection is enabled.
+        using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, ct))
+        {
+            detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct);
+        }
 
         // Map ContentType enum → restore filter chain per MPlayer guide §7.2.3
         restore = RestoreStrategyMapper.MapToRestore(detection);

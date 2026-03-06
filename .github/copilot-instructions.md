@@ -44,7 +44,7 @@ Target framework: `net10.0`. No test projects exist. No CI configuration.
 - **No dependency injection.** `Config` is constructed in `Main()` and passed to static methods. `GpuGate` (semaphores) is the only stateful object.
 - **Process execution** uses `Proc.RunAsync` (capture all output) and `Proc.RunStreamingAsync` (line-by-line callback). Always use `ProcessStartInfo.ArgumentList` — never string concatenation.
 - **Error handling:** throw `InvalidOperationException` on failures; per-file `try/catch` in the main loop records errors as `RunError` in `OverallSummary`.
-- **Async:** all I/O is `async Task<T>` with `CancellationToken` on every method. Parallelism via `Task.WhenAll` with `.Chunk(8)` batching. GPU access gated by `GpuGate.AcquireAsync()` returning `IDisposable`.
+- **Async:** all I/O is `async Task<T>` with `CancellationToken` on every method. File-level parallelism via `Parallel.ForEachAsync` (unbounded — GPU semaphores in `GpuGate` are the sole concurrency control). Files flow freely through CPU phases and block only when acquiring NVENC/NVDEC slots. VMAF (CPU-only) overlaps with GPU encodes via `Task.Run`. Thread-safe collection access via `lock` on `OverallSummary`.
 - **JSON:** `System.Text.Json` with `WriteIndented = true`, `DefaultIgnoreCondition = WhenWritingNull`. Ffprobe models use `[JsonPropertyName]`.
 - **Detection thresholds** in `ContentDetector` are `const double` — derived from signal physics, not tunable.
 
@@ -52,5 +52,5 @@ Target framework: `net10.0`. No test projects exist. No CI configuration.
 
 - **ffmpeg/ffprobe** invoked via `Proc` — paths configurable in `Config` (default: `"ffmpeg"`, `"ffprobe"`)
 - **VMAF model** file path required via `--vmaf-model` CLI argument
-- **NVIDIA GPU** required: NVENC + NVDEC, configured for RTX 5080 (2 NVENC + 2 NVDEC slots in `GpuGate`)
+- **NVIDIA GPU** required: NVENC + NVDEC, configured for RTX 5080 (2 NVENC + 2 NVDEC slots in `GpuGate`). GPU slot semaphores are the sole concurrency control — no artificial file-level limit.
 - Codec: `av1_nvenc`, preset `p7`, VBR rate control, `p010le` pixel format, CUDA hwaccel
