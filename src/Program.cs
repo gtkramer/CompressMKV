@@ -152,11 +152,8 @@ public static class Program
                     }
                 }
 
-                // Incomplete prior run: wipe partial output and start fresh.
-                if (Directory.Exists(outDir))
-                {
-                    Directory.Delete(outDir, recursive: true);
-                }
+                // Incomplete prior run: wipe intermediate artifacts and start fresh.
+                CleanIntermediates(outDir);
 
                 Console.WriteLine($"\n[{idx}/{files.Count}] {file}");
                 try
@@ -315,6 +312,9 @@ public static class Program
         };
 
         await JsonIO.WriteAsync(Path.Combine(outDir, "log.json"), summary, ct);
+
+        CleanIntermediates(outDir);
+
         return summary;
     }
 
@@ -323,6 +323,16 @@ public static class Program
         for (int i = 0; i < args.Length - 1; i++)
             if (args[i] == key) return args[i + 1];
         return null;
+    }
+
+    private static void CleanIntermediates(string outDir)
+    {
+        foreach (var subDir in new[] { "refs", "samples", "vmaf", "previews" })
+        {
+            var path = Path.Combine(outDir, subDir);
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
     }
 
     private static string SafeId(string s)
