@@ -157,6 +157,9 @@ public static class Program
         var marginalCount = overall.Videos.Count(v => v.Tuning?.Selection?.IsMarginal == true);
         if (marginalCount > 0)
             AnsiConsole.MarkupLine($"  [yellow]Marginal passes:[/] {marginalCount}");
+        var passthroughCount = overall.Videos.Count(v => v.SizeGuard?.FellBack == true);
+        if (passthroughCount > 0)
+            AnsiConsole.MarkupLine($"  [yellow]Passthrough fallback:[/] {passthroughCount} (source already efficiently compressed)");
         AnsiConsole.MarkupLine($"  [grey]Wrote {overallPath}[/]");
 
         return overall.Errors.Count == 0 ? 0 : 1;
@@ -241,17 +244,20 @@ public static class Program
     private static (string text, ResultLevel level) SummariseResult(VideoSummary s)
     {
         // Build a compact one-line result for the recent-completions table.
-        var parts = new List<string>();
-        if (s.Tuning?.Selection?.SelectedCq is { } cq) parts.Add($"CQ={cq}");
-
         bool marginal = s.Tuning?.Selection?.IsMarginal == true;
         bool verifyFailed = s.OutputVerification?.Passed == false;
+        bool fellBack = s.SizeGuard?.FellBack == true;
 
         if (verifyFailed)
-            return ($"verify FAILED — {string.Join(' ', parts)}", ResultLevel.Failure);
+        {
+            string label = fellBack ? "passthrough" : $"CQ={s.FinalCq}";
+            return ($"verify FAILED — {label}", ResultLevel.Failure);
+        }
+        if (fellBack)
+            return ("⚠ passthrough — source already compressed", ResultLevel.Warning);
         if (marginal)
-            return ($"⚠ marginal — {string.Join(' ', parts)}", ResultLevel.Warning);
-        return ($"✓ {string.Join(' ', parts)}", ResultLevel.Success);
+            return ($"⚠ marginal — CQ={s.FinalCq}", ResultLevel.Warning);
+        return ($"✓ CQ={s.FinalCq}", ResultLevel.Success);
     }
 
     private static string Truncate(string s, int max) =>
@@ -424,6 +430,18 @@ public static class Program
         timings.FinalEncode = sw.Elapsed;
         logger.LogInfo($"Final encode written: {finalOut}");
 
+        // ---- Size guard ----
+        // If AV1 came out larger than the source (already-compressed inputs),
+        // discard the encode and remux the source through as .mkv.  Only
+        // applies to Progressive (no-restore) sources — for IVTC/Deinterlace
+        // a passthrough would lose the user's intended restoration.
+        SizeGuardOutcome sizeGuard;
+        using (await cpu.AcquireAsync(ct))
+        {
+            sizeGuard = await SizeGuard.MaybeFallbackAsync(cfg, input, finalOut, restore, logger, ct);
+        }
+        finalOut = sizeGuard.OutputPath;
+
         // ---- Verification ----
         sw.Restart();
         OutputVerificationResult verification;
@@ -457,6 +475,7 @@ public static class Program
             Tuning = tuning,
             FinalCq = finalCq,
             OutputVerification = verification,
+            SizeGuard = sizeGuard,
             Timings = timings,
             HdrMetadata = hdrMetadata,
         };

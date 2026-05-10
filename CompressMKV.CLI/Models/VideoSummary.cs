@@ -32,6 +32,14 @@ public sealed class VideoSummary
     public OutputVerificationResult? OutputVerification { get; set; }
 
     /// <summary>
+    /// Result of the post-encode size check.  When the AV1 encode came out
+    /// larger than the source (typical for already-compressed streaming
+    /// inputs), the encode is discarded and a stream-copy passthrough is
+    /// written instead.  Null when verification was skipped or unrun.
+    /// </summary>
+    public SizeGuardOutcome? SizeGuard { get; set; }
+
+    /// <summary>
     /// Wall-clock time spent in each pipeline phase.  Used to verify the
     /// concurrency model produced the expected utilization profile.
     /// </summary>
