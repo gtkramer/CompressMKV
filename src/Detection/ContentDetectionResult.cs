@@ -61,8 +61,19 @@ public sealed class ContentDetectionResult
     public FieldParity FfprobeMappedParity { get; set; } = FieldParity.Auto;
     public bool ParityMismatch { get; set; }
 
-    // ---- Source frame rate (used to identify NTSC family) ----
+    // ---- Source frame rate metadata (used by §7.2.3 action gating) ----
 
-    public double? SourceFps { get; set; }
+    /// <summary>Source frame rate as an exact fraction.  Null when ffprobe
+    /// reported no parseable rate.</summary>
+    public Fps? SourceFps { get; set; }
+
+    /// <summary>True when the source rate matches an NTSC family rate
+    /// (30000/1001, 24000/1001, 60000/1001).  Used by the parity NTSC tiebreaker.</summary>
     public bool IsNtscFamilyFps { get; set; }
+
+    /// <summary>True when r_frame_rate and avg_frame_rate agree closely.  False
+    /// indicates a variable-frame-rate (VFR) source, where idet's cadence
+    /// metrics and any fixed-rate output are unreliable — the IVTC chain is
+    /// suppressed for VFR sources to prevent rate damage.</summary>
+    public bool SourceIsLikelyCfr { get; set; } = true;
 }

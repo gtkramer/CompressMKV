@@ -167,9 +167,10 @@ public static partial class ContentDetector
         double cadenceRate = ComputeCadenceMatchRate(frames);
         double iInCadence  = ComputeIFramesInCadenceRatio(frames);
 
-        // ---- Source fps (NTSC family check used by parity tiebreaker) ----
-        double? sourceFps = vstream.ResolveFps();
-        bool isNtsc = vstream.IsNtscFamilyFps();
+        // ---- Source fps and CFR signal (used by parity tiebreaker + IVTC gating) ----
+        Fps? sourceFps = vstream.ResolveFps();
+        bool isNtsc = sourceFps?.IsNtscFamily() ?? false;
+        bool isLikelyCfr = vstream.IsLikelyCfr();
 
         // ---- Parity ----
         var ffprobeParity = FieldOrderMapper.MapToParity(
@@ -190,6 +191,8 @@ public static partial class ContentDetector
         Console.WriteLine($"    progFrac={progFrac:P1}, cadence={cadenceRate:P1}, " +
             $"i_in_cadence={iInCadence:P1}, parity={parity}" +
             (parityFromNtsc ? " (NTSC fallback)" : "") +
+            $", source={sourceFps?.ToString() ?? "?"}" +
+            (isLikelyCfr ? "" : " (VFR)") +
             $", frames={frames.Count:N0} (P={progCount:N0} I={intCount:N0} U={undetCount:N0})");
 
         return new ContentDetectionResult
@@ -218,6 +221,7 @@ public static partial class ContentDetector
 
             SourceFps = sourceFps,
             IsNtscFamilyFps = isNtsc,
+            SourceIsLikelyCfr = isLikelyCfr,
         };
     }
 

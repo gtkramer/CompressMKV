@@ -171,8 +171,9 @@ public static class Program
                         Console.WriteLine($"    Progressive fraction: {det.GlobalProgressiveFraction:P2}");
                         Console.WriteLine($"    Telecine cadence match rate: {det.TelecineCadenceMatchRate:P2}");
                         Console.WriteLine($"    I-frames in 3:2 cycles: {det.InterlacedFramesInCadenceRatio:P2}");
-                        Console.WriteLine($"    Source fps: {(det.SourceFps?.ToString("F3", CultureInfo.InvariantCulture) ?? "?")}" +
-                            $" ({(det.IsNtscFamilyFps ? "NTSC family" : "non-NTSC")})");
+                        Console.WriteLine($"    Source fps: {det.SourceFps?.ToString() ?? "?"}" +
+                            $" ({(det.IsNtscFamilyFps ? "NTSC family" : "non-NTSC")}" +
+                            $", {(det.SourceIsLikelyCfr ? "CFR" : "VFR")})");
                         Console.WriteLine($"    Parity: {det.DetectedParity}" +
                             (det.ParityFromNtscFallback ? " (NTSC fallback)" : "") +
                             $" (raw TFF={det.RawIdetTffCount:N0}, BFF={det.RawIdetBffCount:N0})");
@@ -183,7 +184,7 @@ public static class Program
 
                     if (summary.Restore != null)
                     {
-                        Console.WriteLine($"  [{idx}/{files.Count}] Restore: {summary.Restore.Mode} → filter=\"{summary.Restore.FilterGraph}\", fps={summary.Restore.OutputFps ?? "native"}");
+                        Console.WriteLine($"  [{idx}/{files.Count}] Restore: {summary.Restore.Mode} → filter=\"{summary.Restore.FilterGraph}\", fps={summary.Restore.OutputFps?.ToString() ?? "native"}");
                         Console.WriteLine(summary.Restore.Previews is { Count: > 0 }
                             ? $"  Previews: generated ({summary.Restore.Previews.Count})"
                             : "  Previews: not generated");

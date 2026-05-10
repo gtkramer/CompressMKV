@@ -24,7 +24,7 @@ public static class RestoreFilters
     /// Output frame rate after the IVTC chain — the canonical 24000/1001 film rate
     /// before telecine was applied.  Set with `-r` and `-fps_mode cfr` to pin output.
     /// </summary>
-    public const string IvtcOutputFps = "24000/1001";
+    public static readonly Fps IvtcOutputFps = Fps.Ntsc24;
 
     /// <summary>
     /// IVTC chain — equivalent to MPlayer's filmdint (guide §7.2.3.4 method 2):
@@ -53,7 +53,7 @@ public static class RestoreFilters
     /// Mode-based overload used by PreviewGenerator for side-by-side comparison
     /// of the two strategies regardless of detected category.
     /// </summary>
-    public static (string Filter, string? OutputFps) For(RestoreMode mode, FieldParity parity) =>
+    public static (string Filter, Fps? OutputFps) For(RestoreMode mode, FieldParity parity) =>
         mode switch
         {
             RestoreMode.Ivtc => (IvtcChain(parity), IvtcOutputFps),

@@ -31,8 +31,8 @@ public static class Pipelines
         if (!string.IsNullOrWhiteSpace(restore.FilterGraph))
             args.AddRange(["-vf", restore.FilterGraph]);
 
-        if (!string.IsNullOrWhiteSpace(restore.OutputFps) && restore.Mode != RestoreMode.None)
-            args.AddRange(["-r", restore.OutputFps!]);
+        if (restore.OutputFps.HasValue && restore.Mode != RestoreMode.None)
+            args.AddRange(["-r", restore.OutputFps.Value.ToString()]);
 
         args.AddRange([
             "-fps_mode", "cfr",
@@ -153,8 +153,8 @@ public static class Pipelines
         if (!string.IsNullOrWhiteSpace(restore.FilterGraph))
             args.AddRange(["-vf", restore.FilterGraph]);
 
-        if (!string.IsNullOrWhiteSpace(restore.OutputFps) && restore.Mode != RestoreMode.None)
-            args.AddRange(["-r", restore.OutputFps!]);
+        if (restore.OutputFps.HasValue && restore.Mode != RestoreMode.None)
+            args.AddRange(["-r", restore.OutputFps.Value.ToString()]);
 
         args.AddRange([
             "-map", "0",

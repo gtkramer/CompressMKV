@@ -1,5 +1,3 @@
-using System.Globalization;
-
 namespace CompressMkv;
 
 // =========================================================================
@@ -9,26 +7,32 @@ namespace CompressMkv;
 // §7.2.3 *action* choices live here so that each branch reads as a direct
 // reflection of one guide sub-section.
 //
-// Source-rate awareness is required because the IVTC chain pins output to
-// 24000/1001 fps — applying it to anything other than a 30000/1001 source
-// (the canonical NTSC telecine/interlace storage rate) damages the content:
-// a 24p Blu-ray with a few idet false positives, a 25p PAL disc, or a 60p
-// sports Blu-ray would all see frames dropped to hit 24p.  The guide is
-// scoped to NTSC DVDs precisely because IVTC only makes sense for that source.
+// The IVTC chain is gated on TWO source-rate conditions:
 //
-// Coverage of the five §7.2.3 sub-sections:
+//   1. Source rate matches NTSC-thirty (30000/1001) exactly enough.
+//      The IVTC chain decimates 30000/1001 → 24000/1001 and pins the output
+//      with -r 24000/1001.  Applied to a 30/1 source (true 30p web/screen
+//      content), a 25/1 PAL source, or a 60p source, ffmpeg would drop frames
+//      to satisfy the rate pin and damage the content.
 //
-//   §7.2.3.1 Progressive       → no filter, native fps
-//   §7.2.3.2 Telecined         → IvtcChain @ 24000/1001  (NTSC-thirty source only)
-//   §7.2.3.3 Interlaced        → DeinterlaceChain @ native fps
-//   §7.2.3.4 Mixed prog+TC     → IvtcChain @ 24000/1001  (NTSC-thirty source only)
-//   §7.2.3.5 Mixed prog+intl   → IvtcChain when ≥90% prog (favor-progressive
-//                                + footnote [3] safe pullup default), else
-//                                DeinterlaceChain @ native fps
+//   2. Source is constant frame rate (CFR).  VFR sources (screen recordings,
+//      mobile captures with varying timestamps) make idet's per-frame cadence
+//      metrics unreliable, and the rate pin would itself impose a fixed rate
+//      on what should be a variable-rate stream.
 //
 // Off-script categories (e.g. Telecined classification on a 24p Blu-ray) are
 // treated as detection anomalies — passed through unmodified rather than fed
 // into a chain that would damage them.
+//
+// Coverage of the five §7.2.3 sub-sections:
+//
+//   §7.2.3.1 Progressive       → no filter, native fps
+//   §7.2.3.2 Telecined         → IvtcChain @ 24000/1001  (gated on NTSC-thirty + CFR)
+//   §7.2.3.3 Interlaced        → DeinterlaceChain @ native fps
+//   §7.2.3.4 Mixed prog+TC     → IvtcChain @ 24000/1001  (gated on NTSC-thirty + CFR)
+//   §7.2.3.5 Mixed prog+intl   → IvtcChain when ≥90% prog (favor-progressive
+//                                + footnote [3] safe pullup default), else
+//                                DeinterlaceChain @ native fps
 // =========================================================================
 public static class RestoreStrategyMapper
 {
@@ -40,20 +44,18 @@ public static class RestoreStrategyMapper
     /// </summary>
     const double FavorProgressiveProgFracMin = 0.90;
 
-    /// <summary>
-    /// The IVTC chain decimates 30000/1001 → 24000/1001.  Applying it to a source
-    /// at any other rate forces ffmpeg to drop frames after the filter to satisfy
-    /// `-r 24000/1001 -fps_mode cfr`, damaging the content.  The guide is explicitly
-    /// scoped to NTSC DVDs (30000/1001 storage); this guard enforces that scope.
-    /// </summary>
-    const double NtscThirtyFps = 30000.0 / 1001.0;
-    const double NtscThirtyFpsTolerance = 0.05;
-
     public static RestoreDecision MapToRestore(ContentDetectionResult detection)
     {
         var parity = detection.DetectedParity;
         var contentType = detection.ContentType;
-        bool sourceIsNtscThirty = IsNtscThirtyFps(detection.SourceFps);
+
+        // Guard: the IVTC chain only applies to a 30000/1001 CFR source.  Both
+        // conditions must hold — a true-30p source (30/1) at any cadence rate
+        // must NOT enter IVTC, and a VFR source's "rate" is meaningless.
+        bool canApplyIvtc =
+            (detection.SourceFps?.IsNtscThirty() ?? false) &&
+            detection.SourceIsLikelyCfr;
+
         bool favorProgressive =
             detection.GlobalProgressiveFraction >= FavorProgressiveProgFracMin;
 
@@ -67,7 +69,7 @@ public static class RestoreStrategyMapper
                 NoFilter("Progressive (§7.2.3.1): verified pure progressive — no filter."),
 
             // -----------------------------------------------------------
-            // §7.2.3.3 Interlaced.  Always safe at native rate.
+            // §7.2.3.3 Interlaced.  Always safe at native rate, regardless of source fps.
             // "Use a deinterlacing filter before encoding."
             // -----------------------------------------------------------
             ContentType.Interlaced =>
@@ -76,68 +78,53 @@ public static class RestoreStrategyMapper
                     "at native frame rate."),
 
             // -----------------------------------------------------------
-            // §7.2.3.2 Telecined — only valid for NTSC-thirty source.
-            // "the best filter, pullup, is described in the mixed progressive
-            //  and telecine section."  -ofps 24000/1001 is required.
+            // §7.2.3.2 Telecined — only valid on a 30000/1001 CFR source.
             // -----------------------------------------------------------
-            ContentType.Telecined when sourceIsNtscThirty =>
+            ContentType.Telecined when canApplyIvtc =>
                 Ivtc(parity,
                     "Telecined (§7.2.3.2): IVTC via fieldmatch + bwdif(interlaced) + " +
                     "decimate to recover 24000/1001."),
 
-            // Telecine pattern detected on a non-NTSC-thirty source: anomaly.
+            // Cadence detected but the source rate or CFR guard fails: anomaly.
             // Pass through rather than damage the rate.
             ContentType.Telecined =>
-                NoFilter(
-                    $"Telecine pattern detected but source is " +
-                    $"{Fps(detection.SourceFps)} fps (not 30000/1001) — guide §7.2 " +
-                    "IVTC chain doesn't apply. Passing through."),
+                NoFilter(IvtcSkipReason("Telecine pattern detected", detection)),
 
             // -----------------------------------------------------------
-            // §7.2.3.4 Mixed progressive+telecine — only valid for NTSC-thirty.
+            // §7.2.3.4 Mixed progressive+telecine — only valid on a 30000/1001 CFR source.
             // "pullup is designed to inverse-telecine telecined material while
-            //  leaving progressive data alone."  -ofps 24000/1001 is required.
+            //  leaving progressive data alone."
             // -----------------------------------------------------------
-            ContentType.MixedProgressiveTelecine when sourceIsNtscThirty =>
+            ContentType.MixedProgressiveTelecine when canApplyIvtc =>
                 Ivtc(parity,
                     "Mixed prog+telecine (§7.2.3.4): fieldmatch leaves progressive " +
                     "data alone and inverse-telecines the telecined sections; " +
                     "decimate restores 24000/1001."),
 
-            // Cadence-pattern I frames on a non-NTSC-thirty source: idet noise on
-            // essentially-progressive content.  Pass through.
             ContentType.MixedProgressiveTelecine =>
-                NoFilter(
-                    $"Cadence-pattern I frames detected on a {Fps(detection.SourceFps)} " +
-                    "fps source — IVTC chain only applies to 30000/1001 storage. " +
-                    "Treating as progressive noise. Passing through."),
+                NoFilter(IvtcSkipReason("Cadence-pattern I frames detected", detection)),
 
             // -----------------------------------------------------------
             // §7.2.3.5 Mixed progressive+interlaced — guide gives a tradeoff.
             //
-            // (a) Favor progressive when ≥90% prog AND source is NTSC-thirty.
+            // (a) Favor progressive when ≥90% prog AND source is NTSC-thirty + CFR.
             //     This is the §7.2.3.5 dominance rule plus footnote [3]'s safe
-            //     pullup default.  IVTC chain preserves progressive bulk and
-            //     cleans up sparse interlaced frames via bwdif=interlaced.
+            //     pullup default.
             //
-            // (b) ≥90% prog but non-NTSC-thirty source: idet noise on a 24p/25p/60p
-            //     disc.  IVTC would damage the rate; pass through.
+            // (b) ≥90% prog but source is non-NTSC-thirty or VFR: idet noise on a
+            //     24p/25p/60p disc or screen recording.  Pass through.
             //
-            // (c) <90% prog: deinterlace all.  "If it is only half progressive,
-            //     you probably want to encode it as if it is all interlaced."
+            // (c) <90% prog: deinterlace all.
             // -----------------------------------------------------------
-            ContentType.MixedProgressiveInterlaced when favorProgressive && sourceIsNtscThirty =>
+            ContentType.MixedProgressiveInterlaced when favorProgressive && canApplyIvtc =>
                 Ivtc(parity,
                     $"Mixed prog+interlaced ({detection.GlobalProgressiveFraction:P1} " +
-                    "progressive, NTSC-thirty source): IVTC chain per guide §7.2.3.5 " +
+                    "progressive, NTSC-thirty CFR source): IVTC chain per guide §7.2.3.5 " +
                     "favor-progressive + footnote [3] safe pullup default."),
 
             ContentType.MixedProgressiveInterlaced when favorProgressive =>
-                NoFilter(
-                    $"Mixed prog+interlaced ({detection.GlobalProgressiveFraction:P1} " +
-                    $"progressive) on a {Fps(detection.SourceFps)} fps source — " +
-                    "interlaced flags are likely idet noise on a non-telecine-format " +
-                    "source. Passing through."),
+                NoFilter(IvtcSkipReason(
+                    $"Mostly progressive ({detection.GlobalProgressiveFraction:P1})", detection)),
 
             ContentType.MixedProgressiveInterlaced =>
                 Deinterlace(parity,
@@ -163,20 +150,32 @@ public static class RestoreStrategyMapper
 
     // ---- Action constructors (one per §7.2.3 chain choice) ----
 
-    private static (RestoreMode, string, string?, string) NoFilter(string notes) =>
+    private static (RestoreMode, string, Fps?, string) NoFilter(string notes) =>
         (RestoreMode.None, "", null, notes);
 
-    private static (RestoreMode, string, string?, string) Ivtc(FieldParity parity, string notes) =>
+    private static (RestoreMode, string, Fps?, string) Ivtc(FieldParity parity, string notes) =>
         (RestoreMode.Ivtc, RestoreFilters.IvtcChain(parity), RestoreFilters.IvtcOutputFps, notes);
 
-    private static (RestoreMode, string, string?, string) Deinterlace(FieldParity parity, string notes) =>
+    private static (RestoreMode, string, Fps?, string) Deinterlace(FieldParity parity, string notes) =>
         (RestoreMode.Deinterlace, RestoreFilters.DeinterlaceChain(parity), null, notes);
 
-    // ---- Helpers ----
+    // ---- Diagnostics ----
 
-    private static bool IsNtscThirtyFps(double? fps) =>
-        fps.HasValue && Math.Abs(fps.Value - NtscThirtyFps) < NtscThirtyFpsTolerance;
+    /// <summary>
+    /// Builds the explanation string for an IVTC-skip pass-through, naming the
+    /// specific guard(s) that failed.  Distinguishes "wrong source rate" from
+    /// "VFR source" so the log makes it clear why the chain didn't fire.
+    /// </summary>
+    private static string IvtcSkipReason(string trigger, ContentDetectionResult detection)
+    {
+        var fpsStr = detection.SourceFps?.ToString() ?? "?";
+        var reasons = new List<string>();
+        if (!(detection.SourceFps?.IsNtscThirty() ?? false))
+            reasons.Add($"source is {fpsStr} fps (not 30000/1001)");
+        if (!detection.SourceIsLikelyCfr)
+            reasons.Add("source is variable frame rate");
 
-    private static string Fps(double? fps) =>
-        fps.HasValue ? fps.Value.ToString("F3", CultureInfo.InvariantCulture) : "?";
+        string why = reasons.Count > 0 ? string.Join(" and ", reasons) : "IVTC guard failed";
+        return $"{trigger} but {why} — guide §7.2 IVTC chain doesn't apply. Passing through.";
+    }
 }

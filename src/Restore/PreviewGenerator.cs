@@ -27,8 +27,8 @@ public static class PreviewGenerator
         if (!string.IsNullOrWhiteSpace(restoreFilter))
             args.AddRange(new[] { "-vf", restoreFilter });
 
-        if (!string.IsNullOrWhiteSpace(outFps))
-            args.AddRange(new[] { "-r", outFps! });
+        if (outFps.HasValue)
+            args.AddRange(new[] { "-r", outFps.Value.ToString() });
 
         args.AddRange(new[]
         {
