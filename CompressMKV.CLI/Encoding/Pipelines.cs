@@ -178,6 +178,20 @@ public static class Pipelines
         logger ??= NullLogger.Instance;
         bool isIvtc = restore.Mode == RestoreMode.Ivtc;
         string loglevel = isIvtc ? "warning" : "error";
+        bool hasCpuFilter = !string.IsNullOrWhiteSpace(restore.FilterGraph);
+
+        // Two NVDEC+NVENC pipeline shapes, depending on whether a CPU filter
+        // sits between decode and encode:
+        //
+        //   No CPU filter (Progressive) — pure-GPU path.  Frames stay on the
+        //     GPU end-to-end (-hwaccel_output_format cuda).  NVENC consumes
+        //     cuda hwframes directly and matches the decoder's bit depth
+        //     automatically — so we MUST NOT also request -pix_fmt nv12 here,
+        //     which would otherwise force an unsupported cuda→nv12 auto-scale.
+        //
+        //   CPU filter (IVTC / Deinterlace) — download immediately at the
+        //     matched bit depth.  The CPU filter operates in system memory,
+        //     and NVENC re-uploads at the requested -pix_fmt.
 
         var args = new List<string>
         {
@@ -186,11 +200,14 @@ public static class Pipelines
         };
 
         if (cfg.UseNvdecForEncode)
-            args.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]);
+        {
+            string hwOutFormat = hasCpuFilter ? format.HwaccelOutputFormat : "cuda";
+            args.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", hwOutFormat]);
+        }
 
         args.AddRange(["-i", input]);
 
-        if (!string.IsNullOrWhiteSpace(restore.FilterGraph))
+        if (hasCpuFilter)
             args.AddRange(["-vf", restore.FilterGraph]);
 
         if (restore.OutputFps.HasValue && restore.Mode != RestoreMode.None)
@@ -207,7 +224,17 @@ public static class Pipelines
             "-spatial-aq", "1",
             "-temporal-aq", "1",
             "-rc-lookahead", cfg.RcLookahead.ToString(CultureInfo.InvariantCulture),
-            "-pix_fmt", format.EncodePixFmt,
+        ]);
+
+        // Only set -pix_fmt when frames will be in CPU memory (CPU filter case
+        // or no NVDEC).  In the pure-GPU pipeline NVENC selects the matched
+        // bit depth from the cuda hwframes; setting -pix_fmt would force a
+        // cuda→sw conversion that the auto-scaler can't perform.
+        bool framesOnGpu = cfg.UseNvdecForEncode && !hasCpuFilter;
+        if (!framesOnGpu)
+            args.AddRange(["-pix_fmt", format.EncodePixFmt]);
+
+        args.AddRange([
             "-fps_mode:v", "cfr",
             "-c:a", "copy",
             "-c:s", "copy",

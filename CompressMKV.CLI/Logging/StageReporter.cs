@@ -129,8 +129,12 @@ public sealed class StageReporter
             string bar = new string('#', filled) + new string(' ', barWidth - filled);
             string skipped = _skippedFiles > 0 ? $"  ({_skippedFiles} skipped via resume)" : "";
 
+            // Spectre markup escapes `[` and `]` by doubling them.  The earlier
+            // `\[` form looked like a C# escape but Spectre treats it as a real
+            // backslash followed by the opening of a new tag — which then ate
+            // the bar's spaces and crashed with "Could not find color or style ''".
             grid.AddRow(new Markup(
-                $"[bold]Overall:[/]  [green]\\[{bar}][/]  [yellow]{pct:P0}[/]  ({done}/{total} complete){skipped}"));
+                $"[bold]Overall:[/]  [green][[{bar}]][/]  [yellow]{pct:P0}[/]  ({done}/{total} complete){skipped}"));
 
             // Active table.
             grid.AddRow(new Markup(""));

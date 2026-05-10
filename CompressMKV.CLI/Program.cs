@@ -68,6 +68,17 @@ public static class Program
         }
 
         var cfg = BuildConfig(input!, output);
+
+        if (!Directory.Exists(cfg.InputFolder))
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Input folder not found:[/] {Markup.Escape(cfg.InputFolder)}");
+            AnsiConsole.MarkupLine(
+                "[grey]Tip: paths with spaces must be quoted on the shell, e.g. " +
+                "--input \"/some/path with spaces/folder\"[/]");
+            return 2;
+        }
+
         Directory.CreateDirectory(cfg.OutputFolder);
 
         // ---- Validate ffmpeg capabilities at startup ----
@@ -86,7 +97,15 @@ public static class Program
         // even files with no extension at all.
         var discovered = await VideoFileDiscovery.DiscoverAsync(cfg, cfg.InputFolder, cts.Token);
 
-        AnsiConsole.MarkupLine($"[bold]Found {discovered.Count} video file(s)[/] under {cfg.InputFolder}");
+        AnsiConsole.MarkupLine($"[bold]Found {discovered.Count} video file(s)[/] under {Markup.Escape(cfg.InputFolder)}");
+        if (discovered.Count == 0)
+        {
+            AnsiConsole.MarkupLine(
+                "[yellow]No video files to process.[/]  If the input path contains spaces, " +
+                "make sure to quote it on the command line (e.g. " +
+                "[grey]--input \"/some/path with spaces/folder\"[/]).");
+            return 0;
+        }
         AnsiConsole.MarkupLine(
             $"[grey]Concurrency:[/] {cfg.MaxConcurrentFiles} files in flight, " +
             $"{cfg.MaxConcurrentCpuFfmpegOps} CPU ffmpeg ops, " +
