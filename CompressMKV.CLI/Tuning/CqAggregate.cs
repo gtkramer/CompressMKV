@@ -12,8 +12,24 @@ public sealed class CqAggregate
     public List<SampleMetric> Samples { get; set; } = new();
 
     /// <summary>
-    /// Aggregates from ALL per-frame VMAF scores across all samples.
-    /// With 16 windows × 12s × 24fps ≈ 4,608 frames — robust percentile data.
+    /// Aggregates from ALL per-frame VMAF scores across all samples.  With 16
+    /// windows × 12s × 24fps ≈ 4,608 frames per CQ.
+    ///
+    /// A note on effective sample size: <see cref="TotalFrameCount"/> reports
+    /// the raw frame count, which is the right denominator for percentile
+    /// computation but NOT a measure of statistical independence.  Frames
+    /// within a 12-second window are highly correlated (same scene, same
+    /// motion characteristics), so for confidence-interval purposes the
+    /// effective sample size is closer to the WINDOW count (16 typically) —
+    /// each window is one approximately-independent observation.
+    ///
+    /// In practice this means: percentile estimates have a wider confidence
+    /// interval than the raw frame count would suggest.  Mean VMAF, P05,
+    /// and P01 reported here are point estimates with sampling-derived noise
+    /// of ~±0.5–1.0 VMAF points across runs (vs. the ~±0.05 you'd naively
+    /// expect from 4,608 truly-independent samples).  This is fundamental to
+    /// VMAF tuning at any scale, not a bug — Selector.MarginalThresholdPoints
+    /// (0.5) accounts for it.
     /// </summary>
     public static CqAggregate From(int cq, List<SampleMetric> samples)
     {

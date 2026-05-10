@@ -110,7 +110,7 @@ public static class Pipelines
             $"log_fmt=json:log_path={esc(vmafLog)}:" +
             $"model=version={vmafModelVersion}:" +
             $"n_threads={cfg.LibvmafThreads.ToString(CultureInfo.InvariantCulture)}:" +
-            "n_subsample=1";
+            $"n_subsample={cfg.LibvmafSubsample.ToString(CultureInfo.InvariantCulture)}";
 
         string filter;
         if (isHdr)

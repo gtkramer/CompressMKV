@@ -210,6 +210,12 @@ public static class Program
                         if (summary.Tuning.HdrCqShiftApplied)
                             Console.WriteLine($"    HDR CQ ladder shift applied: -{summary.Tuning.HdrCqShiftDelta}  Base=[{string.Join(",", summary.Tuning.BaseCqList)}] Effective=[{string.Join(",", summary.Tuning.EffectiveCqList)}]");
                         Console.WriteLine($"    VMAF: mean={sel.SelectedMeanVmaf:F2}, harmonic={sel.SelectedHarmonicMeanVmaf:F2}, p05={sel.SelectedP05Vmaf:F2}, p01={sel.SelectedP01Vmaf:F2}, min={sel.SelectedMinVmaf:F2}, frames={sel.TotalFrameCount}");
+                        if (sel.IsMarginal)
+                        {
+                            Console.WriteLine($"    MARGINAL PASS — selection is within {Selector.MarginalThresholdPoints:F1} VMAF points of threshold:");
+                            foreach (var r in sel.MarginalReasons)
+                                Console.WriteLine($"      ! {r}");
+                        }
                     }
 
                     Console.WriteLine($"  [{idx}/{files.Count}] Output: {summary.FinalOutputPath}");

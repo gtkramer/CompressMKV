@@ -72,18 +72,97 @@ public sealed class Config
     public int LibvmafThreads { get; set; } =
         Math.Clamp(Environment.ProcessorCount / 5, 2, 6);
 
+    /// <summary>
+    /// `n_subsample=N` setting for libvmaf.  N=1 measures every frame (most
+    /// accurate); N=2 measures every other frame (~2× faster, ~0.1 VMAF point
+    /// accuracy loss); N=4 measures every 4th frame (~4× faster).  For the
+    /// "find a CQ that hits the threshold" use case, 1 is correct — the cost
+    /// of an over-conservative pick (slightly larger files for the same
+    /// imperceptible quality) outweighs the speed gain from subsampling.
+    /// </summary>
+    public int LibvmafSubsample { get; set; } = 1;
+
+    /// <summary>
+    /// CQ ladder for the tuning search.  Range 16–34 in steps of 2:
+    ///   - Lower bound 16: near-lossless quality safety floor.  Below 16
+    ///     the encoder rarely improves on already-perceptually-transparent
+    ///     output and we'd just be wasting bits.
+    ///   - Upper bound 34: practical maximum compression for AV1 NVENC; CQs
+    ///     above this consistently fail the 97/95 quality gates on real content.
+    ///   - Step 2: ten ladder rungs gives reasonable granularity (~0.5 VMAF
+    ///     points per step on typical content); step 1 would double the search
+    ///     work for sub-perceptual differences between adjacent rungs.
+    /// </summary>
     public List<int> CandidateCq { get; set; } = new();
+
+    /// <summary>
+    /// Target number of stratified random sample windows.  16 × 12s = 192s
+    /// of measured content gives ~4,608 frames per CQ for a 24p source —
+    /// statistically robust for mean and P05.  See <see cref="Sampler"/> for
+    /// how this scales down on short sources.
+    /// </summary>
     public int SampleCount { get; set; } = 16;
+
+    /// <summary>
+    /// Target length of each sample window in seconds.  12s is long enough for
+    /// NVENC's <c>rc-lookahead</c> (~2s) and any temporal AQ / scene-change
+    /// detection to settle into steady-state behavior, so the VMAF score for
+    /// the window reflects the encoder's normal output rather than warm-up.
+    /// Below ~5s, encoder warm-up dominates and measurements get noisy.
+    /// </summary>
     public int SampleWindowSeconds { get; set; } = 12;
+
+    /// <summary>RNG seed for reproducible window selection.  Same input always
+    /// gets the same windows; runs with the same seed are byte-deterministic.</summary>
     public int RandomSeed { get; set; } = 12345;
 
-    // Frame-level VMAF thresholds (computed from per-frame scores across all samples).
-    // mean ≥ 97 + p05 ≥ 95 → quality loss virtually imperceptible at close viewing distances.
+    // -- VMAF quality thresholds --
+    //
+    // Computed from per-frame scores pooled across all sample windows.
+    // Three gates: mean catches systematic quality drops, P05 bounds the
+    // bottom-5% tail, P01 catches rare really-bad frames the P05 gate misses.
+
+    /// <summary>
+    /// Required mean VMAF.  Industry convention for the standard <c>vmaf_v0.6.1</c>
+    /// model: 97 = "perceptually transparent at typical viewing distances."
+    /// Lower (e.g. 95) for phone-screen viewing; higher (99+) for archive-grade.
+    /// </summary>
     public double TargetMeanVmaf { get; set; } = 97.0;
+
+    /// <summary>
+    /// Required 5th-percentile VMAF.  At most 5% of frames may score below this.
+    /// 95 = "very high quality" for the bottom-of-distribution frames.
+    /// Catches scenes that the mean would average over.
+    /// </summary>
     public double TargetP05Vmaf { get; set; } = 95.0;
 
+    /// <summary>
+    /// Required 1st-percentile VMAF.  Bounds the worst ~1% of frames.  Catches
+    /// rare bad scenes (single-second high-motion sequences, hard cuts) that
+    /// don't move the P05 needle but are perceptually visible if they drop too
+    /// low.  90 corresponds to "good quality" per the standard interpretation
+    /// — drops below this are starting to be visible to attentive viewers.
+    /// </summary>
+    public double TargetP01Vmaf { get; set; } = 90.0;
+
+    /// <summary>
+    /// Enables a uniform CQ-ladder shift for HDR content.  HDR's wider dynamic
+    /// range makes quantization errors more visible — the same CQ on HDR yields
+    /// lower VMAF scores than on SDR.  Shifting the ladder toward higher quality
+    /// compensates.
+    /// </summary>
     public bool HdrApplyCqLadderShift { get; set; } = true;
+
+    /// <summary>
+    /// HDR CQ ladder shift in CQ units.  Default 2 = "shift the whole search
+    /// 2 CQ steps toward higher quality" for HDR.  Empirical heuristic;
+    /// industry recommendations span 1–5 and modern AV1 may need less.
+    /// </summary>
     public int HdrCqLadderDelta { get; set; } = 2;
+
+    /// <summary>
+    /// Floor for the shifted CQ ladder so the HDR shift can't drive CQ negative.
+    /// </summary>
     public int MinCq { get; set; } = 0;
 
     public string NvencPreset { get; set; } = "p7";

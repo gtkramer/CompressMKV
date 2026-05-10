@@ -32,6 +32,18 @@ public static class VmafTuner
         var sampler = new Sampler(cfg.RandomSeed);
         var windows = sampler.StratifiedRandomWindows(dur, cfg.SampleCount, cfg.SampleWindowSeconds);
 
+        // Surface adaptive sampling: if the source was too short to fit the
+        // configured budget, the user should see what we actually used.
+        if (windows.Count != cfg.SampleCount)
+        {
+            double covered = windows.Sum(w => w.LengthSeconds);
+            double pct = dur > 0 ? covered / dur * 100 : 0;
+            Console.WriteLine(
+                $"  Adaptive sampling: source is {dur:F1}s — using {windows.Count} window(s) " +
+                $"covering {covered:F1}s ({pct:F0}% of source) instead of the configured " +
+                $"{cfg.SampleCount}×{cfg.SampleWindowSeconds}s budget.");
+        }
+
         var refsDir = Path.Combine(outDir, "refs");
         var samplesDir = Path.Combine(outDir, "samples");
         var vmafDir = Path.Combine(outDir, "vmaf");
@@ -144,11 +156,14 @@ public static class VmafTuner
                 $"p05={agg.P05Vmaf:F2} p01={agg.P01Vmaf:F2} min={agg.MinVmaf:F2} " +
                 $"frames={agg.TotalFrameCount} ({cqSw.Elapsed.TotalSeconds:F1}s)");
 
-            // Early termination: highest CQ passing both thresholds is the answer.
-            if (agg.MeanVmaf >= cfg.TargetMeanVmaf && agg.P05Vmaf >= cfg.TargetP05Vmaf)
+            // Early termination: highest CQ passing all three gates is the answer.
+            if (agg.MeanVmaf >= cfg.TargetMeanVmaf &&
+                agg.P05Vmaf  >= cfg.TargetP05Vmaf  &&
+                agg.P01Vmaf  >= cfg.TargetP01Vmaf)
             {
-                Console.WriteLine($"    CQ={cq} meets thresholds " +
-                    $"(mean>={cfg.TargetMeanVmaf:F1}, p05>={cfg.TargetP05Vmaf:F1}) — stopping search.");
+                Console.WriteLine($"    CQ={cq} meets all thresholds " +
+                    $"(mean≥{cfg.TargetMeanVmaf:F1}, p05≥{cfg.TargetP05Vmaf:F1}, " +
+                    $"p01≥{cfg.TargetP01Vmaf:F1}) — stopping search.");
                 break;
             }
         }
