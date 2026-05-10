@@ -104,9 +104,15 @@ public static partial class ContentDetector
         Config cfg, string input, FfprobeStream vstream, CancellationToken ct)
     {
         // ---- Build ffmpeg args ----
+        // Loglevel "info" is required so idet's end-of-stream aggregate ("Multi
+        // frame detection: ...") reaches stderr — that line is logged at info
+        // level, not warning or error.  The aggregate cross-check in
+        // CheckAggregateAgreement depends on this.  -nostats suppresses the
+        // periodic decoder progress chatter that would otherwise fill stderr
+        // at info level.
         var argList = new List<string>
         {
-            "-hide_banner", "-loglevel", "error", "-nostats"
+            "-hide_banner", "-loglevel", "info", "-nostats"
         };
 
         if (cfg.UseHwaccelForDetection)
@@ -435,8 +441,13 @@ public static partial class ContentDetector
     internal static (long? Prog, long? Tff, long? Bff, long? Undet) ParseIdetAggregate(string stderr)
     {
         if (string.IsNullOrEmpty(stderr)) return (null, null, null, null);
-        var match = IdetAggregateRegex().Match(stderr);
-        if (!match.Success) return (null, null, null, null);
+
+        // idet emits "Multi frame detection:" TWICE — once at filter init (all
+        // zeros), once at end-of-stream with the real counts.  Take the LAST
+        // match to get the meaningful aggregate.
+        var matches = IdetAggregateRegex().Matches(stderr);
+        if (matches.Count == 0) return (null, null, null, null);
+        var match = matches[^1];
 
         return (
             long.Parse(match.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture),

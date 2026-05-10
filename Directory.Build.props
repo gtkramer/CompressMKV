@@ -1,0 +1,19 @@
+<Project>
+
+  <!--
+    Repository-wide MSBuild settings.  Inherited by every project under this
+    directory unless explicitly overridden.  Centralising here keeps individual
+    .csproj files focused on project-specific concerns (assembly references,
+    package references, conditional compilation, etc.).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+</Project>

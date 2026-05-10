@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>CompressMkv</RootNamespace>
+    <AssemblyName>CompressMKV.CLI</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CompressMKV.Tests" />
+  </ItemGroup>
+
+</Project>
