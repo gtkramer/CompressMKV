@@ -36,6 +36,7 @@
 //   Detection thresholds are internal constants derived from signal physics.
 //   Hardware-accelerated decoding (NVDEC) is used when available.
 
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 
@@ -120,12 +121,24 @@ public static class Program
                              .ToList();
 
         Console.WriteLine($"Found {files.Count} mkv files under {cfg.InputFolder}");
+        Console.WriteLine(
+            $"Concurrency: {cfg.MaxConcurrentFiles} files in flight, " +
+            $"{cfg.MaxConcurrentCpuFfmpegOps} CPU ffmpeg ops, " +
+            $"{cfg.NvencSlots} NVENC + {cfg.NvdecSlots} NVDEC, " +
+            $"{cfg.FfmpegCpuThreads} threads/CPU op, " +
+            $"{cfg.LibvmafThreads} threads/libvmaf.");
+
         var gpu = new GpuGate(cfg.NvencSlots, cfg.NvdecSlots);
+        var cpu = new CpuGate(cfg.MaxConcurrentCpuFfmpegOps);
         var overall = new OverallSummary { StartedUtc = DateTime.UtcNow, Config = cfg };
 
         await Parallel.ForEachAsync(
             files.Select((file, i) => (file, idx: i + 1)),
-            new ParallelOptions { CancellationToken = cts.Token },
+            new ParallelOptions
+            {
+                CancellationToken = cts.Token,
+                MaxDegreeOfParallelism = cfg.MaxConcurrentFiles,
+            },
             async (item, ct) =>
             {
                 var (file, idx) = item;
@@ -158,7 +171,7 @@ public static class Program
                 Console.WriteLine($"\n[{idx}/{files.Count}] {file}");
                 try
                 {
-                    var summary = await ProcessOneAsync(cfg, gpu, file, hasZscale, ct);
+                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, hasZscale, ct);
                     lock (overall) overall.Videos.Add(summary);
 
                     Console.WriteLine($"  [{idx}/{files.Count}] HDR: {summary.IsHdr}");
@@ -210,6 +223,18 @@ public static class Program
                         foreach (var w in v.Warnings)
                             Console.WriteLine($"    ! {w}");
                     }
+
+                    if (summary.Timings is { } tm)
+                    {
+                        Console.WriteLine(
+                            $"  [{idx}/{files.Count}] Timings (total {tm.Total.TotalSeconds:F1}s): " +
+                            $"detect={tm.Detection.TotalSeconds:F1}s, " +
+                            $"prev={tm.Previews.TotalSeconds:F1}s, " +
+                            $"tune.p1={tm.TuningPhase1.TotalSeconds:F1}s, " +
+                            $"tune.p2={tm.TuningPhase2.TotalSeconds:F1}s, " +
+                            $"final={tm.FinalEncode.TotalSeconds:F1}s, " +
+                            $"verify={tm.Verification.TotalSeconds:F1}s.");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -226,8 +251,10 @@ public static class Program
     }
 
     private static async Task<VideoSummary> ProcessOneAsync(
-        Config cfg, GpuGate gpu, string input, bool hasZscale, CancellationToken ct)
+        Config cfg, GpuGate gpu, CpuGate cpu, string input, bool hasZscale, CancellationToken ct)
     {
+        var totalSw = Stopwatch.StartNew();
+        var timings = new PhaseTimings();
         var id = SafeId(Path.GetFileNameWithoutExtension(input));
         var outDir = Path.Combine(cfg.OutputFolder, id);
         Directory.CreateDirectory(outDir);
@@ -260,11 +287,15 @@ public static class Program
 
         // Source-agnostic content detection per MPlayer guide §7.2.2.
         // Runs on all content regardless of source type (DVD, Blu-ray, etc.)
-        // Gate NVDEC slot when hardware-accelerated detection is enabled.
+        // Gate NVDEC slot when hardware-accelerated detection is enabled, plus
+        // a CPU slot for the idet filter and any software decode work.
+        var sw = Stopwatch.StartNew();
         using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, ct))
+        using (await cpu.AcquireAsync(ct))
         {
             detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct);
         }
+        timings.Detection = sw.Elapsed;
 
         // Map ContentType enum → restore filter chain per MPlayer guide §7.2.3
         restore = RestoreStrategyMapper.MapToRestore(detection);
@@ -276,6 +307,7 @@ public static class Program
 
         if (needPreviews)
         {
+            sw.Restart();
             var previewDir = Path.Combine(outDir, "previews");
             Directory.CreateDirectory(previewDir);
             restore.Previews = new List<PreviewArtifact>();
@@ -298,28 +330,45 @@ public static class Program
                 string ivtcPrev = Path.Combine(previewDir, $"preview_ivtc_{baseTag}.mkv");
                 string deintPrev = Path.Combine(previewDir, $"preview_deint_{baseTag}.mkv");
 
-                await PreviewGenerator.MakeLosslessPreviewAsync(cfg, input, ivtcPrev, RestoreMode.Ivtc, detection.DetectedParity, t, ct);
-                await PreviewGenerator.MakeLosslessPreviewAsync(cfg, input, deintPrev, RestoreMode.Deinterlace, detection.DetectedParity, t, ct);
+                using (await cpu.AcquireAsync(ct))
+                    await PreviewGenerator.MakeLosslessPreviewAsync(cfg, input, ivtcPrev, RestoreMode.Ivtc, detection.DetectedParity, t, ct);
+                using (await cpu.AcquireAsync(ct))
+                    await PreviewGenerator.MakeLosslessPreviewAsync(cfg, input, deintPrev, RestoreMode.Deinterlace, detection.DetectedParity, t, ct);
 
                 restore.Previews.Add(new PreviewArtifact { TimestampSeconds = t, IvtcPath = ivtcPrev, DeintPath = deintPrev });
             }
+            timings.Previews = sw.Elapsed;
         }
 
         // VMAF tuning: two-phase pipeline with pre-extracted reference clips.
-        var tuning = await VmafTuner.TuneAsync(cfg, gpu, input, outDir, restore, isHdr, vmafModelPath, ct);
+        var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore, isHdr, vmafModelPath, ct);
+        timings.TuningPhase1 = tuning.Phase1Elapsed;
+        timings.TuningPhase2 = tuning.Phase2Elapsed;
 
-        // Final encode uses selected CQ directly (HDR ladder already shifted during tuning)
+        // Final encode uses selected CQ directly (HDR ladder already shifted during tuning).
+        // The restore filter runs on CPU even though NVENC handles encoding, so a CPU slot
+        // is acquired for the duration in addition to the NVENC slot inside FinalEncoder.
         int finalCq = tuning.Selection.SelectedCq;
         var finalOut = Path.Combine(outDir, $"{id}_av1_cq{finalCq}{cfg.OutputExtension}");
-        await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, ct);
+        sw.Restart();
+        using (await cpu.AcquireAsync(ct))
+        {
+            await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, ct);
+        }
+        timings.FinalEncode = sw.Elapsed;
 
         // Trust-but-verify: confirm the final output reflects the chosen restoration.
-        // For pass-through runs this is a no-op.  Acquires NVDEC for the AV1 decode pass.
+        // For pass-through runs this is a no-op.  Acquires NVDEC for the AV1 decode pass
+        // plus a CPU slot for the idet filter.
+        sw.Restart();
         OutputVerificationResult verification;
         using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, ct))
+        using (await cpu.AcquireAsync(ct))
         {
             verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, ct);
         }
+        timings.Verification = sw.Elapsed;
+        timings.Total = totalSw.Elapsed;
 
         var summary = new VideoSummary
         {
@@ -334,6 +383,7 @@ public static class Program
             Tuning = tuning,
             FinalCq = finalCq,
             OutputVerification = verification,
+            Timings = timings,
         };
 
         await JsonIO.WriteAsync(Path.Combine(outDir, "log.json"), summary, ct);

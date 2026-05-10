@@ -23,4 +23,10 @@ public sealed class VideoSummary
     /// verification was skipped or failed to run.
     /// </summary>
     public OutputVerificationResult? OutputVerification { get; set; }
+
+    /// <summary>
+    /// Wall-clock time spent in each pipeline phase.  Used to verify the
+    /// concurrency model produced the expected utilization profile.
+    /// </summary>
+    public PhaseTimings? Timings { get; set; }
 }

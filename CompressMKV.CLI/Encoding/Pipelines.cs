@@ -22,6 +22,7 @@ public static class Pipelines
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", "error",
+            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
             "-ss", w.StartSeconds.ToString("F3", CultureInfo.InvariantCulture),
             "-i", input,
             "-t", w.LengthSeconds.ToString("F3", CultureInfo.InvariantCulture),
@@ -39,6 +40,7 @@ public static class Pipelines
             "-c:v", "ffv1",
             "-level", "3",
             "-slicecrc", "1",
+            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
             output
         ]);
 
@@ -59,6 +61,7 @@ public static class Pipelines
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", "error",
+            "-threads", cfg.FfmpegGpuThreads.ToString(CultureInfo.InvariantCulture),
             "-i", refInput,
             "-map", "0:v:0", "-an",
             "-c:v", "av1_nvenc",
@@ -95,6 +98,14 @@ public static class Pipelines
 
         string esc(string p) => p.Replace(@"\", @"\\").Replace(":", @"\:");
 
+        // libvmaf threads: capped via Config so total CPU stays in-budget when
+        // multiple VMAF runs are in flight (gated by CpuGate at the caller).
+        string vmafOpts =
+            $"log_fmt=json:log_path={esc(vmafLog)}:" +
+            $"model_path={esc(vmafModelPath)}:" +
+            $"n_threads={cfg.LibvmafThreads.ToString(CultureInfo.InvariantCulture)}:" +
+            "n_subsample=1";
+
         string filter;
         if (isHdr)
         {
@@ -105,8 +116,7 @@ public static class Pipelines
                 "zscale=t=bt709:m=bt709:r=tv,format=yuv420p[ref_sdr];",
                 "[1:v]zscale=t=linear:npl=100,tonemap=tonemap=hable,",
                 "zscale=t=bt709:m=bt709:r=tv,format=yuv420p[enc_sdr];",
-                $"[enc_sdr][ref_sdr]libvmaf=log_fmt=json:log_path={esc(vmafLog)}:",
-                $"model_path={esc(vmafModelPath)}:n_subsample=1");
+                $"[enc_sdr][ref_sdr]libvmaf={vmafOpts}");
         }
         else
         {
@@ -114,13 +124,13 @@ public static class Pipelines
             filter = string.Concat(
                 "[0:v]format=yuv420p10le[ref];",
                 "[1:v]format=yuv420p10le[enc];",
-                $"[enc][ref]libvmaf=log_fmt=json:log_path={esc(vmafLog)}:",
-                $"model_path={esc(vmafModelPath)}:n_subsample=1");
+                $"[enc][ref]libvmaf={vmafOpts}");
         }
 
         var args = new[]
         {
             "-hide_banner", "-loglevel", "error",
+            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
             "-i", refInput,
             "-i", encInput,
             "-lavfi", filter,
@@ -151,6 +161,7 @@ public static class Pipelines
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", loglevel,
+            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
         };
 
         if (cfg.UseNvdecForEncode)

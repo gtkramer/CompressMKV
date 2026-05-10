@@ -112,7 +112,8 @@ public static partial class ContentDetector
         // at info level.
         var argList = new List<string>
         {
-            "-hide_banner", "-loglevel", "info", "-nostats"
+            "-hide_banner", "-loglevel", "info", "-nostats",
+            "-threads", cfg.FfmpegCpuThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
 
         if (cfg.UseHwaccelForDetection)

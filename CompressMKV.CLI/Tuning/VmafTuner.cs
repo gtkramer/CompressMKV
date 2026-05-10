@@ -1,4 +1,4 @@
-using System.Globalization;
+using System.Diagnostics;
 
 namespace CompressMkv;
 
@@ -9,13 +9,19 @@ namespace CompressMkv;
 ///            Early termination when a CQ meets frame-level thresholds.
 ///
 /// This reduces N_samples × N_cq full source decodes to just N_samples fast-seeking decodes.
-/// VMAF runs are CPU-only and overlap naturally with GPU encodes.
-/// HDR CQ ladder shift is applied here.
+///
+/// Concurrency model:
+///   - CPU-heavy ffmpeg ops (ref extraction, VMAF) gate on a global <see cref="CpuGate"/>
+///     so that work flows naturally across files without oversubscribing the CPU.
+///   - GPU NVENC sample encodes gate on <see cref="GpuGate"/> separately — they're
+///     mostly idle on CPU and run in parallel with CPU-heavy VMAF.
+///   - Per-process thread counts come from <see cref="Config.FfmpegCpuThreads"/>,
+///     <see cref="Config.FfmpegGpuThreads"/>, and <see cref="Config.LibvmafThreads"/>.
 /// </summary>
 public static class VmafTuner
 {
     public static async Task<TuningResult> TuneAsync(
-        Config cfg, GpuGate gpu, string input, string outDir,
+        Config cfg, GpuGate gpu, CpuGate cpu, string input, string outDir,
         RestoreDecision restore, bool isHdr, string vmafModelPath,
         CancellationToken ct)
     {
@@ -48,87 +54,94 @@ public static class VmafTuner
         //  Each clip has the restore filter applied (IVTC/deinterlace)
         //  so it represents the true progressive reference for VMAF.
         //  Fast-seek (-ss before -i) → minimal decode overhead.
+        //
+        //  Throttled by the CpuGate — the global gate caps total in-flight
+        //  CPU ffmpeg ops (across all files) at Config.MaxConcurrentCpuFfmpegOps,
+        //  so this saturates the CPU without thrashing.  No batch barriers.
         // =======================================================
         Console.WriteLine($"  Phase 1: Extracting {windows.Count} reference clips (FFV1 lossless, cadence-restored)...");
+        var phase1Sw = Stopwatch.StartNew();
         var refClips = new string[windows.Count];
 
         var refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
-            await Pipelines.ExtractReferenceClipAsync(cfg, input, refPath, w, restore, ct);
-            return (Index: i, Path: refPath);
-        }).ToList();
+            using (await cpu.AcquireAsync(ct))
+                await Pipelines.ExtractReferenceClipAsync(cfg, input, refPath, w, restore, ct);
+            refClips[i] = refPath;
+        }).ToArray();
 
-        // Moderate parallelism for CPU-bound restore filter work.
-        foreach (var batch in refTasks.Chunk(4))
-        {
-            var results = await Task.WhenAll(batch);
-            foreach (var (idx, path) in results)
-                refClips[idx] = path;
-        }
-        Console.WriteLine("  Phase 1 complete: reference clips extracted.");
+        await Task.WhenAll(refTasks);
+        phase1Sw.Stop();
+        Console.WriteLine($"  Phase 1 complete in {phase1Sw.Elapsed.TotalSeconds:F1}s.");
 
         // =======================================================
         //  Phase 2: Encode + VMAF per CQ level.
         //  Test from highest CQ (most compression) to lowest.
         //  Early termination when a CQ meets frame-level thresholds.
-        //  VMAF is CPU-only — overlaps naturally with GPU encodes.
+        //
+        //  All 16 sample tasks for a CQ fire in parallel.  Each task does:
+        //    1. acquire NVENC slot (GpuGate) → encode → release
+        //    2. acquire CPU slot   (CpuGate) → VMAF   → release
+        //
+        //  Concurrency emerges naturally from the gates:
+        //    - Up to 2 NVENC encodes in flight at once (across all files).
+        //    - Up to MaxConcurrentCpuFfmpegOps VMAFs in flight at once
+        //      (across all files).
+        //    - With 2 files in flight, each gets ~1 NVENC continuously and
+        //      shares the CPU pool with the other file's Phase 1 / VMAFs.
+        //    - With 1 file in flight, that file uses BOTH NVENC engines for
+        //      sample encodes — no idle silicon at the tail of a batch.
         // =======================================================
         var effectiveCqDesc = effectiveCq.OrderByDescending(x => x).ToList();
         var cqResults = new List<CqAggregate>();
+        var phase2Sw = Stopwatch.StartNew();
 
         foreach (var cq in effectiveCqDesc)
         {
             ct.ThrowIfCancellationRequested();
+            var cqSw = Stopwatch.StartNew();
             Console.WriteLine($"  Tuning CQ={cq}...");
 
-            // GPU encodes run one at a time per file (serial), freeing the other
-            // NVENC slot for the concurrent file.  VMAF tasks (CPU-only) fire off
-            // immediately after each encode and overlap with the next encode.
-            var vmafTasks = new List<Task<SampleMetric>>();
-
-            for (int i = 0; i < windows.Count; i++)
+            var sampleTasks = Enumerable.Range(0, windows.Count).Select(async i =>
             {
                 string refClip = refClips[i];
                 string tag = $"s{i:00}";
                 string encPath = Path.Combine(samplesDir, $"cq{cq}_{tag}.mkv");
                 string vmafLog = Path.Combine(vmafDir, $"cq{cq}_{tag}.json");
 
-                // GPU encode — one NVENC slot at a time per file.
+                // 1. GPU encode — competes for NVENC slot via GpuGate.
                 using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, ct))
-                {
                     await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, ct);
-                }
 
-                // VMAF — CPU-only, runs concurrently with the next sample's encode.
-                int sampleIdx = i;
-                var window = windows[i];
-                vmafTasks.Add(Task.Run(async () =>
-                {
+                // 2. VMAF — competes for CPU slot via CpuGate.  Held only for
+                //    the ffmpeg/libvmaf process; the JSON parse is unmetered.
+                using (await cpu.AcquireAsync(ct))
                     await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, vmafLog, vmafModelPath, ct);
-                    var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
-                    return new SampleMetric
-                    {
-                        SampleIndex = sampleIdx,
-                        Window = window,
-                        ReferenceClipPath = refClip,
-                        EncodedPath = encPath,
-                        VmafLogPath = vmafLog,
-                        VmafMean = vmafResult.Mean,
-                        VmafHarmonicMean = vmafResult.HarmonicMean,
-                        FrameVmafScores = vmafResult.FrameScores,
-                    };
-                }, ct));
-            }
 
-            var metrics = (await Task.WhenAll(vmafTasks)).ToList();
+                var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
+                return new SampleMetric
+                {
+                    SampleIndex = i,
+                    Window = windows[i],
+                    ReferenceClipPath = refClip,
+                    EncodedPath = encPath,
+                    VmafLogPath = vmafLog,
+                    VmafMean = vmafResult.Mean,
+                    VmafHarmonicMean = vmafResult.HarmonicMean,
+                    FrameVmafScores = vmafResult.FrameScores,
+                };
+            }).ToArray();
+
+            var metrics = (await Task.WhenAll(sampleTasks)).ToList();
+            cqSw.Stop();
 
             var agg = CqAggregate.From(cq, metrics);
             cqResults.Add(agg);
 
             Console.WriteLine($"    mean={agg.MeanVmaf:F2} harmonic={agg.HarmonicMeanVmaf:F2} " +
                 $"p05={agg.P05Vmaf:F2} p01={agg.P01Vmaf:F2} min={agg.MinVmaf:F2} " +
-                $"frames={agg.TotalFrameCount}");
+                $"frames={agg.TotalFrameCount} ({cqSw.Elapsed.TotalSeconds:F1}s)");
 
             // Early termination: highest CQ passing both thresholds is the answer.
             if (agg.MeanVmaf >= cfg.TargetMeanVmaf && agg.P05Vmaf >= cfg.TargetP05Vmaf)
@@ -139,7 +152,9 @@ public static class VmafTuner
             }
         }
 
+        phase2Sw.Stop();
         var selection = Selector.Select(cfg, cqResults);
+        Console.WriteLine($"  Phase 2 complete in {phase2Sw.Elapsed.TotalSeconds:F1}s ({cqResults.Count} CQ levels evaluated).");
 
         return new TuningResult
         {
@@ -150,7 +165,10 @@ public static class VmafTuner
             BaseCqList = baseCq,
             EffectiveCqList = effectiveCq,
             HdrCqShiftApplied = hdrShiftApplied,
-            HdrCqShiftDelta = hdrShiftApplied ? cfg.HdrCqLadderDelta : 0
+            HdrCqShiftDelta = hdrShiftApplied ? cfg.HdrCqLadderDelta : 0,
+
+            Phase1Elapsed = phase1Sw.Elapsed,
+            Phase2Elapsed = phase2Sw.Elapsed,
         };
     }
 }

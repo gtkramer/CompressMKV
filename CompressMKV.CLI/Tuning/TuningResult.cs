@@ -10,4 +10,7 @@ public sealed class TuningResult
     public List<int> EffectiveCqList { get; set; } = new();
     public bool HdrCqShiftApplied { get; set; }
     public int HdrCqShiftDelta { get; set; }
+
+    public TimeSpan Phase1Elapsed { get; set; }
+    public TimeSpan Phase2Elapsed { get; set; }
 }
