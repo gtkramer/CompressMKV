@@ -78,11 +78,15 @@ public static class Program
         else
             AnsiConsole.MarkupLine("[green]OK:[/] libvmaf and zscale available.");
 
-        var files = Directory.EnumerateFiles(cfg.InputFolder, "*.mkv", SearchOption.AllDirectories)
-                             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-                             .ToList();
+        // Discover video files by content, not extension.  Probes every file
+        // in the input folder (that's >10 KB and not hidden) with ffprobe and
+        // keeps the ones that have real video content — i.e. at least one
+        // non-cover-art video stream and >1 second of duration.  Handles any
+        // container ffmpeg can read (.mkv/.mp4/.rm/.flv/.vob/.wmv/...) and
+        // even files with no extension at all.
+        var discovered = await VideoFileDiscovery.DiscoverAsync(cfg, cfg.InputFolder, cts.Token);
 
-        AnsiConsole.MarkupLine($"[bold]Found {files.Count} mkv files[/] under {cfg.InputFolder}");
+        AnsiConsole.MarkupLine($"[bold]Found {discovered.Count} video file(s)[/] under {cfg.InputFolder}");
         AnsiConsole.MarkupLine(
             $"[grey]Concurrency:[/] {cfg.MaxConcurrentFiles} files in flight, " +
             $"{cfg.MaxConcurrentCpuFfmpegOps} CPU ffmpeg ops, " +
@@ -96,11 +100,11 @@ public static class Program
         var gpu = new GpuGate(cfg.NvencSlots, cfg.NvdecSlots);
         var cpu = new CpuGate(cfg.MaxConcurrentCpuFfmpegOps);
         var overall = new OverallSummary { StartedUtc = DateTime.UtcNow, Config = cfg };
-        var reporter = new StageReporter(files.Count);
+        var reporter = new StageReporter(discovered.Count);
 
         // Live UI: re-renders the reporter every 200ms while the workload runs.
         // Spectre.Console handles non-TTY environments gracefully (plain output).
-        var workTask = ProcessAllFilesAsync(cfg, gpu, cpu, files, hasZscale, forceRedo, overall, reporter, cts.Token);
+        var workTask = ProcessAllFilesAsync(cfg, gpu, cpu, discovered, hasZscale, forceRedo, overall, reporter, cts.Token);
 
         await AnsiConsole.Live(reporter.BuildRenderable())
             .AutoClear(false)
@@ -144,11 +148,11 @@ public static class Program
     /// concurrent file processings, each with its own <see cref="PerFileLogger"/>.
     /// </summary>
     private static async Task ProcessAllFilesAsync(
-        Config cfg, GpuGate gpu, CpuGate cpu, List<string> files, bool hasZscale,
+        Config cfg, GpuGate gpu, CpuGate cpu, List<DiscoveredVideo> files, bool hasZscale,
         bool forceRedo, OverallSummary overall, StageReporter reporter, CancellationToken ct)
     {
         await Parallel.ForEachAsync(
-            files.Select((file, i) => (file, idx: i + 1)),
+            files.Select((dv, i) => (dv, idx: i + 1)),
             new ParallelOptions
             {
                 CancellationToken = ct,
@@ -156,7 +160,8 @@ public static class Program
             },
             async (item, fileCt) =>
             {
-                var (file, idx) = item;
+                var (discovered, idx) = item;
+                var file = discovered.Path;
                 var id = SafeId(Path.GetFileNameWithoutExtension(file));
                 var outDir = Path.Combine(cfg.OutputFolder, id);
                 var logPath = Path.Combine(outDir, "log.json");
@@ -194,7 +199,7 @@ public static class Program
 
                 try
                 {
-                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, hasZscale, fileCt, logger);
+                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, discovered.Probe, hasZscale, fileCt, logger);
                     lock (overall) overall.Videos.Add(summary);
 
                     var (resultText, level) = SummariseResult(summary);
@@ -277,9 +282,10 @@ public static class Program
     };
 
     private static async Task<VideoSummary> ProcessOneAsync(
-        Config cfg, GpuGate gpu, CpuGate cpu, string input, bool hasZscale,
-        CancellationToken ct, IPipelineLogger logger)
+        Config cfg, GpuGate gpu, CpuGate cpu, string input, FfprobeRoot probe,
+        bool hasZscale, CancellationToken ct, IPipelineLogger logger)
     {
+        await Task.CompletedTask;  // makes async-state-machine cancellation deterministic
         var totalSw = Stopwatch.StartNew();
         var timings = new PhaseTimings();
         var id = SafeId(Path.GetFileNameWithoutExtension(input));
@@ -289,10 +295,10 @@ public static class Program
         logger.LogInfo($"Input: {input}");
         logger.LogInfo($"Output dir: {outDir}");
 
-        logger.SetStage("Probe");
-        var probe = await Ffprobe.RunAsync(cfg, input, ct);
-        var vstream = probe.Streams?.FirstOrDefault(s => s.CodecType == "video")
-                     ?? throw new InvalidOperationException("No video stream found.");
+        // Probe was already done during discovery; pick the real video stream.
+        // Filter out cover-art streams in case the source contains both.
+        var vstream = probe.Streams?.FirstOrDefault(s => s.IsActualVideo())
+                     ?? throw new InvalidOperationException("No usable video stream found.");
 
         bool isHdr = SourceClassifier.IsHdr(vstream);
         logger.LogInfo($"HDR: {isHdr}");

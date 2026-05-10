@@ -17,6 +17,22 @@ public sealed class FfprobeStream
     // ffprobe may provide this; sometimes "unknown" even when interlaced.
     [JsonPropertyName("field_order")] public string? FieldOrder { get; set; }
 
+    /// <summary>
+    /// Stream-level disposition.  Used to recognise "attached picture" video
+    /// streams — i.e. cover art embedded in audio files — which would
+    /// otherwise show up as <c>codec_type = "video"</c> and look like real
+    /// video content during discovery.
+    /// </summary>
+    [JsonPropertyName("disposition")] public FfprobeDisposition? Disposition { get; set; }
+
+    /// <summary>
+    /// True when this stream represents real video content as opposed to
+    /// audio-with-cover-art.  Used by file-discovery to decide whether a file
+    /// is worth processing.
+    /// </summary>
+    public bool IsActualVideo() =>
+        CodecType == "video" && (Disposition?.AttachedPic ?? 0) != 1;
+
     // Frame rate strings.  r_frame_rate is the lowest common multiple of frame
     // rates seen (the "nominal" rate for CFR sources, the highest seen for VFR);
     // avg_frame_rate is the mean across the stream.  For CFR content the two

@@ -1,9 +1,16 @@
 # CompressMKV
 
-VMAF-guided AV1 NVENC compressor for arbitrary MKV files. Detects whether the
-source is progressive, telecined, interlaced, or a mix; restores the original
-cadence; then searches for the highest-CQ encode that hits a per-frame VMAF
-quality target.
+VMAF-guided AV1 NVENC compressor for arbitrary video files. Detects whether
+the source is progressive, telecined, interlaced, or a mix; restores the
+original cadence; then searches for the highest-CQ encode that hits a
+per-frame VMAF quality target.
+
+Despite the name, accepts **any** video file ffmpeg can read as input,
+regardless of extension. Discovery probes every file in the input folder
+with ffprobe and keeps the ones that contain real video content (excluding
+audio-only files, embedded cover art, and single-image files). Output is
+always written as `.mkv` since that's the right home for AV1 + multi-track
+audio + subtitle pass-through.
 
 Implements the five NTSC content categories from the
 [MPlayer/MEncoder telecine guide §7.2](http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-telecine.html)
