@@ -1,69 +1,82 @@
-using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace CompressMkv;
 
-// =========================
-// Content type detection per MPlayer guide §7.2.2 — five categories
-// =========================
+// =========================================================================
+// Content type detection per MPlayer guide §7.2.2 — five categories.
 //
-// Single-pass approach: one ffmpeg call decodes the entire file with the idet
-// filter and metadata=mode=print.  Per-frame classification (progressive, tff,
-// bff, or undetermined) is streamed from stdout and stored as a compact
-// FrameFlag list — about 200 KB for a typical 2-hour movie, trivially small
-// even with gigabytes of available RAM.
+// Single-pass, ffmpeg-only:
+//   ffmpeg → idet → metadata=mode=print streams a per-frame interlace flag
+//   (progressive | tff | bff | undetermined) for every frame in the file.
 //
-// All five §7.2.2 content types are identified using two whole-file metrics
-// computed directly from the per-frame sequence:
+// Three whole-file metrics decide which of the five §7.2.2 categories apply:
 //
-//   1. Global progressive fraction
-//      The ratio of progressive frames to all classified (P+I) frames.
-//      §7.2.2.1 Progressive:  ≥ 95% progressive
-//      §7.2.2.3 Interlaced:   ≤ 5%  progressive
+//   1. progFrac   — progressive / (progressive + interlaced)
+//                   Excludes undetermined frames so the value reflects the
+//                   true content mix rather than idet's blind spots.
 //
-//   2. Telecine cadence match rate
-//      A 5-frame sliding window scans the entire frame sequence.  Each window
-//      that contains exactly 3 progressive and 2 interlaced frames matches the
-//      3:2 pulldown signature (PPPII) described in §7.2.2.2.  The fraction of
-//      matching windows is the cadence match rate.
+//   2. cadenceRate — fraction of 5-frame sliding windows containing exactly
+//                    3 progressive + 2 interlaced frames (the 3:2 pulldown
+//                    PPPII signature, in any of its 5 cyclic phases).
 //
-//      §7.2.2.2 Telecined:               cadence rate ≥ 80%  (uniform cadence)
-//      §7.2.2.4 Mixed prog+telecine:     cadence rate 10–80% (some telecined sections)
-//      §7.2.2.5 Mixed prog+interlaced:   cadence rate < 10%  (no periodic pattern)
+//   3. iInCadence — fraction of *interlaced* frames whose centered 5-frame
+//                   neighborhood is exactly 3P + 2I.  This is the §7.2.2.4
+//                   vs §7.2.2.5 discriminator: telecined I frames sit inside
+//                   3:2 cycles (high ratio); native interlace produces clusters
+//                   of consecutive I frames (low ratio).
 //
-// The cadence match rate is the key discriminator.  Telecined content has a
-// deterministic repeating 5-frame cycle, so the rate is near 100%.  Contiguous
-// mixed progressive+interlaced content has a rate near 0% because progressive
-// regions (all P) and interlaced regions (all I) never produce 3P+2I windows.
+// Classification is pure §7.2.2 identification — one branch per category, no
+// action choices.  The §7.2.3 action mapping (including the §7.2.3.5 "favor
+// what dominates" sub-decision and footnote [3]'s safe-pullup default) lives
+// in RestoreStrategyMapper, which has access to source rate and can guard
+// against applying the IVTC chain to non-NTSC-thirty sources.
 //
-// No chunks.  No sampling.  No IVTC verification.  No configurable thresholds.
-// All detection constants are derived from 3:2 pulldown signal physics and are
-// internal to this class.
+// Evaluation order (most specific first):
 //
-// Parity (TFF vs BFF) is determined from full-file frame counts — with hundreds
-// of thousands of frames the result is definitive.
+//   intCount == 0       → §7.2.2.1 Progressive (verified — "you should never
+//                          see any interlacing")
+//   progFrac ≤ 5%       → §7.2.2.3 Interlaced ("every single frame is interlaced")
+//   cadenceRate ≥ 80%   → §7.2.2.2 Telecined  (uniform PPPII pattern)
+//   iInCadence ≥ 60%    → §7.2.2.4 Mixed prog+telecine (the I frames sit inside
+//                          3:2 cycles — guide's verification step)
+//   else                → §7.2.2.5 Mixed prog+interlaced (I frames are clusters)
 //
-// Hardware-accelerated decoding (NVDEC) is used when configured, offloading the
-// decode to one of the RTX 5080's two hardware decode streams.
-// =========================
+// Parity (TFF vs BFF):
+//   Strict 90% dominance from idet's interlaced-frame TFF/BFF counts.  When
+//   ambiguous and the source is NTSC family (30000/1001, 24000/1001, 60000/1001
+//   fps), default to TFF — the NTSC standards convention.  ffprobe's field_order
+//   is consulted as a secondary tiebreaker.
+//
+// All thresholds are constants — they're chosen from the guide's qualitative
+// descriptions and the 3:2 pulldown structure, not user-tunable.
+// =========================================================================
 public static partial class ContentDetector
 {
-    // ---- Detection constants (derived from signal physics, not tunable) ----
+    // ---- Classification thresholds ----
 
-    /// <summary>§7.2.2.1: "you should never see any interlacing."</summary>
-    const double PureProgressiveThreshold = 0.95;
-
-    /// <summary>§7.2.2.3: "every single frame is interlaced."</summary>
-    const double PureInterlacedThreshold = 0.05;
+    /// <summary>§7.2.2.3: "every single frame is interlaced".</summary>
+    const double PureInterlacedProgFracMax = 0.05;
 
     /// <summary>§7.2.2.2: 3:2 cadence present uniformly throughout the file.</summary>
-    const double CadenceHighThreshold = 0.80;
+    const double PureTelecineCadenceMin = 0.80;
 
-    /// <summary>§7.2.2.4: cadence present in some regions → mixed prog+telecine.</summary>
-    const double CadencePresentThreshold = 0.10;
+    /// <summary>
+    /// Fraction of I frames sitting in 3:2 windows that confirms §7.2.2.4 (telecine
+    /// in the interlaced regions) vs §7.2.2.5 (genuine 60i in those regions).
+    /// This is the guide's explicit verification step for §7.2.2.4: "check the
+    /// 30000/1001 fps NTSC sections to make sure they are actually telecine, and
+    /// not just interlaced."
+    /// </summary>
+    const double TelecineIRatioMin = 0.60;
 
-    /// <summary>TFF vs BFF dominance for parity detection.</summary>
-    const double ParityMinDominance = 0.60;
+    // ---- Parity thresholds ----
+
+    /// <summary>
+    /// TFF/BFF dominance required for confident parity assignment from idet.
+    /// Real interlaced sources are 99%+ on one side; 90% leaves room for the
+    /// minority of frames idet flips.
+    /// </summary>
+    const double ParityStrictDominance = 0.90;
 
     // ---- Regex for per-frame idet metadata ----
 
@@ -73,24 +86,22 @@ public static partial class ContentDetector
     private static partial Regex IdetFrameRegex();
 
     /// <summary>
-    /// Single-pass content detection.  Decodes the entire file once with idet,
-    /// stores every frame's classification, and determines the content type from
-    /// global progressive fraction and telecine cadence match rate.
+    /// Single-pass content detection.  Decodes the entire file once with ffmpeg's
+    /// idet filter, computes whole-file metrics from the per-frame flag stream,
+    /// and classifies into one of the five §7.2.2 categories.
     /// Source-agnostic: works on DVDs, Blu-rays, or any other container/codec.
     /// </summary>
     public static async Task<ContentDetectionResult> DetectAsync(
         Config cfg, string input, FfprobeStream vstream, CancellationToken ct)
     {
-        // ---- Build ffmpeg args: full decode → idet → metadata print to stdout ----
+        // ---- Build ffmpeg args ----
         var argList = new List<string>
         {
             "-hide_banner", "-loglevel", "error", "-nostats"
         };
 
         if (cfg.UseHwaccelForDetection)
-        {
             argList.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", "nv12"]);
-        }
 
         argList.AddRange([
             "-i", input,
@@ -99,9 +110,7 @@ public static partial class ContentDetector
             "-f", "null", "-"
         ]);
 
-        var args = argList.ToArray();
-
-        // ---- Per-frame accumulation (trivial memory: ~1 byte per frame) ----
+        // ---- Per-frame accumulation ----
         var frames = new List<FrameFlag>();
         long totalTff = 0, totalBff = 0;
 
@@ -114,8 +123,7 @@ public static partial class ContentDetector
             var match = regex.Match(line);
             if (!match.Success) return;
 
-            string value = match.Groups[1].Value.ToLowerInvariant();
-            switch (value)
+            switch (match.Groups[1].Value.ToLowerInvariant())
             {
                 case "progressive":
                     frames.Add(FrameFlag.Progressive);
@@ -134,13 +142,13 @@ public static partial class ContentDetector
             }
         }
 
-        var (exitCode, _) = await Proc.RunStreamingAsync(cfg.Ffmpeg, args, ProcessLine, ct);
+        var (exitCode, _) = await Proc.RunStreamingAsync(cfg.Ffmpeg, argList.ToArray(), ProcessLine, ct);
 
         Console.WriteLine($"  Detection: decoded {frames.Count:N0} frames.");
         if (exitCode != 0)
             Console.WriteLine($"  Warning: ffmpeg exited with code {exitCode}");
 
-        // ---- Compute frame statistics ----
+        // ---- Per-frame counts ----
         int progCount = 0, intCount = 0, undetCount = 0;
         foreach (var f in frames)
         {
@@ -153,64 +161,76 @@ public static partial class ContentDetector
         }
 
         int classified = progCount + intCount;
-        double globalProgFrac = classified > 0 ? progCount / (double)classified : 1.0;
+        double progFrac = classified > 0 ? progCount / (double)classified : 1.0;
 
-        // ---- Telecine cadence detection (sliding 5-frame window) ----
+        // ---- Cadence metrics ----
         double cadenceRate = ComputeCadenceMatchRate(frames);
+        double iInCadence  = ComputeIFramesInCadenceRatio(frames);
 
-        // ---- Parity detection from full-file TFF/BFF counts ----
-        var parity = DetectParity(totalTff, totalBff);
+        // ---- Source fps (NTSC family check used by parity tiebreaker) ----
+        double? sourceFps = vstream.ResolveFps();
+        bool isNtsc = vstream.IsNtscFamilyFps();
 
-        // Cross-check with ffprobe field_order.
+        // ---- Parity ----
         var ffprobeParity = FieldOrderMapper.MapToParity(
             vstream.FieldOrder?.Trim().ToLowerInvariant() ?? "");
+
+        var (parity, parityFromNtsc) = DetectParity(totalTff, totalBff, isNtsc, ffprobeParity);
+
         bool parityMismatch =
             ffprobeParity != FieldParity.Auto &&
             parity != FieldParity.Auto &&
             ffprobeParity != parity;
 
-        // ---- Classify into one of the five §7.2.2 categories ----
+        // ---- Classify ----
         var (contentType, confidence, reason) = Classify(
-            globalProgFrac, cadenceRate, parityMismatch);
+            intCount, progFrac, cadenceRate, iInCadence, parityMismatch);
 
         Console.WriteLine($"  Detection complete: {contentType} (confidence={confidence:P0})");
-        Console.WriteLine($"    prog={globalProgFrac:P1}, cadence={cadenceRate:P1}, " +
-            $"parity={parity}, frames={frames.Count:N0} (P={progCount:N0} I={intCount:N0} U={undetCount:N0})");
+        Console.WriteLine($"    progFrac={progFrac:P1}, cadence={cadenceRate:P1}, " +
+            $"i_in_cadence={iInCadence:P1}, parity={parity}" +
+            (parityFromNtsc ? " (NTSC fallback)" : "") +
+            $", frames={frames.Count:N0} (P={progCount:N0} I={intCount:N0} U={undetCount:N0})");
 
         return new ContentDetectionResult
         {
             ContentType = contentType,
             Confidence = confidence,
             Reason = reason,
+
             TotalFramesAnalyzed = frames.Count,
             ProgressiveFrameCount = progCount,
             InterlacedFrameCount = intCount,
             UndeterminedFrameCount = undetCount,
-            GlobalProgressiveFraction = globalProgFrac,
+
+            GlobalProgressiveFraction = progFrac,
             TelecineCadenceMatchRate = cadenceRate,
+            InterlacedFramesInCadenceRatio = iInCadence,
+
             DetectedParity = parity,
             RawIdetTffCount = totalTff,
             RawIdetBffCount = totalBff,
+            ParityFromNtscFallback = parityFromNtsc,
+
             FfprobeFieldOrder = vstream.FieldOrder,
             FfprobeMappedParity = ffprobeParity,
             ParityMismatch = parityMismatch,
+
+            SourceFps = sourceFps,
+            IsNtscFamilyFps = isNtsc,
         };
     }
 
-    // ------------------------------------------------------------------
-    // Telecine cadence detection
-    //
-    // Scans the full frame sequence with a sliding 5-frame window.
-    // Each window matching exactly 3 progressive + 2 interlaced frames
-    // corresponds to one position of the 3:2 pulldown cycle (PPPII).
-    //
-    // O(n) via incremental count maintenance.
-    // ------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // Cadence match rate: fraction of all 5-frame windows containing exactly
+    // 3P + 2I.  All five cyclic phases of PPPII (PPPII, PPIIP, PIIPP, IIPPP,
+    // IPPPI) satisfy this count, so a perfectly telecined file scores ~100%.
+    // O(n) via incremental counts.
+    // -------------------------------------------------------------------
     internal static double ComputeCadenceMatchRate(List<FrameFlag> frames)
     {
         if (frames.Count < 5) return 0;
 
-        // Initialize counts for the first window [0..4].
         int p = 0, intl = 0;
         for (int j = 0; j < 5; j++)
         {
@@ -221,15 +241,12 @@ public static partial class ContentDetector
         int windows = frames.Count - 4;
         int matches = (p == 3 && intl == 2) ? 1 : 0;
 
-        // Slide the window one frame at a time.
         for (int i = 1; i < windows; i++)
         {
-            // Remove the frame leaving the window (position i-1).
             var leaving = frames[i - 1];
             if (leaving == FrameFlag.Progressive) p--;
             else if (leaving == FrameFlag.Interlaced) intl--;
 
-            // Add the frame entering the window (position i+4).
             var entering = frames[i + 4];
             if (entering == FrameFlag.Progressive) p++;
             else if (entering == FrameFlag.Interlaced) intl++;
@@ -240,88 +257,131 @@ public static partial class ContentDetector
         return matches / (double)windows;
     }
 
-    // ------------------------------------------------------------------
-    // Parity detection from full-file idet TFF/BFF counts.
-    // With 100K+ frames, the dominance is unambiguous.
-    // ------------------------------------------------------------------
-    internal static FieldParity DetectParity(long rawTff, long rawBff)
+    // -------------------------------------------------------------------
+    // Of all I frames in the file, the fraction whose centered 5-frame
+    // neighborhood [i-2 .. i+2] is exactly 3P + 2I.  Used to distinguish
+    // §7.2.2.4 (telecine: I frames embedded in 3:2 cycles, ratio high)
+    // from §7.2.2.5 (native interlace: I frames in clusters, ratio low).
+    // -------------------------------------------------------------------
+    internal static double ComputeIFramesInCadenceRatio(List<FrameFlag> frames)
     {
-        long denom = rawTff + rawBff;
-        if (denom <= 0) return FieldParity.Auto;
+        if (frames.Count < 5) return 0;
 
-        double tffFrac = rawTff / (double)denom;
-        if (tffFrac >= ParityMinDominance) return FieldParity.Tff;
-        if (tffFrac <= (1.0 - ParityMinDominance)) return FieldParity.Bff;
-        return FieldParity.Auto;
+        long evaluated = 0, inCycle = 0;
+
+        for (int i = 2; i < frames.Count - 2; i++)
+        {
+            if (frames[i] != FrameFlag.Interlaced) continue;
+            evaluated++;
+
+            int p = 0, intl = 0;
+            for (int j = i - 2; j <= i + 2; j++)
+            {
+                if (frames[j] == FrameFlag.Progressive) p++;
+                else if (frames[j] == FrameFlag.Interlaced) intl++;
+            }
+
+            if (p == 3 && intl == 2) inCycle++;
+        }
+
+        return evaluated > 0 ? inCycle / (double)evaluated : 0;
     }
 
-    // ------------------------------------------------------------------
-    // File-level classification: global progressive fraction + cadence
-    // match rate → one of the five §7.2.2 content types.
+    // -------------------------------------------------------------------
+    // Parity from idet's full-file TFF/BFF counts, with NTSC fallback.
     //
-    // Decision space (two axes, five regions):
-    //
-    //   progFrac ≥ 0.95                         → Progressive    (§7.2.2.1)
-    //   progFrac ≤ 0.05                         → Interlaced     (§7.2.2.3)
-    //   cadenceRate ≥ 0.80                      → Telecined      (§7.2.2.2)
-    //   cadenceRate ≥ 0.10                      → Mixed P+TC     (§7.2.2.4)
-    //   cadenceRate < 0.10                      → Mixed P+I      (§7.2.2.5)
-    // ------------------------------------------------------------------
+    //   tffFrac ≥ 0.90  → TFF
+    //   tffFrac ≤ 0.10  → BFF
+    //   ambiguous + ffprobe gives a clear answer → use ffprobe
+    //   ambiguous + NTSC fps → TFF (standards convention for NTSC interlace)
+    //   else → Auto
+    // -------------------------------------------------------------------
+    internal static (FieldParity Parity, bool FromNtscFallback) DetectParity(
+        long rawTff, long rawBff, bool isNtsc, FieldParity ffprobeParity)
+    {
+        long denom = rawTff + rawBff;
+        if (denom <= 0)
+        {
+            // No interlaced frames detected at all.  Trust ffprobe if it has an opinion;
+            // otherwise leave Auto and let downstream filters figure it out (only matters
+            // when sparse interlaced frames slip into a mostly-progressive IVTC pass).
+            if (ffprobeParity != FieldParity.Auto) return (ffprobeParity, false);
+            if (isNtsc) return (FieldParity.Tff, true);
+            return (FieldParity.Auto, false);
+        }
+
+        double tffFrac = rawTff / (double)denom;
+
+        if (tffFrac >= ParityStrictDominance) return (FieldParity.Tff, false);
+        if (tffFrac <= 1.0 - ParityStrictDominance) return (FieldParity.Bff, false);
+
+        // Ambiguous idet result — defer to ffprobe if it's confident.
+        if (ffprobeParity != FieldParity.Auto) return (ffprobeParity, false);
+
+        // Last resort: NTSC standards convention is TFF.
+        if (isNtsc) return (FieldParity.Tff, true);
+
+        return (FieldParity.Auto, false);
+    }
+
+    // -------------------------------------------------------------------
+    // Decision tree mapping the three metrics onto the five §7.2.2 categories.
+    // Order matters: each branch is the strictest qualifier for that category.
+    // -------------------------------------------------------------------
     internal static (ContentType Type, double Confidence, string Reason) Classify(
-        double progFrac, double cadenceRate, bool parityMismatch)
+        int intCount, double progFrac, double cadenceRate, double iInCadence, bool parityMismatch)
     {
         double Penalize(double c) => parityMismatch ? Math.Max(0.20, c - 0.10) : c;
 
-        // 1. Pure progressive (§7.2.2.1)
-        //    "When you watch progressive video, you should never see any interlacing."
-        if (progFrac >= PureProgressiveThreshold)
+        // §7.2.2.1: Progressive (verified).  Strict — only when zero interlaced frames.
+        // Per guide footnote [3], anything else gets the safe IVTC chain.
+        if (intCount == 0)
         {
-            double conf = Math.Clamp(0.85 + (progFrac - PureProgressiveThreshold) * 3.0, 0.85, 0.99);
-            return (ContentType.Progressive, Penalize(conf),
-                $"Progressive (§7.2.2.1): {progFrac:P2} of classified frames are progressive.");
+            return (ContentType.Progressive, Penalize(0.99),
+                "Progressive (§7.2.2.1): zero interlaced frames — verified pure progressive.");
         }
 
-        // 2. Pure interlaced (§7.2.2.3)
-        //    "Every single frame is interlaced."
-        if (progFrac <= PureInterlacedThreshold)
+        // §7.2.2.3: Interlaced.  "Every single frame is interlaced."
+        if (progFrac <= PureInterlacedProgFracMax)
         {
-            double conf = Math.Clamp(0.85 + (PureInterlacedThreshold - progFrac) * 3.0, 0.85, 0.99);
+            double conf = Math.Clamp(0.85 + (PureInterlacedProgFracMax - progFrac) * 3.0, 0.85, 0.99);
             return (ContentType.Interlaced, Penalize(conf),
                 $"Interlaced (§7.2.2.3): {1.0 - progFrac:P2} of classified frames are interlaced.");
         }
 
-        // 3. Pure telecined (§7.2.2.2)
-        //    "The pattern you see is PPPII, PPPII, PPPII, ..."
-        //    Uniform 3:2 cadence throughout the file → high cadence match rate.
-        if (cadenceRate >= CadenceHighThreshold)
+        // §7.2.2.2: Telecined.  Uniform 3:2 cadence across the entire file.
+        if (cadenceRate >= PureTelecineCadenceMin)
         {
-            double conf = Math.Clamp(0.80 + (cadenceRate - CadenceHighThreshold) * 2.0, 0.80, 0.99);
+            double conf = Math.Clamp(0.80 + (cadenceRate - PureTelecineCadenceMin) * 2.0, 0.80, 0.99);
             return (ContentType.Telecined, Penalize(conf),
                 $"Telecined (§7.2.2.2): cadence match rate = {cadenceRate:P2} — " +
-                $"3:2 pulldown pattern (PPPII) detected uniformly across the file.");
+                "uniform 3:2 pulldown (PPPII) detected across the file.");
         }
 
-        // 4. Mixed progressive + telecine (§7.2.2.4)
-        //    "MPlayer will (often repeatedly) switch back and forth between
-        //     30000/1001 fps NTSC and 24000/1001 fps progressive NTSC."
-        //    Cadence is present in telecined sections but absent in progressive sections.
-        if (cadenceRate >= CadencePresentThreshold)
+        // §7.2.2.4: I frames embedded in 3:2 cycles → telecine in the interlaced regions.
+        // Implements the guide's explicit verification step:
+        //   "You should check the '30000/1001 fps NTSC' sections to make sure they
+        //    are actually telecine, and not just interlaced."
+        // Footnote [3]'s "safe pullup default for mostly-progressive content" is NOT
+        // implemented here — it lives in RestoreStrategyMapper, which gates on source
+        // fps so that non-NTSC-thirty sources (24p Blu-rays, 25p PAL, 60p sports)
+        // aren't pushed through a 24000/1001-pinning IVTC chain.
+        if (iInCadence >= TelecineIRatioMin)
         {
-            double conf = Math.Clamp(0.60 + cadenceRate * 0.3, 0.50, 0.90);
+            double conf = Math.Clamp(0.60 + iInCadence * 0.3, 0.55, 0.90);
             return (ContentType.MixedProgressiveTelecine, Penalize(conf),
-                $"Mixed progressive+telecine (§7.2.2.4): cadence match rate = {cadenceRate:P2}, " +
-                $"prog fraction = {progFrac:P2}. " +
-                $"Telecine in some sections, progressive in others.");
+                $"Mixed progressive+telecine (§7.2.2.4): {iInCadence:P1} of interlaced frames " +
+                $"sit inside 3:2 windows, cadence rate = {cadenceRate:P2}, progFrac = {progFrac:P2}.");
         }
 
-        // 5. Mixed progressive + interlaced (§7.2.2.5)
-        //    "Progressive and interlaced video have been spliced together."
-        //    No telecine cadence detected — contiguous progressive and interlaced regions.
+        // §7.2.2.5: I frames are clustered (not in cadence) → genuine interlace mixed in.
         {
-            double conf = Math.Clamp(0.60 + Math.Min(progFrac, 1.0 - progFrac) * 0.5, 0.45, 0.85);
+            // Confidence dips toward the §7.2.2.4 boundary (iInCadence ≈ 0.60).
+            double margin = TelecineIRatioMin - iInCadence;
+            double conf = Math.Clamp(0.50 + margin * 0.5, 0.45, 0.85);
             return (ContentType.MixedProgressiveInterlaced, Penalize(conf),
-                $"Mixed progressive+interlaced (§7.2.2.5): prog fraction = {progFrac:P2}, " +
-                $"cadence rate = {cadenceRate:P2}. No telecine pattern detected.");
+                $"Mixed progressive+interlaced (§7.2.2.5): only {iInCadence:P1} of interlaced " +
+                $"frames are in 3:2 cycles, progFrac = {progFrac:P2}, cadence = {cadenceRate:P2}.");
         }
     }
 

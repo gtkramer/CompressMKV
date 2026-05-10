@@ -1,67 +1,65 @@
 namespace CompressMkv;
 
 /// <summary>
-/// Restore filter graph generation for each content type and restore mode.
+/// Restoration filter graph primitives.  Two chains cover every guide §7.2.3 action:
+///
+///   IvtcChain        — fieldmatch + bwdif(interlaced) + decimate.
+///                      Reverses 3:2 pulldown to recover 24000/1001 progressive.
+///                      Used for §7.2.3.2 (Telecined), §7.2.3.4 (Mixed prog+telecine),
+///                      and the §7.2.3.5 favor-progressive sub-decision.
+///                      Caller MUST also set -r 24000/1001 — this chain decimates
+///                      30000/1001 → 24000/1001 and the output rate must be pinned.
+///
+///   DeinterlaceChain — bwdif=send_frame at the source's native rate.
+///                      Used for §7.2.3.3 (Interlaced) and the deinterlace-all
+///                      compromise of §7.2.3.5 (Mixed prog+interlaced).
+///                      Motion-adaptive: progressive frames in mixed sources
+///                      pass through with minimal degradation.
+///
+/// All filters are stock ffmpeg.
 /// </summary>
 public static class RestoreFilters
 {
     /// <summary>
-    /// Returns the appropriate filter graph and output fps for a ContentType + parity.
+    /// Output frame rate after the IVTC chain — the canonical 24000/1001 film rate
+    /// before telecine was applied.  Set with `-r` and `-fps_mode cfr` to pin output.
     /// </summary>
-    public static (string Filter, string? OutputFps) For(ContentType type, FieldParity parity)
+    public const string IvtcOutputFps = "24000/1001";
+
+    /// <summary>
+    /// IVTC chain — equivalent to MPlayer's filmdint (guide §7.2.3.4 method 2):
+    /// fieldmatch reconstructs progressive frames from telecined fields,
+    /// bwdif=interlaced cleans up frames fieldmatch couldn't reconstruct
+    /// (drop-free, unlike pullup), and decimate removes the duplicate
+    /// from each 5-frame cycle.
+    /// </summary>
+    public static string IvtcChain(FieldParity parity)
     {
-        string p = ParityStr(parity);
-
-        return type switch
-        {
-            // §7.2.3.1: No filter needed.
-            ContentType.Progressive => ("", null),
-
-            // §7.2.3.2: fieldmatch is ffmpeg's equivalent of MPlayer's pullup.
-            // combmatch=full checks every frame for residual combing (default sc only
-            // checks at scene changes).  An intermediate bwdif with deint=interlaced
-            // cleans up any frames fieldmatch couldn't cleanly match — progressive
-            // frames pass through untouched.  decimate drops the duplicate frame from
-            // each 5-frame cycle → 24000/1001.
-            ContentType.Telecined =>
-                ($"fieldmatch=order={p}:combmatch=full,bwdif=mode=send_frame:parity={p}:deint=interlaced,decimate",
-                 "24000/1001"),
-
-            // §7.2.3.3: bwdif is a motion-adaptive deinterlacer (successor to yadif).
-            // send_frame mode: one output frame per input frame, preserving native fps.
-            ContentType.Interlaced => ($"bwdif=mode=send_frame:parity={p}", null),
-
-            // §7.2.3.4: fieldmatch handles both progressive and telecined frames.
-            // Progressive frames pass through; telecined frames get field-matched.
-            // Same IVTC chain as §7.2.3.2 — bwdif cleanup + combmatch=full.
-            ContentType.MixedProgressiveTelecine =>
-                ($"fieldmatch=order={p}:combmatch=full,bwdif=mode=send_frame:parity={p}:deint=interlaced,decimate",
-                 "24000/1001"),
-
-            // §7.2.3.5: Deinterlace everything. Progressive frames pass through bwdif
-            // with minimal degradation (motion-adaptive → no combing detected → passthrough).
-            ContentType.MixedProgressiveInterlaced => ($"bwdif=mode=send_frame:parity={p}", null),
-
-            _ => ("", null),
-        };
+        var p = ParityStr(parity);
+        return $"fieldmatch=order={p}:combmatch=full," +
+               $"bwdif=mode=send_frame:parity={p}:deint=interlaced," +
+               "decimate";
     }
 
     /// <summary>
-    /// Legacy overload for PreviewGenerator and other code that uses RestoreMode + parity.
+    /// Motion-adaptive deinterlace at native frame rate (one output frame per
+    /// input frame).  bwdif is the modern successor to yadif recommended by the
+    /// guide §7.2.3.3.
     /// </summary>
-    public static (string Filter, string? OutputFps) For(RestoreMode mode, FieldParity parity)
-    {
-        string p = ParityStr(parity);
+    public static string DeinterlaceChain(FieldParity parity) =>
+        $"bwdif=mode=send_frame:parity={ParityStr(parity)}";
 
-        return mode switch
+    /// <summary>
+    /// Mode-based overload used by PreviewGenerator for side-by-side comparison
+    /// of the two strategies regardless of detected category.
+    /// </summary>
+    public static (string Filter, string? OutputFps) For(RestoreMode mode, FieldParity parity) =>
+        mode switch
         {
-            RestoreMode.Ivtc =>
-                ($"fieldmatch=order={p}:combmatch=full,bwdif=mode=send_frame:parity={p}:deint=interlaced,decimate",
-                 "24000/1001"),
-            RestoreMode.Deinterlace => ($"bwdif=mode=send_frame:parity={p}", null),
+            RestoreMode.Ivtc => (IvtcChain(parity), IvtcOutputFps),
+            RestoreMode.Deinterlace => (DeinterlaceChain(parity), null),
             _ => ("", null),
         };
-    }
 
     internal static string ParityStr(FieldParity parity) => parity switch
     {

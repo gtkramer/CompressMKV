@@ -170,7 +170,12 @@ public static class Program
                         Console.WriteLine($"    Frames: {det.TotalFramesAnalyzed:N0} (P={det.ProgressiveFrameCount:N0}, I={det.InterlacedFrameCount:N0}, U={det.UndeterminedFrameCount:N0})");
                         Console.WriteLine($"    Progressive fraction: {det.GlobalProgressiveFraction:P2}");
                         Console.WriteLine($"    Telecine cadence match rate: {det.TelecineCadenceMatchRate:P2}");
-                        Console.WriteLine($"    Parity: {det.DetectedParity} (raw TFF={det.RawIdetTffCount:N0}, BFF={det.RawIdetBffCount:N0})");
+                        Console.WriteLine($"    I-frames in 3:2 cycles: {det.InterlacedFramesInCadenceRatio:P2}");
+                        Console.WriteLine($"    Source fps: {(det.SourceFps?.ToString("F3", CultureInfo.InvariantCulture) ?? "?")}" +
+                            $" ({(det.IsNtscFamilyFps ? "NTSC family" : "non-NTSC")})");
+                        Console.WriteLine($"    Parity: {det.DetectedParity}" +
+                            (det.ParityFromNtscFallback ? " (NTSC fallback)" : "") +
+                            $" (raw TFF={det.RawIdetTffCount:N0}, BFF={det.RawIdetBffCount:N0})");
                         if (det.ParityMismatch)
                             Console.WriteLine($"    PARITY MISMATCH: idet={det.DetectedParity} vs ffprobe={det.FfprobeMappedParity} (ffprobe field_order={det.FfprobeFieldOrder})");
                         Console.WriteLine($"    Reason: {det.Reason}");
