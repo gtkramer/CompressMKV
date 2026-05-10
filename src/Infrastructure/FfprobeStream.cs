@@ -37,11 +37,20 @@ public sealed class FfprobeStream
     }
 
     /// <summary>
+    /// Maximum r_frame_rate / avg_frame_rate ratio we treat as CFR.  Above this,
+    /// the stream is variable-frame-rate (VFR): r_frame_rate (LCD of timestamps)
+    /// has inflated toward the highest rate seen while avg_frame_rate stays near
+    /// the typical rate.  Real-world VFR sources (screen recordings, mobile
+    /// captures) run at 1.5–2.0+; real CFR sources sit at 1.000–1.001, so 1.05
+    /// is comfortably between them.
+    /// </summary>
+    private const double VfrDetectionRatio = 1.05;
+
+    /// <summary>
     /// Heuristic CFR check: compares r_frame_rate (the LCD across all timestamps
     /// seen) to avg_frame_rate (the mean).  For genuine CFR content the two
     /// agree within rounding noise; for VFR sources r_frame_rate inflates toward
     /// the highest rate seen while avg_frame_rate stays near the typical rate.
-    /// A r/avg ratio above ~1.05 is a strong VFR signal.
     ///
     /// Returns true when the stream looks CFR or when either rate is missing
     /// (assume CFR rather than block on uncertain metadata).
@@ -51,6 +60,6 @@ public sealed class FfprobeStream
         if (!Fps.TryParse(RFrameRate, out var r)) return true;
         if (!Fps.TryParse(AvgFrameRate, out var a)) return true;
         if (a.AsDouble <= 0) return true;
-        return r.AsDouble / a.AsDouble < 1.05;
+        return r.AsDouble / a.AsDouble < VfrDetectionRatio;
     }
 }
