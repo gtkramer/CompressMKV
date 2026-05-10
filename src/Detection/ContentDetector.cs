@@ -322,7 +322,14 @@ public static partial class ContentDetector
         // Ambiguous idet result — defer to ffprobe if it's confident.
         if (ffprobeParity != FieldParity.Auto) return (ffprobeParity, false);
 
-        // Last resort: NTSC standards convention is TFF.
+        // Last resort: NTSC standards convention is TFF.  This is wrong for
+        // genuinely BFF NTSC content where idet's dominance fell in the 80–90%
+        // band AND ffprobe reported "unknown" — but BFF NTSC discs are
+        // vanishingly rare (the standard mandates TFF and ~99%+ of NTSC content
+        // follows it), so the bias is acceptable.  If a BFF NTSC source is
+        // misidentified, the visible symptom is shimmering or reversed motion
+        // in the deinterlace output — visible enough that the user will catch
+        // it on first playback.
         if (isNtsc) return (FieldParity.Tff, true);
 
         return (FieldParity.Auto, false);
