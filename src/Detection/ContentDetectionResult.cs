@@ -76,4 +76,34 @@ public sealed class ContentDetectionResult
     /// metrics and any fixed-rate output are unreliable — the IVTC chain is
     /// suppressed for VFR sources to prevent rate damage.</summary>
     public bool SourceIsLikelyCfr { get; set; } = true;
+
+    // ---- idet aggregate cross-check ----
+    //
+    // idet's "Multi frame detection" line at end-of-stream gives ffmpeg's own
+    // aggregate prog/int/TFF/BFF counts using the same multi-frame detector
+    // mode we sample per-frame.  Cross-checking these against our streaming
+    // counts validates the parser end-to-end — if ffmpeg's claim and our claim
+    // disagree by more than rounding noise, our regex or stream handling has
+    // a bug.
+
+    /// <summary>True when idet emitted an aggregate line and the parsed counts
+    /// matched our per-frame counts within tolerance.  False on disagreement
+    /// (logged as a warning) or when no aggregate was emitted.</summary>
+    public bool IdetAggregateAgrees { get; set; } = true;
+
+    /// <summary>idet's aggregate progressive count from "Multi frame detection",
+    /// or null if not parsed.</summary>
+    public long? IdetAggregateProgressive { get; set; }
+
+    /// <summary>idet's aggregate TFF count from "Multi frame detection",
+    /// or null if not parsed.</summary>
+    public long? IdetAggregateTff { get; set; }
+
+    /// <summary>idet's aggregate BFF count from "Multi frame detection",
+    /// or null if not parsed.</summary>
+    public long? IdetAggregateBff { get; set; }
+
+    /// <summary>idet's aggregate Undetermined count from "Multi frame detection",
+    /// or null if not parsed.</summary>
+    public long? IdetAggregateUndetermined { get; set; }
 }

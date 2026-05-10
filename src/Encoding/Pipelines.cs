@@ -135,14 +135,22 @@ public static class Pipelines
     //  Final full-file encode: source → restore → AV1 NVENC.
     //  Includes multipass, spatial/temporal AQ, CFR.
     //  Audio and subtitles are copied through.
+    //
+    //  Loglevel is "warning" (not the usual "error") on IVTC-using runs so
+    //  that fieldmatch's parity/cadence warnings reach our stderr capture.
+    //  Stripped via SurfaceFieldmatchWarnings below — we only forward
+    //  fieldmatch lines to the user, not every ffmpeg "info"-level chatter.
     // ----------------------------------------------------------------
     public static async Task EncodeFullNvencAsync(
         Config cfg, string input, string output, RestoreDecision restore,
         int cq, CancellationToken ct)
     {
+        bool isIvtc = restore.Mode == RestoreMode.Ivtc;
+        string loglevel = isIvtc ? "warning" : "error";
+
         var args = new List<string>
         {
-            "-y", "-hide_banner", "-loglevel", "error",
+            "-y", "-hide_banner", "-loglevel", loglevel,
         };
 
         if (cfg.UseNvdecForEncode)
@@ -176,5 +184,32 @@ public static class Pipelines
 
         var (code, _, err) = await Proc.RunAsync(cfg.Ffmpeg, args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"final encode failed: {err}");
+
+        if (isIvtc) SurfaceFieldmatchWarnings(err);
+    }
+
+    /// <summary>
+    /// Scans captured ffmpeg stderr for fieldmatch's runtime warnings (typically
+    /// about declared-vs-detected field order mismatches) and forwards them to
+    /// the user.  Other ffmpeg log lines are ignored to keep output focused.
+    /// </summary>
+    internal static void SurfaceFieldmatchWarnings(string stderr)
+    {
+        if (string.IsNullOrEmpty(stderr)) return;
+
+        int count = 0;
+        foreach (var raw in stderr.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0) continue;
+            if (line.Contains("fieldmatch", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"  fieldmatch: {line}");
+                count++;
+            }
+        }
+
+        if (count > 0)
+            Console.WriteLine($"  (fieldmatch emitted {count} warning line(s) — review for parity/cadence issues.)");
     }
 }

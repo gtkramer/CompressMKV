@@ -86,6 +86,15 @@ public static partial class ContentDetector
     private static partial Regex IdetFrameRegex();
 
     /// <summary>
+    /// Matches idet's end-of-stream "Multi frame detection" aggregate line.
+    /// Example: "[Parsed_idet_0 @ 0x...] Multi frame detection: TFF: 0 BFF: 0 Progressive: 248594 Undetermined: 1"
+    /// </summary>
+    [GeneratedRegex(
+        @"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex IdetAggregateRegex();
+
+    /// <summary>
     /// Single-pass content detection.  Decodes the entire file once with ffmpeg's
     /// idet filter, computes whole-file metrics from the per-frame flag stream,
     /// and classifies into one of the five §7.2.2 categories.
@@ -142,11 +151,16 @@ public static partial class ContentDetector
             }
         }
 
-        var (exitCode, _) = await Proc.RunStreamingAsync(cfg.Ffmpeg, argList.ToArray(), ProcessLine, ct);
+        var (exitCode, stderr) = await Proc.RunStreamingAsync(cfg.Ffmpeg, argList.ToArray(), ProcessLine, ct);
 
         Console.WriteLine($"  Detection: decoded {frames.Count:N0} frames.");
         if (exitCode != 0)
             Console.WriteLine($"  Warning: ffmpeg exited with code {exitCode}");
+
+        // Parse idet's end-of-stream aggregate line ("Multi frame detection:...") from stderr.
+        // This is ffmpeg's own claim about the file using the same detector we sampled per-frame.
+        // Cross-checking validates our parser; significant divergence indicates a bug.
+        var (aggProg, aggTff, aggBff, aggUndet) = ParseIdetAggregate(stderr);
 
         // ---- Per-frame counts ----
         int progCount = 0, intCount = 0, undetCount = 0;
@@ -182,6 +196,11 @@ public static partial class ContentDetector
             ffprobeParity != FieldParity.Auto &&
             parity != FieldParity.Auto &&
             ffprobeParity != parity;
+
+        // ---- Cross-check our per-frame counts against idet's aggregate (sanity check) ----
+        bool aggregateAgrees = CheckAggregateAgreement(
+            aggProg, aggTff, aggBff, aggUndet,
+            progCount, totalTff, totalBff, undetCount);
 
         // ---- Classify ----
         var (contentType, confidence, reason) = Classify(
@@ -222,6 +241,12 @@ public static partial class ContentDetector
             SourceFps = sourceFps,
             IsNtscFamilyFps = isNtsc,
             SourceIsLikelyCfr = isLikelyCfr,
+
+            IdetAggregateAgrees = aggregateAgrees,
+            IdetAggregateProgressive = aggProg,
+            IdetAggregateTff = aggTff,
+            IdetAggregateBff = aggBff,
+            IdetAggregateUndetermined = aggUndet,
         };
     }
 
@@ -402,4 +427,58 @@ public static partial class ContentDetector
         FieldParity.Bff => "bff",
         _ => "auto"
     };
+
+    // -------------------------------------------------------------------
+    // idet aggregate parsing (cross-check).
+    // -------------------------------------------------------------------
+
+    internal static (long? Prog, long? Tff, long? Bff, long? Undet) ParseIdetAggregate(string stderr)
+    {
+        if (string.IsNullOrEmpty(stderr)) return (null, null, null, null);
+        var match = IdetAggregateRegex().Match(stderr);
+        if (!match.Success) return (null, null, null, null);
+
+        return (
+            long.Parse(match.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture),
+            long.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture),
+            long.Parse(match.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture),
+            long.Parse(match.Groups[4].Value, System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// Compares idet's own aggregate counts to our per-frame totals.  Returns true
+    /// if they agree (or if idet didn't emit an aggregate, which is a soft pass).
+    /// On disagreement, logs a warning so a parser bug is visible to the user.
+    /// </summary>
+    /// <remarks>
+    /// Tolerance: 1 frame difference is normal (idet's aggregate is computed
+    /// after the multi-frame detector's lookahead, while our stream parse may
+    /// see one fewer frame at end-of-stream).  Anything larger is a bug.
+    /// </remarks>
+    internal static bool CheckAggregateAgreement(
+        long? aggProg, long? aggTff, long? aggBff, long? aggUndet,
+        int progCount, long tffCount, long bffCount, int undetCount)
+    {
+        // No aggregate → can't check; treat as soft pass.
+        if (aggProg is null || aggTff is null || aggBff is null || aggUndet is null)
+            return true;
+
+        const long Tolerance = 1;
+        bool ok =
+            Math.Abs(aggProg.Value - progCount) <= Tolerance &&
+            Math.Abs(aggTff.Value - tffCount)   <= Tolerance &&
+            Math.Abs(aggBff.Value - bffCount)   <= Tolerance &&
+            Math.Abs(aggUndet.Value - undetCount) <= Tolerance;
+
+        if (!ok)
+        {
+            Console.WriteLine(
+                $"  Warning: idet aggregate disagrees with per-frame stream — " +
+                $"per-frame [P={progCount:N0}, TFF={tffCount:N0}, BFF={bffCount:N0}, U={undetCount:N0}] " +
+                $"vs aggregate [P={aggProg.Value:N0}, TFF={aggTff.Value:N0}, BFF={aggBff.Value:N0}, U={aggUndet.Value:N0}]. " +
+                "This indicates a parser bug or unexpected idet output format.");
+        }
+
+        return ok;
+    }
 }

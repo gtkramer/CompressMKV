@@ -179,6 +179,8 @@ public static class Program
                             $" (raw TFF={det.RawIdetTffCount:N0}, BFF={det.RawIdetBffCount:N0})");
                         if (det.ParityMismatch)
                             Console.WriteLine($"    PARITY MISMATCH: idet={det.DetectedParity} vs ffprobe={det.FfprobeMappedParity} (ffprobe field_order={det.FfprobeFieldOrder})");
+                        if (!det.IdetAggregateAgrees)
+                            Console.WriteLine($"    PARSER WARNING: idet aggregate disagrees with per-frame stream (see prior log line).");
                         Console.WriteLine($"    Reason: {det.Reason}");
                     }
 
@@ -200,6 +202,14 @@ public static class Program
                     }
 
                     Console.WriteLine($"  [{idx}/{files.Count}] Output: {summary.FinalOutputPath}");
+
+                    if (summary.OutputVerification is { } v)
+                    {
+                        string status = v.Skipped ? "SKIPPED" : (v.Passed ? "PASSED" : "FAILED");
+                        Console.WriteLine($"  [{idx}/{files.Count}] Verification: {status} — {v.Notes}");
+                        foreach (var w in v.Warnings)
+                            Console.WriteLine($"    ! {w}");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -303,6 +313,14 @@ public static class Program
         var finalOut = Path.Combine(outDir, $"{id}_av1_cq{finalCq}{cfg.OutputExtension}");
         await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, ct);
 
+        // Trust-but-verify: confirm the final output reflects the chosen restoration.
+        // For pass-through runs this is a no-op.  Acquires NVDEC for the AV1 decode pass.
+        OutputVerificationResult verification;
+        using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, ct))
+        {
+            verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, ct);
+        }
+
         var summary = new VideoSummary
         {
             VideoId = id,
@@ -315,6 +333,7 @@ public static class Program
             Restore = restore,
             Tuning = tuning,
             FinalCq = finalCq,
+            OutputVerification = verification,
         };
 
         await JsonIO.WriteAsync(Path.Combine(outDir, "log.json"), summary, ct);

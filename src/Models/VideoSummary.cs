@@ -15,4 +15,12 @@ public sealed class VideoSummary
     public TuningResult? Tuning { get; set; }
 
     public int FinalCq { get; set; }
+
+    /// <summary>
+    /// Trust-but-verify result of running idet on the final encoded output.
+    /// Confirms the chosen restoration produced structurally-correct output
+    /// (clean progressive, no residual cadence, expected fps).  Null when
+    /// verification was skipped or failed to run.
+    /// </summary>
+    public OutputVerificationResult? OutputVerification { get; set; }
 }
