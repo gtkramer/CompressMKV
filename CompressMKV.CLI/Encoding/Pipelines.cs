@@ -172,8 +172,10 @@ public static class Pipelines
     // ----------------------------------------------------------------
     public static async Task EncodeFullNvencAsync(
         Config cfg, string input, string output, RestoreDecision restore,
-        int cq, PipelineFormat format, CancellationToken ct)
+        int cq, PipelineFormat format, CancellationToken ct,
+        IPipelineLogger? logger = null)
     {
+        logger ??= NullLogger.Instance;
         bool isIvtc = restore.Mode == RestoreMode.Ivtc;
         string loglevel = isIvtc ? "warning" : "error";
 
@@ -215,15 +217,17 @@ public static class Pipelines
         var (code, _, err) = await Proc.RunAsync(cfg.Ffmpeg, args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"final encode failed: {err}");
 
-        if (isIvtc) SurfaceFieldmatchWarnings(err);
+        if (isIvtc) SurfaceFieldmatchWarnings(err, logger);
     }
 
     /// <summary>
     /// Scans captured ffmpeg stderr for fieldmatch's runtime warnings (typically
     /// about declared-vs-detected field order mismatches) and forwards them to
-    /// the user.  Other ffmpeg log lines are ignored to keep output focused.
+    /// the per-file logger.  Other ffmpeg log lines are ignored to keep output
+    /// focused.  Warnings persist in the per-file decisions.log for post-hoc
+    /// inspection — they used to scroll past on the console only.
     /// </summary>
-    internal static void SurfaceFieldmatchWarnings(string stderr)
+    internal static void SurfaceFieldmatchWarnings(string stderr, IPipelineLogger logger)
     {
         if (string.IsNullOrEmpty(stderr)) return;
 
@@ -234,12 +238,12 @@ public static class Pipelines
             if (line.Length == 0) continue;
             if (line.Contains("fieldmatch", StringComparison.OrdinalIgnoreCase))
             {
-                Console.WriteLine($"  fieldmatch: {line}");
+                logger.LogWarning($"fieldmatch: {line}");
                 count++;
             }
         }
 
         if (count > 0)
-            Console.WriteLine($"  (fieldmatch emitted {count} warning line(s) — review for parity/cadence issues.)");
+            logger.LogWarning($"fieldmatch emitted {count} warning line(s) — review for parity/cadence issues.");
     }
 }

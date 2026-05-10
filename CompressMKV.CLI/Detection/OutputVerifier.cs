@@ -49,8 +49,10 @@ public static class OutputVerifier
     const double MaxResidualCadenceRate = 0.05;
 
     public static async Task<OutputVerificationResult> VerifyAsync(
-        Config cfg, string outputPath, RestoreDecision restore, CancellationToken ct)
+        Config cfg, string outputPath, RestoreDecision restore, CancellationToken ct,
+        IPipelineLogger? logger = null)
     {
+        logger ??= NullLogger.Instance;
         var result = new OutputVerificationResult
         {
             OutputPath = outputPath,
@@ -66,7 +68,8 @@ public static class OutputVerifier
             return result;
         }
 
-        Console.WriteLine($"  Verification: decoding final output with idet (full file)...");
+        logger.SetStage("Verify", "decoding output with idet");
+        logger.LogInfo("Verification: decoding final output with idet (full file).");
 
         // Probe output for stream metadata (so DetectAsync can read field_order, fps, etc.).
         FfprobeRoot probe;
@@ -95,7 +98,7 @@ public static class OutputVerifier
         ContentDetectionResult detection;
         try
         {
-            detection = await ContentDetector.DetectAsync(cfg, outputPath, vstream, ct);
+            detection = await ContentDetector.DetectAsync(cfg, outputPath, vstream, ct, logger);
         }
         catch (Exception ex)
         {
@@ -148,9 +151,12 @@ public static class OutputVerifier
               $"cadence {detection.TelecineCadenceMatchRate:P2}, rate {result.OutputFps?.ToString() ?? "?"}."
             : $"Output verification FAILED: {result.Warnings.Count} issue(s) — review warnings.";
 
-        Console.WriteLine($"  {result.Notes}");
+        if (result.Passed)
+            logger.LogInfo(result.Notes);
+        else
+            logger.LogWarning(result.Notes);
         foreach (var w in result.Warnings)
-            Console.WriteLine($"    ! {w}");
+            logger.LogWarning(w);
 
         return result;
     }

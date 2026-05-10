@@ -101,8 +101,10 @@ public static partial class ContentDetector
     /// Source-agnostic: works on DVDs, Blu-rays, or any other container/codec.
     /// </summary>
     public static async Task<ContentDetectionResult> DetectAsync(
-        Config cfg, string input, FfprobeStream vstream, CancellationToken ct)
+        Config cfg, string input, FfprobeStream vstream, CancellationToken ct,
+        IPipelineLogger? logger = null)
     {
+        logger ??= NullLogger.Instance;
         // ---- Build ffmpeg args ----
         // Loglevel "info" is required so idet's end-of-stream aggregate ("Multi
         // frame detection: ...") reaches stderr — that line is logged at info
@@ -137,7 +139,8 @@ public static partial class ContentDetector
 
         var regex = IdetFrameRegex();
 
-        Console.WriteLine("  Detection: decoding full file with idet (single pass)...");
+        logger.SetStage("Detect", "decoding full file with idet");
+        logger.LogInfo("Detection: decoding full file with idet (single pass).");
 
         void ProcessLine(string line)
         {
@@ -165,9 +168,9 @@ public static partial class ContentDetector
 
         var (exitCode, stderr) = await Proc.RunStreamingAsync(cfg.Ffmpeg, argList.ToArray(), ProcessLine, ct);
 
-        Console.WriteLine($"  Detection: decoded {frames.Count:N0} frames.");
+        logger.LogInfo($"Detection: decoded {frames.Count:N0} frames.");
         if (exitCode != 0)
-            Console.WriteLine($"  Warning: ffmpeg exited with code {exitCode}");
+            logger.LogWarning($"ffmpeg exited with code {exitCode}");
 
         // Parse idet's end-of-stream aggregate line ("Multi frame detection:...") from stderr.
         // This is ffmpeg's own claim about the file using the same detector we sampled per-frame.
@@ -218,13 +221,21 @@ public static partial class ContentDetector
         var (contentType, confidence, reason) = Classify(
             intCount, progFrac, cadenceRate, iInCadence, parityMismatch);
 
-        Console.WriteLine($"  Detection complete: {contentType} (confidence={confidence:P0})");
-        Console.WriteLine($"    progFrac={progFrac:P1}, cadence={cadenceRate:P1}, " +
+        logger.LogInfo($"Detection complete: {contentType} (confidence={confidence:P0})");
+        logger.LogInfo(
+            $"  progFrac={progFrac:P1}, cadence={cadenceRate:P1}, " +
             $"i_in_cadence={iInCadence:P1}, parity={parity}" +
             (parityFromNtsc ? " (NTSC fallback)" : "") +
             $", source={sourceFps?.ToString() ?? "?"}" +
             (isLikelyCfr ? "" : " (VFR)") +
             $", frames={frames.Count:N0} (P={progCount:N0} I={intCount:N0} U={undetCount:N0})");
+        if (parityMismatch)
+            logger.LogWarning(
+                $"PARITY MISMATCH: idet={parity} vs ffprobe={ffprobeParity} " +
+                $"(ffprobe field_order={vstream.FieldOrder})");
+        if (!aggregateAgrees)
+            logger.LogWarning(
+                "idet aggregate disagrees with per-frame stream — likely parser bug.");
 
         return new ContentDetectionResult
         {
@@ -487,14 +498,8 @@ public static partial class ContentDetector
             Math.Abs(aggBff.Value - bffCount)   <= Tolerance &&
             Math.Abs(aggUndet.Value - undetCount) <= Tolerance;
 
-        if (!ok)
-        {
-            Console.WriteLine(
-                $"  Warning: idet aggregate disagrees with per-frame stream — " +
-                $"per-frame [P={progCount:N0}, TFF={tffCount:N0}, BFF={bffCount:N0}, U={undetCount:N0}] " +
-                $"vs aggregate [P={aggProg.Value:N0}, TFF={aggTff.Value:N0}, BFF={aggBff.Value:N0}, U={aggUndet.Value:N0}]. " +
-                "This indicates a parser bug or unexpected idet output format.");
-        }
+        // Disagreement is logged at the call site via the logger now (this
+        // helper is pure-function so it can be unit-tested without a logger).
 
         return ok;
     }

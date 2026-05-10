@@ -24,8 +24,9 @@ public static class VmafTuner
         Config cfg, GpuGate gpu, CpuGate cpu, string input, string outDir,
         RestoreDecision restore, bool isHdr, HdrMetadata? hdrMetadata,
         PipelineFormat format, string vmafModelVersion,
-        CancellationToken ct)
+        CancellationToken ct, IPipelineLogger? logger = null)
     {
+        logger ??= NullLogger.Instance;
         var probe = await Ffprobe.RunAsync(cfg, input, ct);
         var dur = probe.Format?.DurationSeconds ?? throw new InvalidOperationException("No duration.");
 
@@ -38,8 +39,8 @@ public static class VmafTuner
         {
             double covered = windows.Sum(w => w.LengthSeconds);
             double pct = dur > 0 ? covered / dur * 100 : 0;
-            Console.WriteLine(
-                $"  Adaptive sampling: source is {dur:F1}s — using {windows.Count} window(s) " +
+            logger.LogInfo(
+                $"Adaptive sampling: source is {dur:F1}s — using {windows.Count} window(s) " +
                 $"covering {covered:F1}s ({pct:F0}% of source) instead of the configured " +
                 $"{cfg.SampleCount}×{cfg.SampleWindowSeconds}s budget.");
         }
@@ -60,7 +61,7 @@ public static class VmafTuner
             : baseCq.Distinct().OrderBy(x => x).ToList();
 
         if (hdrShiftApplied)
-            Console.WriteLine($"  HDR tuning: CQ ladder shifted by -{cfg.HdrCqLadderDelta}. Base=[{string.Join(",", baseCq)}] Effective=[{string.Join(",", effectiveCq)}]");
+            logger.LogInfo($"HDR tuning: CQ ladder shifted by -{cfg.HdrCqLadderDelta}. Base=[{string.Join(",", baseCq)}] Effective=[{string.Join(",", effectiveCq)}]");
 
         // =======================================================
         //  Phase 1: Extract lossless FFV1 reference clips.
@@ -72,21 +73,25 @@ public static class VmafTuner
         //  CPU ffmpeg ops (across all files) at Config.MaxConcurrentCpuFfmpegOps,
         //  so this saturates the CPU without thrashing.  No batch barriers.
         // =======================================================
-        Console.WriteLine($"  Phase 1: Extracting {windows.Count} reference clips (FFV1 lossless, cadence-restored)...");
+        logger.SetStage("Phase 1", $"extracting {windows.Count} reference clips");
+        logger.LogInfo($"Phase 1: extracting {windows.Count} FFV1 reference clips (cadence-restored).");
         var phase1Sw = Stopwatch.StartNew();
         var refClips = new string[windows.Count];
 
+        int extractedCount = 0;
         var refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
             using (await cpu.AcquireAsync(ct))
                 await Pipelines.ExtractReferenceClipAsync(cfg, input, refPath, w, restore, ct);
             refClips[i] = refPath;
+            int done = Interlocked.Increment(ref extractedCount);
+            logger.SetStage("Phase 1", $"extracted {done}/{windows.Count} refs");
         }).ToArray();
 
         await Task.WhenAll(refTasks);
         phase1Sw.Stop();
-        Console.WriteLine($"  Phase 1 complete in {phase1Sw.Elapsed.TotalSeconds:F1}s.");
+        logger.LogInfo($"Phase 1 complete in {phase1Sw.Elapsed.TotalSeconds:F1}s.");
 
         // =======================================================
         //  Phase 2: Encode + VMAF per CQ level.
@@ -114,8 +119,10 @@ public static class VmafTuner
         {
             ct.ThrowIfCancellationRequested();
             var cqSw = Stopwatch.StartNew();
-            Console.WriteLine($"  Tuning CQ={cq}...");
+            logger.SetStage("Phase 2", $"CQ={cq} (0/{windows.Count})");
+            logger.LogInfo($"Phase 2: tuning CQ={cq}...");
 
+            int doneSamples = 0;
             var sampleTasks = Enumerable.Range(0, windows.Count).Select(async i =>
             {
                 string refClip = refClips[i];
@@ -133,6 +140,8 @@ public static class VmafTuner
                     await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
 
                 var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
+                int done = Interlocked.Increment(ref doneSamples);
+                logger.SetStage("Phase 2", $"CQ={cq} ({done}/{windows.Count})");
                 return new SampleMetric
                 {
                     SampleIndex = i,
@@ -152,7 +161,7 @@ public static class VmafTuner
             var agg = CqAggregate.From(cq, metrics);
             cqResults.Add(agg);
 
-            Console.WriteLine($"    mean={agg.MeanVmaf:F2} harmonic={agg.HarmonicMeanVmaf:F2} " +
+            logger.LogInfo($"  CQ={cq}: mean={agg.MeanVmaf:F2} harmonic={agg.HarmonicMeanVmaf:F2} " +
                 $"p05={agg.P05Vmaf:F2} p01={agg.P01Vmaf:F2} min={agg.MinVmaf:F2} " +
                 $"frames={agg.TotalFrameCount} ({cqSw.Elapsed.TotalSeconds:F1}s)");
 
@@ -161,7 +170,7 @@ public static class VmafTuner
                 agg.P05Vmaf  >= cfg.TargetP05Vmaf  &&
                 agg.P01Vmaf  >= cfg.TargetP01Vmaf)
             {
-                Console.WriteLine($"    CQ={cq} meets all thresholds " +
+                logger.LogInfo($"CQ={cq} meets all thresholds " +
                     $"(mean≥{cfg.TargetMeanVmaf:F1}, p05≥{cfg.TargetP05Vmaf:F1}, " +
                     $"p01≥{cfg.TargetP01Vmaf:F1}) — stopping search.");
                 break;
@@ -170,7 +179,7 @@ public static class VmafTuner
 
         phase2Sw.Stop();
         var selection = Selector.Select(cfg, cqResults);
-        Console.WriteLine($"  Phase 2 complete in {phase2Sw.Elapsed.TotalSeconds:F1}s ({cqResults.Count} CQ levels evaluated).");
+        logger.LogInfo($"Phase 2 complete in {phase2Sw.Elapsed.TotalSeconds:F1}s ({cqResults.Count} CQ levels evaluated).");
 
         return new TuningResult
         {

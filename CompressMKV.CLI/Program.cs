@@ -1,6 +1,6 @@
 // Program.cs
 // Build: dotnet build
-// Run:   dotnet run --project CompressMKV.CLI -- --input /path/to/mkvs --output /path/to/out
+// Run:   dotnet run --project CompressMKV.CLI -- --input /path/to/mkvs --output /path/to/out [--force-redo]
 //
 // VMAF models come from libvmaf's compiled-in versions — vmaf_v0.6.1 for
 // ≤1080p, vmaf_4k_v0.6.1 for ≥3840×2160.  Selected automatically by source
@@ -22,7 +22,7 @@
 //   Phase 1: Extract lossless FFV1 reference clips with restored cadence (fast seek).
 //   Phase 2: Encode each at candidate CQ levels (high→low, early termination).
 //   VMAF measured per-frame across all samples for robust percentile computation.
-//   Thresholds: mean ≥ 97, p05 ≥ 95 (virtually imperceptible at close viewing).
+//   Thresholds: mean ≥ 97, p05 ≥ 95, p01 ≥ 90 (virtually imperceptible at close viewing).
 //
 // Detection approach (single-pass per-frame):
 //   One ffmpeg call decodes the entire file with idet + metadata=print,
@@ -34,10 +34,19 @@
 //   No chunks, no sampling, no IVTC verification, no source-type bias.
 //   Detection thresholds are internal constants derived from signal physics.
 //   Hardware-accelerated decoding (NVDEC) is used when available.
+//
+// Logging:
+//   - log.json  (per-file structured summary with all decisions)
+//   - decisions.log (per-file plain-text chronological narrative)
+//   - overall_<timestamp>.json (run-level aggregate)
+//
+// Resume:
+//   - Files with valid log.json are skipped on restart (file-level resume).
+//   - --force-redo deletes prior log.json + intermediate state and re-runs.
 
 using System.Diagnostics;
 using System.Globalization;
-using System.Text;
+using Spectre.Console;
 
 namespace CompressMkv;
 
@@ -50,110 +59,119 @@ public static class Program
 
         string? input = GetArg(args, "--input");
         string? output = GetArg(args, "--output");
+        bool forceRedo = args.Contains("--force-redo");
+
         if (string.IsNullOrWhiteSpace(input))
         {
-            Console.WriteLine("Usage: compress-mkv --input <folder> [--output <folder>]");
+            AnsiConsole.MarkupLine("[red]Usage:[/] compress-mkv --input <folder> [[--output <folder>]] [[--force-redo]]");
             return 2;
         }
 
-        var cfg = new Config
-        {
-            InputFolder = input!,
-            OutputFolder = output ?? "./out",
-            Ffmpeg = "ffmpeg",
-            Ffprobe = "ffprobe",
-
-            // VMAF models (vmaf_v0.6.1 / vmaf_4k_v0.6.1) come from libvmaf's
-            // built-in versions — no /usr/share/model/ dependency required.
-
-            // RTX 5080: 2 NVENC + 2 NVDEC sessions.
-            // GpuGate semaphores are the sole concurrency control for GPU work —
-            // files flow freely through CPU phases and block only on encoder/decoder slots.
-            NvencSlots = 2,
-            NvdecSlots = 2,
-
-            // VMAF tuning — stratified random sampling + per-frame score aggregation
-            CandidateCq = [16, 18, 20, 22, 24, 26, 28, 30, 32, 34],
-            SampleCount = 16,
-            SampleWindowSeconds = 12,
-            RandomSeed = 12345,
-
-            // Frame-level VMAF thresholds for imperceptible quality loss.
-            // Calibrated for 27" 16:9 at 2-3 ft and 65" 16:9 at 8-12 ft.
-            TargetMeanVmaf = 97.0,
-            TargetP05Vmaf = 95.0,
-
-            // HDR CQ ladder shift (effective CQ = base CQ - delta)
-            HdrApplyCqLadderShift = true,
-            HdrCqLadderDelta = 2,
-            MinCq = 0,
-
-            // NVENC AV1 — highest quality preset with multipass + AQ (set in Pipelines)
-            NvencPreset = "p7",
-            RcLookahead = 48,
-            UseNvdecForEncode = true,
-
-            // Content detection (single-pass per-frame idet)
-            UseHwaccelForDetection = true,
-
-            // Preview gating
-            PreviewMaxConfidenceToGenerate = 0.60,
-            PreviewCount = 3,
-            PreviewDurationSeconds = 10.0,
-
-            OutputExtension = ".mkv",
-        };
-
+        var cfg = BuildConfig(input!, output);
         Directory.CreateDirectory(cfg.OutputFolder);
 
         // ---- Validate ffmpeg capabilities at startup ----
-        Console.WriteLine("Validating ffmpeg capabilities...");
+        AnsiConsole.MarkupLine("[grey]Validating ffmpeg capabilities...[/]");
         bool hasZscale = await FfmpegCapabilities.ValidateAsync(cfg, cts.Token);
         if (!hasZscale)
-            Console.WriteLine("  Warning: zscale (libzimg) not available — HDR content will fail.");
+            AnsiConsole.MarkupLine("[yellow]Warning:[/] zscale (libzimg) not available — HDR content will fail.");
         else
-            Console.WriteLine("  OK: libvmaf and zscale available.");
+            AnsiConsole.MarkupLine("[green]OK:[/] libvmaf and zscale available.");
 
         var files = Directory.EnumerateFiles(cfg.InputFolder, "*.mkv", SearchOption.AllDirectories)
                              .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
                              .ToList();
 
-        Console.WriteLine($"Found {files.Count} mkv files under {cfg.InputFolder}");
-        Console.WriteLine(
-            $"Concurrency: {cfg.MaxConcurrentFiles} files in flight, " +
+        AnsiConsole.MarkupLine($"[bold]Found {files.Count} mkv files[/] under {cfg.InputFolder}");
+        AnsiConsole.MarkupLine(
+            $"[grey]Concurrency:[/] {cfg.MaxConcurrentFiles} files in flight, " +
             $"{cfg.MaxConcurrentCpuFfmpegOps} CPU ffmpeg ops, " +
             $"{cfg.NvencSlots} NVENC + {cfg.NvdecSlots} NVDEC, " +
             $"{cfg.FfmpegCpuThreads} threads/CPU op, " +
             $"{cfg.LibvmafThreads} threads/libvmaf.");
+        if (forceRedo)
+            AnsiConsole.MarkupLine("[yellow]--force-redo:[/] existing log.json files will be ignored and files re-processed.");
+        AnsiConsole.WriteLine();
 
         var gpu = new GpuGate(cfg.NvencSlots, cfg.NvdecSlots);
         var cpu = new CpuGate(cfg.MaxConcurrentCpuFfmpegOps);
         var overall = new OverallSummary { StartedUtc = DateTime.UtcNow, Config = cfg };
+        var reporter = new StageReporter(files.Count);
 
+        // Live UI: re-renders the reporter every 200ms while the workload runs.
+        // Spectre.Console handles non-TTY environments gracefully (plain output).
+        var workTask = ProcessAllFilesAsync(cfg, gpu, cpu, files, hasZscale, forceRedo, overall, reporter, cts.Token);
+
+        await AnsiConsole.Live(reporter.BuildRenderable())
+            .AutoClear(false)
+            .Overflow(VerticalOverflow.Ellipsis)
+            .StartAsync(async ctx =>
+            {
+                while (!workTask.IsCompleted)
+                {
+                    ctx.UpdateTarget(reporter.BuildRenderable());
+                    try { await Task.Delay(200, cts.Token); }
+                    catch (OperationCanceledException) { break; }
+                }
+                ctx.UpdateTarget(reporter.BuildRenderable());
+            });
+
+        try { await workTask; }
+        catch (OperationCanceledException) { /* user-initiated */ }
+
+        overall.FinishedUtc = DateTime.UtcNow;
+        var overallPath = Path.Combine(cfg.OutputFolder, $"overall_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
+        await JsonIO.WriteAsync(overallPath, overall, cts.Token);
+
+        // End-of-run summary.
+        AnsiConsole.WriteLine();
+        var rule = new Rule("[bold]Run summary[/]") { Justification = Justify.Left };
+        AnsiConsole.Write(rule);
+        AnsiConsole.MarkupLine($"  [green]Completed:[/] {overall.Videos.Count - overall.Errors.Count} files");
+        AnsiConsole.MarkupLine($"  [yellow]Skipped via resume:[/] {overall.Videos.Count(v => v.Tuning == null && v.OutputVerification == null)}");
+        if (overall.Errors.Count > 0)
+            AnsiConsole.MarkupLine($"  [red]Errored:[/] {overall.Errors.Count}");
+        var marginalCount = overall.Videos.Count(v => v.Tuning?.Selection?.IsMarginal == true);
+        if (marginalCount > 0)
+            AnsiConsole.MarkupLine($"  [yellow]Marginal passes:[/] {marginalCount}");
+        AnsiConsole.MarkupLine($"  [grey]Wrote {overallPath}[/]");
+
+        return overall.Errors.Count == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Per-file work loop.  Spawns at most <see cref="Config.MaxConcurrentFiles"/>
+    /// concurrent file processings, each with its own <see cref="PerFileLogger"/>.
+    /// </summary>
+    private static async Task ProcessAllFilesAsync(
+        Config cfg, GpuGate gpu, CpuGate cpu, List<string> files, bool hasZscale,
+        bool forceRedo, OverallSummary overall, StageReporter reporter, CancellationToken ct)
+    {
         await Parallel.ForEachAsync(
             files.Select((file, i) => (file, idx: i + 1)),
             new ParallelOptions
             {
-                CancellationToken = cts.Token,
+                CancellationToken = ct,
                 MaxDegreeOfParallelism = cfg.MaxConcurrentFiles,
             },
-            async (item, ct) =>
+            async (item, fileCt) =>
             {
                 var (file, idx) = item;
                 var id = SafeId(Path.GetFileNameWithoutExtension(file));
                 var outDir = Path.Combine(cfg.OutputFolder, id);
                 var logPath = Path.Combine(outDir, "log.json");
+                var fileName = Path.GetFileName(file);
 
                 // Resume: if a prior run completed successfully, load its result and skip.
-                if (File.Exists(logPath))
+                if (!forceRedo && File.Exists(logPath))
                 {
                     try
                     {
-                        var prior = await JsonIO.ReadAsync<VideoSummary>(logPath, ct);
+                        var prior = await JsonIO.ReadAsync<VideoSummary>(logPath, fileCt);
                         if (prior != null)
                         {
                             lock (overall) overall.Videos.Add(prior);
-                            Console.WriteLine($"  [{idx}/{files.Count}] Skipped (already completed): {file}");
+                            reporter.SkipFile(idx, fileName, "prior log.json found");
                             return;
                         }
                     }
@@ -163,99 +181,104 @@ public static class Program
                     }
                 }
 
-                // Incomplete prior run: wipe intermediate artifacts and start fresh.
+                // Incomplete prior run (or --force-redo): wipe intermediates + log.
+                if (forceRedo && File.Exists(logPath)) File.Delete(logPath);
                 CleanIntermediates(outDir);
+                Directory.CreateDirectory(outDir);
 
-                Console.WriteLine($"\n[{idx}/{files.Count}] {file}");
+                int slot = idx;  // file slot identifier for the reporter
+                reporter.BeginFile(slot, idx, fileName);
+
+                using var logger = new PerFileLogger(
+                    Path.Combine(outDir, "decisions.log"), reporter, slot);
+
                 try
                 {
-                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, hasZscale, ct);
+                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, hasZscale, fileCt, logger);
                     lock (overall) overall.Videos.Add(summary);
 
-                    Console.WriteLine($"  [{idx}/{files.Count}] HDR: {summary.IsHdr}");
-
-                    if (summary.ContentDetection != null)
-                    {
-                        var det = summary.ContentDetection;
-                        Console.WriteLine($"  [{idx}/{files.Count}] ContentType: {det.ContentType} (confidence={det.Confidence:P0})");
-                        Console.WriteLine($"    Frames: {det.TotalFramesAnalyzed:N0} (P={det.ProgressiveFrameCount:N0}, I={det.InterlacedFrameCount:N0}, U={det.UndeterminedFrameCount:N0})");
-                        Console.WriteLine($"    Progressive fraction: {det.GlobalProgressiveFraction:P2}");
-                        Console.WriteLine($"    Telecine cadence match rate: {det.TelecineCadenceMatchRate:P2}");
-                        Console.WriteLine($"    I-frames in 3:2 cycles: {det.InterlacedFramesInCadenceRatio:P2}");
-                        Console.WriteLine($"    Source fps: {det.SourceFps?.ToString() ?? "?"}" +
-                            $" ({(det.IsNtscFamilyFps ? "NTSC family" : "non-NTSC")}" +
-                            $", {(det.SourceIsLikelyCfr ? "CFR" : "VFR")})");
-                        Console.WriteLine($"    Parity: {det.DetectedParity}" +
-                            (det.ParityFromNtscFallback ? " (NTSC fallback)" : "") +
-                            $" (raw TFF={det.RawIdetTffCount:N0}, BFF={det.RawIdetBffCount:N0})");
-                        if (det.ParityMismatch)
-                            Console.WriteLine($"    PARITY MISMATCH: idet={det.DetectedParity} vs ffprobe={det.FfprobeMappedParity} (ffprobe field_order={det.FfprobeFieldOrder})");
-                        if (!det.IdetAggregateAgrees)
-                            Console.WriteLine($"    PARSER WARNING: idet aggregate disagrees with per-frame stream (see prior log line).");
-                        Console.WriteLine($"    Reason: {det.Reason}");
-                    }
-
-                    if (summary.Restore != null)
-                    {
-                        Console.WriteLine($"  [{idx}/{files.Count}] Restore: {summary.Restore.Mode} → filter=\"{summary.Restore.FilterGraph}\", fps={summary.Restore.OutputFps?.ToString() ?? "native"}");
-                        Console.WriteLine(summary.Restore.Previews is { Count: > 0 }
-                            ? $"  Previews: generated ({summary.Restore.Previews.Count})"
-                            : "  Previews: not generated");
-                    }
-
-                    if (summary.Tuning?.Selection != null)
-                    {
-                        var sel = summary.Tuning.Selection;
-                        Console.WriteLine($"  [{idx}/{files.Count}] CQ selected (final): {summary.FinalCq}");
-                        if (summary.Tuning.HdrCqShiftApplied)
-                            Console.WriteLine($"    HDR CQ ladder shift applied: -{summary.Tuning.HdrCqShiftDelta}  Base=[{string.Join(",", summary.Tuning.BaseCqList)}] Effective=[{string.Join(",", summary.Tuning.EffectiveCqList)}]");
-                        Console.WriteLine($"    VMAF: mean={sel.SelectedMeanVmaf:F2}, harmonic={sel.SelectedHarmonicMeanVmaf:F2}, p05={sel.SelectedP05Vmaf:F2}, p01={sel.SelectedP01Vmaf:F2}, min={sel.SelectedMinVmaf:F2}, frames={sel.TotalFrameCount}");
-                        if (sel.IsMarginal)
-                        {
-                            Console.WriteLine($"    MARGINAL PASS — selection is within {Selector.MarginalThresholdPoints:F1} VMAF points of threshold:");
-                            foreach (var r in sel.MarginalReasons)
-                                Console.WriteLine($"      ! {r}");
-                        }
-                    }
-
-                    Console.WriteLine($"  [{idx}/{files.Count}] Output: {summary.FinalOutputPath}");
-
-                    if (summary.OutputVerification is { } v)
-                    {
-                        string status = v.Skipped ? "SKIPPED" : (v.Passed ? "PASSED" : "FAILED");
-                        Console.WriteLine($"  [{idx}/{files.Count}] Verification: {status} — {v.Notes}");
-                        foreach (var w in v.Warnings)
-                            Console.WriteLine($"    ! {w}");
-                    }
-
-                    if (summary.Timings is { } tm)
-                    {
-                        Console.WriteLine(
-                            $"  [{idx}/{files.Count}] Timings (total {tm.Total.TotalSeconds:F1}s): " +
-                            $"detect={tm.Detection.TotalSeconds:F1}s, " +
-                            $"prev={tm.Previews.TotalSeconds:F1}s, " +
-                            $"tune.p1={tm.TuningPhase1.TotalSeconds:F1}s, " +
-                            $"tune.p2={tm.TuningPhase2.TotalSeconds:F1}s, " +
-                            $"final={tm.FinalEncode.TotalSeconds:F1}s, " +
-                            $"verify={tm.Verification.TotalSeconds:F1}s.");
-                    }
+                    var (resultText, level) = SummariseResult(summary);
+                    reporter.CompleteFile(slot, resultText, level);
+                }
+                catch (OperationCanceledException)
+                {
+                    reporter.CompleteFile(slot, "cancelled", ResultLevel.Failure);
+                    throw;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"  [{idx}/{files.Count}] ERROR: {ex.Message}");
+                    logger.LogError(ex.ToString());
                     lock (overall) overall.Errors.Add(new RunError { File = file, Error = ex.ToString() });
+                    reporter.CompleteFile(slot, $"error: {Truncate(ex.Message, 60)}", ResultLevel.Failure);
                 }
             });
-
-        overall.FinishedUtc = DateTime.UtcNow;
-        var overallPath = Path.Combine(cfg.OutputFolder, $"overall_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
-        await JsonIO.WriteAsync(overallPath, overall, cts.Token);
-        Console.WriteLine($"\nWrote {overallPath}");
-        return 0;
     }
 
+    private static (string text, ResultLevel level) SummariseResult(VideoSummary s)
+    {
+        // Build a compact one-line result for the recent-completions table.
+        var parts = new List<string>();
+        if (s.Tuning?.Selection?.SelectedCq is { } cq) parts.Add($"CQ={cq}");
+
+        bool marginal = s.Tuning?.Selection?.IsMarginal == true;
+        bool verifyFailed = s.OutputVerification?.Passed == false;
+
+        if (verifyFailed)
+            return ($"verify FAILED — {string.Join(' ', parts)}", ResultLevel.Failure);
+        if (marginal)
+            return ($"⚠ marginal — {string.Join(' ', parts)}", ResultLevel.Warning);
+        return ($"✓ {string.Join(' ', parts)}", ResultLevel.Success);
+    }
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..(max - 1)] + "…";
+
+    private static Config BuildConfig(string input, string? output) => new()
+    {
+        InputFolder = input,
+        OutputFolder = output ?? "./out",
+        Ffmpeg = "ffmpeg",
+        Ffprobe = "ffprobe",
+
+        // RTX 5080: 2 NVENC + 2 NVDEC sessions.
+        NvencSlots = 2,
+        NvdecSlots = 2,
+
+        // VMAF tuning — stratified random sampling + per-frame score aggregation
+        CandidateCq = [16, 18, 20, 22, 24, 26, 28, 30, 32, 34],
+        SampleCount = 16,
+        SampleWindowSeconds = 12,
+        RandomSeed = 12345,
+
+        // Frame-level VMAF thresholds for imperceptible quality loss.
+        TargetMeanVmaf = 97.0,
+        TargetP05Vmaf = 95.0,
+        TargetP01Vmaf = 90.0,
+
+        // HDR CQ ladder shift (effective CQ = base CQ - delta)
+        HdrApplyCqLadderShift = true,
+        HdrCqLadderDelta = 2,
+        MinCq = 0,
+
+        // NVENC AV1 — highest quality preset with multipass + AQ (set in Pipelines)
+        NvencPreset = "p7",
+        RcLookahead = 48,
+        UseNvdecForEncode = true,
+
+        // Content detection (single-pass per-frame idet)
+        UseHwaccelForDetection = true,
+
+        // Preview gating
+        PreviewMaxConfidenceToGenerate = 0.60,
+        PreviewCount = 3,
+        PreviewDurationSeconds = 10.0,
+
+        OutputExtension = ".mkv",
+    };
+
     private static async Task<VideoSummary> ProcessOneAsync(
-        Config cfg, GpuGate gpu, CpuGate cpu, string input, bool hasZscale, CancellationToken ct)
+        Config cfg, GpuGate gpu, CpuGate cpu, string input, bool hasZscale,
+        CancellationToken ct, IPipelineLogger logger)
     {
         var totalSw = Stopwatch.StartNew();
         var timings = new PhaseTimings();
@@ -263,22 +286,23 @@ public static class Program
         var outDir = Path.Combine(cfg.OutputFolder, id);
         Directory.CreateDirectory(outDir);
 
+        logger.LogInfo($"Input: {input}");
+        logger.LogInfo($"Output dir: {outDir}");
+
+        logger.SetStage("Probe");
         var probe = await Ffprobe.RunAsync(cfg, input, ct);
         var vstream = probe.Streams?.FirstOrDefault(s => s.CodecType == "video")
                      ?? throw new InvalidOperationException("No video stream found.");
 
         bool isHdr = SourceClassifier.IsHdr(vstream);
+        logger.LogInfo($"HDR: {isHdr}");
 
-        // Fail early if HDR content needs zscale and it's unavailable.
         if (isHdr && !hasZscale)
             throw new InvalidOperationException(
                 "HDR content detected but ffmpeg lacks zscale (libzimg). " +
-                "VMAF measurement for HDR requires tone-mapping via zscale. " +
-                "On Arch Linux: install 'zimg' and rebuild ffmpeg with --enable-libzimg.");
+                "VMAF measurement for HDR requires tone-mapping via zscale.");
 
-        // Extract HDR mastering / Content-Light-Level metadata so the VMAF tonemap
-        // chain uses the correct nominal peak luminance (npl).  Only meaningful
-        // for HDR sources; SDR files skip the second ffprobe call entirely.
+        // HDR metadata — only meaningful for HDR sources.
         HdrMetadata? hdrMetadata = isHdr
             ? await SourceClassifier.ExtractHdrMetadataAsync(cfg, input, ct)
             : null;
@@ -288,43 +312,30 @@ public static class Program
             string source = hdrMetadata?.MaxCll is { } ? "MaxCLL"
                           : hdrMetadata?.MasteringDisplayMaxLuminance is { } ? "mastering display"
                           : "HDR10 default (no metadata found)";
-            Console.WriteLine($"  HDR npl: {npl} nits (from {source})");
+            logger.LogInfo($"HDR npl: {npl} nits (from {source})");
         }
 
-        // Derive the source's pipeline format once.  Flows through every ffmpeg
-        // call so encode pix_fmt, hwaccel output format, and VMAF compare format
-        // all stay at the source's native bit depth — 8-bit sources end up in
-        // 8-bit encodes (saving ~10-15% file size vs forcing p010le), 10-bit
-        // sources stay 10-bit end-to-end.
         var pipelineFormat = PipelineFormat.FromStream(vstream);
-        Console.WriteLine($"  Pipeline: {pipelineFormat}");
+        logger.LogInfo($"Pipeline format: {pipelineFormat}");
 
-        // Select VMAF model version based on source resolution: 4K model for
-        // ≥3840×2160, standard (1080p-tuned) otherwise.  These are libvmaf's
-        // built-in version names — no model file lookup needed.
         string vmafModelVersion = cfg.ResolveVmafModelVersion(vstream.Width, vstream.Height);
-        Console.WriteLine($"  VMAF model: {vmafModelVersion} " +
-            $"(source {vstream.Width}x{vstream.Height})");
+        logger.LogInfo($"VMAF model: {vmafModelVersion} (source {vstream.Width}x{vstream.Height})");
 
-        ContentDetectionResult? detection = null;
-        RestoreDecision restore;
-
-        // Source-agnostic content detection per MPlayer guide §7.2.2.
-        // Runs on all content regardless of source type (DVD, Blu-ray, etc.)
-        // Gate NVDEC slot when hardware-accelerated detection is enabled, plus
-        // a CPU slot for the idet filter and any software decode work.
+        // ---- Detection ----
         var sw = Stopwatch.StartNew();
+        ContentDetectionResult detection;
         using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, ct))
         using (await cpu.AcquireAsync(ct))
         {
-            detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct);
+            detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct, logger);
         }
         timings.Detection = sw.Elapsed;
 
-        // Map ContentType enum → restore filter chain per MPlayer guide §7.2.3
-        restore = RestoreStrategyMapper.MapToRestore(detection);
+        var restore = RestoreStrategyMapper.MapToRestore(detection);
+        logger.LogInfo($"Restore decision: {restore.Mode} (filter=\"{restore.FilterGraph}\", fps={restore.OutputFps?.ToString() ?? "native"})");
+        logger.LogInfo($"  Reason: {restore.Notes}");
 
-        // Preview gating: generate when confidence is low or parity is mismatched
+        // ---- Previews ----
         bool needPreviews =
             restore.Confidence < cfg.PreviewMaxConfidenceToGenerate ||
             detection.ParityMismatch;
@@ -332,24 +343,23 @@ public static class Program
         if (needPreviews)
         {
             sw.Restart();
+            logger.SetStage("Previews", $"generating {cfg.PreviewCount}×IVTC + {cfg.PreviewCount}×Deint");
+            logger.LogInfo($"Generating {cfg.PreviewCount} preview pairs (low confidence or parity mismatch).");
             var previewDir = Path.Combine(outDir, "previews");
             Directory.CreateDirectory(previewDir);
             restore.Previews = new List<PreviewArtifact>();
 
-            // Pick evenly-spaced timestamps across the video for previews.
             var dur = probe.Format?.DurationSeconds ?? 0;
             var previewTs = new List<double>();
             if (dur > 0)
             {
                 double step = dur / (cfg.PreviewCount + 1);
-                for (int pi = 1; pi <= cfg.PreviewCount; pi++)
-                    previewTs.Add(pi * step);
+                for (int pi = 1; pi <= cfg.PreviewCount; pi++) previewTs.Add(pi * step);
             }
 
             foreach (var t in previewTs)
             {
                 ct.ThrowIfCancellationRequested();
-
                 string baseTag = $"t{t.ToString("F1", CultureInfo.InvariantCulture)}";
                 string ivtcPrev = Path.Combine(previewDir, $"preview_ivtc_{baseTag}.mkv");
                 string deintPrev = Path.Combine(previewDir, $"preview_deint_{baseTag}.mkv");
@@ -364,36 +374,50 @@ public static class Program
             timings.Previews = sw.Elapsed;
         }
 
-        // VMAF tuning: two-phase pipeline with pre-extracted reference clips.
+        // ---- Tuning ----
         var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore,
-            isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, ct);
+            isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, ct, logger);
         timings.TuningPhase1 = tuning.Phase1Elapsed;
         timings.TuningPhase2 = tuning.Phase2Elapsed;
 
-        // Final encode uses selected CQ directly (HDR ladder already shifted during tuning).
-        // The restore filter runs on CPU even though NVENC handles encoding, so a CPU slot
-        // is acquired for the duration in addition to the NVENC slot inside FinalEncoder.
+        if (tuning.Selection.IsMarginal)
+        {
+            logger.LogWarning("Selection is MARGINAL — within "
+                + $"{Selector.MarginalThresholdPoints:F1} VMAF points of threshold:");
+            foreach (var r in tuning.Selection.MarginalReasons)
+                logger.LogWarning($"  ! {r}");
+        }
+
+        // ---- Final encode ----
         int finalCq = tuning.Selection.SelectedCq;
         var finalOut = Path.Combine(outDir, $"{id}_av1_cq{finalCq}{cfg.OutputExtension}");
         sw.Restart();
         using (await cpu.AcquireAsync(ct))
         {
-            await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, pipelineFormat, ct);
+            await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, pipelineFormat, ct, logger);
         }
         timings.FinalEncode = sw.Elapsed;
+        logger.LogInfo($"Final encode written: {finalOut}");
 
-        // Trust-but-verify: confirm the final output reflects the chosen restoration.
-        // For pass-through runs this is a no-op.  Acquires NVDEC for the AV1 decode pass
-        // plus a CPU slot for the idet filter.
+        // ---- Verification ----
         sw.Restart();
         OutputVerificationResult verification;
         using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, ct))
         using (await cpu.AcquireAsync(ct))
         {
-            verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, ct);
+            verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, ct, logger);
         }
         timings.Verification = sw.Elapsed;
         timings.Total = totalSw.Elapsed;
+
+        logger.LogInfo(
+            $"Timings (total {timings.Total.TotalSeconds:F1}s): " +
+            $"detect={timings.Detection.TotalSeconds:F1}s, " +
+            $"prev={timings.Previews.TotalSeconds:F1}s, " +
+            $"tune.p1={timings.TuningPhase1.TotalSeconds:F1}s, " +
+            $"tune.p2={timings.TuningPhase2.TotalSeconds:F1}s, " +
+            $"final={timings.FinalEncode.TotalSeconds:F1}s, " +
+            $"verify={timings.Verification.TotalSeconds:F1}s.");
 
         var summary = new VideoSummary
         {
@@ -413,7 +437,6 @@ public static class Program
         };
 
         await JsonIO.WriteAsync(Path.Combine(outDir, "log.json"), summary, ct);
-
         CleanIntermediates(outDir);
 
         return summary;
@@ -438,7 +461,7 @@ public static class Program
 
     private static string SafeId(string s)
     {
-        var sb = new StringBuilder(s.Length);
+        var sb = new System.Text.StringBuilder(s.Length);
         foreach (var ch in s)
             sb.Append(char.IsLetterOrDigit(ch) || ch is '-' or '_' or '.' ? ch : '_');
         return sb.ToString();
