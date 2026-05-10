@@ -1,5 +1,20 @@
 namespace CompressMkv;
 
+// =========================================================================
+// CQ selection from a list of per-CQ VMAF aggregates.
+//
+// Selection criterion: highest CQ where mean VMAF ≥ TargetMeanVmaf AND
+// P05 VMAF ≥ TargetP05Vmaf.  P05 is the 5th percentile across every per-frame
+// score from every sample window — it bounds the worst-quality frames
+// directly.  Mean catches systematic quality drops.
+//
+// Note on harmonic mean: CqAggregate computes HarmonicMeanVmaf for diagnostic
+// reporting only.  It is intentionally NOT used in selection — the P05 gate
+// already constrains the low-quality tail more directly.  If P05 ≥ 95 then
+// the bottom 5% of frames are bounded at 95+, which keeps harmonic mean
+// from dropping more than ~0.5 below arithmetic mean.  Adding a third gate
+// on harmonic mean would be redundant with P05 in practice.
+// =========================================================================
 public static class Selector
 {
     public static Selection Select(Config cfg, List<CqAggregate> results)

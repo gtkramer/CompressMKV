@@ -92,38 +92,54 @@ public static class Pipelines
     // ----------------------------------------------------------------
     public static async Task RunVmafDirectAsync(
         Config cfg, string refInput, string encInput, bool isHdr,
-        string vmafLog, string vmafModelPath, CancellationToken ct)
+        HdrMetadata? hdrMetadata, string sdrCompareFormat,
+        string vmafLog, string vmafModelVersion, CancellationToken ct)
     {
         if (File.Exists(vmafLog)) File.Delete(vmafLog);
 
         string esc(string p) => p.Replace(@"\", @"\\").Replace(":", @"\:");
 
+        // Use libvmaf's built-in model versions instead of file paths.  Model
+        // names like "vmaf_v0.6.1" and "vmaf_4k_v0.6.1" are compiled into
+        // libvmaf, so no /usr/share/model/ dependency is needed and the
+        // filter graph stays portable across distros.
         // libvmaf threads: capped via Config so total CPU stays in-budget when
         // multiple VMAF runs are in flight (gated by CpuGate at the caller).
         string vmafOpts =
             $"log_fmt=json:log_path={esc(vmafLog)}:" +
-            $"model_path={esc(vmafModelPath)}:" +
+            $"model=version={vmafModelVersion}:" +
             $"n_threads={cfg.LibvmafThreads.ToString(CultureInfo.InvariantCulture)}:" +
             "n_subsample=1";
 
         string filter;
         if (isHdr)
         {
-            // Tonemap both to SDR for VMAF. npl=100 is a reasonable default;
-            // ideally this would come from MaxCLL/MaxFALL HDR metadata.
+            // Tonemap both ref and encode to SDR before VMAF.  npl ("nominal peak
+            // luminance") tells the tonemapper what brightness counts as the input
+            // peak — get it wrong and highlights are crushed identically in both
+            // streams, but their differences in those crushed regions become
+            // invisible to VMAF.  Resolve from HDR side-data (MaxCLL → mastering
+            // display max → 1000 nits HDR10 default).
+            int npl = (hdrMetadata ?? new HdrMetadata()).ResolveNpl();
+            string nplStr = npl.ToString(CultureInfo.InvariantCulture);
+
             filter = string.Concat(
-                "[0:v]zscale=t=linear:npl=100,tonemap=tonemap=hable,",
+                $"[0:v]zscale=t=linear:npl={nplStr},tonemap=tonemap=hable,",
                 "zscale=t=bt709:m=bt709:r=tv,format=yuv420p[ref_sdr];",
-                "[1:v]zscale=t=linear:npl=100,tonemap=tonemap=hable,",
+                $"[1:v]zscale=t=linear:npl={nplStr},tonemap=tonemap=hable,",
                 "zscale=t=bt709:m=bt709:r=tv,format=yuv420p[enc_sdr];",
                 $"[enc_sdr][ref_sdr]libvmaf={vmafOpts}");
         }
         else
         {
-            // SDR: use yuv420p10le to preserve the 10-bit encode's full precision.
+            // SDR: compare at the source's matched bit depth.  An 8-bit reference
+            // converted to yuv420p10le would have zero-padded LSBs while the
+            // 10-bit encode has genuine LSB content — the resulting LSB
+            // differences are sub-perceptual but contribute small bias to VMAF.
+            // sdrCompareFormat comes from FfprobeStream.GetVmafCompareFormat().
             filter = string.Concat(
-                "[0:v]format=yuv420p10le[ref];",
-                "[1:v]format=yuv420p10le[enc];",
+                $"[0:v]format={sdrCompareFormat}[ref];",
+                $"[1:v]format={sdrCompareFormat}[enc];",
                 $"[enc][ref]libvmaf={vmafOpts}");
         }
 

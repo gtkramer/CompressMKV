@@ -1,11 +1,10 @@
 // Program.cs
 // Build: dotnet build
-// Run:   dotnet run -- --input /path/to/mkvs --output /path/to/out [--vmaf-model-dir /usr/share/model]
+// Run:   dotnet run --project CompressMKV.CLI -- --input /path/to/mkvs --output /path/to/out
 //
-// VMAF models:
-//   On Arch Linux: sudo pacman -S vmaf
-//   Models installed to /usr/share/model/ (vmaf_v0.6.1.json, vmaf_4k_v0.6.1.json).
-//   Standard model used for ≤1080p; 4K model for ≥3840×2160 — selected automatically.
+// VMAF models come from libvmaf's compiled-in versions — vmaf_v0.6.1 for
+// ≤1080p, vmaf_4k_v0.6.1 for ≥3840×2160.  Selected automatically by source
+// resolution; no model files required on disk.
 //
 // Content type detection follows the five NTSC DVD categories from MPlayer guide §7.2:
 //   http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-telecine.html
@@ -53,7 +52,7 @@ public static class Program
         string? output = GetArg(args, "--output");
         if (string.IsNullOrWhiteSpace(input))
         {
-            Console.WriteLine("Usage: compress-mkv --input <folder> [--output <folder>] [--vmaf-model-dir <path>]");
+            Console.WriteLine("Usage: compress-mkv --input <folder> [--output <folder>]");
             return 2;
         }
 
@@ -64,9 +63,8 @@ public static class Program
             Ffmpeg = "ffmpeg",
             Ffprobe = "ffprobe",
 
-            // VMAF model directory — auto-selects standard vs 4K based on source resolution.
-            // On Arch Linux: sudo pacman -S vmaf → models at /usr/share/model/
-            VmafModelDir = GetArg(args, "--vmaf-model-dir") ?? "/usr/share/model",
+            // VMAF models (vmaf_v0.6.1 / vmaf_4k_v0.6.1) come from libvmaf's
+            // built-in versions — no /usr/share/model/ dependency required.
 
             // RTX 5080: 2 NVENC + 2 NVDEC sessions.
             // GpuGate semaphores are the sole concurrency control for GPU work —
@@ -272,14 +270,31 @@ public static class Program
                 "VMAF measurement for HDR requires tone-mapping via zscale. " +
                 "On Arch Linux: install 'zimg' and rebuild ffmpeg with --enable-libzimg.");
 
-        // Select VMAF model based on source resolution: 4K model for ≥3840×2160, standard otherwise.
-        string vmafModelPath = cfg.ResolveVmafModelPath(vstream.Width, vstream.Height);
-        if (!File.Exists(vmafModelPath))
-            throw new InvalidOperationException(
-                $"VMAF model not found: {vmafModelPath}. " +
-                $"On Arch Linux: sudo pacman -S vmaf (models install to /usr/share/model/).");
+        // Extract HDR mastering / Content-Light-Level metadata so the VMAF tonemap
+        // chain uses the correct nominal peak luminance (npl).  Only meaningful
+        // for HDR sources; SDR files skip the second ffprobe call entirely.
+        HdrMetadata? hdrMetadata = isHdr
+            ? await SourceClassifier.ExtractHdrMetadataAsync(cfg, input, ct)
+            : null;
+        if (isHdr)
+        {
+            int npl = (hdrMetadata ?? new HdrMetadata()).ResolveNpl();
+            string source = hdrMetadata?.MaxCll is { } ? "MaxCLL"
+                          : hdrMetadata?.MasteringDisplayMaxLuminance is { } ? "mastering display"
+                          : "HDR10 default (no metadata found)";
+            Console.WriteLine($"  HDR npl: {npl} nits (from {source})");
+        }
 
-        Console.WriteLine($"  VMAF model: {Path.GetFileName(vmafModelPath)} " +
+        // Pick the matched-bit-depth comparison format for the VMAF SDR branch.
+        // 8-bit sources compare at yuv420p; 10/12-bit at yuv420p10le.  Avoids
+        // biasing VMAF low when an 8-bit reference is zero-padded to 10 bits.
+        string sdrCompareFormat = vstream.GetVmafCompareFormat();
+
+        // Select VMAF model version based on source resolution: 4K model for
+        // ≥3840×2160, standard (1080p-tuned) otherwise.  These are libvmaf's
+        // built-in version names — no model file lookup needed.
+        string vmafModelVersion = cfg.ResolveVmafModelVersion(vstream.Width, vstream.Height);
+        Console.WriteLine($"  VMAF model: {vmafModelVersion} " +
             $"(source {vstream.Width}x{vstream.Height})");
 
         ContentDetectionResult? detection = null;
@@ -341,7 +356,8 @@ public static class Program
         }
 
         // VMAF tuning: two-phase pipeline with pre-extracted reference clips.
-        var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore, isHdr, vmafModelPath, ct);
+        var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore,
+            isHdr, hdrMetadata, sdrCompareFormat, vmafModelVersion, ct);
         timings.TuningPhase1 = tuning.Phase1Elapsed;
         timings.TuningPhase2 = tuning.Phase2Elapsed;
 
@@ -384,6 +400,7 @@ public static class Program
             FinalCq = finalCq,
             OutputVerification = verification,
             Timings = timings,
+            HdrMetadata = hdrMetadata,
         };
 
         await JsonIO.WriteAsync(Path.Combine(outDir, "log.json"), summary, ct);

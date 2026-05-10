@@ -37,6 +37,32 @@ public sealed class FfprobeStream
     }
 
     /// <summary>
+    /// Inspects <see cref="PixFmt"/> to derive the source's component bit depth.
+    /// 8 for yuv420p / yuv422p / yuv444p, 10 for *p10le / *p10be, 12 for *p12*,
+    /// and 8 as a safe fallback when pix_fmt is missing or unrecognised.
+    /// Used to pick a matched-bit-depth comparison format for VMAF so an 8-bit
+    /// reference isn't artificially zero-padded to 10 bits before comparison
+    /// against a genuine 10-bit encode.
+    /// </summary>
+    public int GetBitDepth()
+    {
+        if (string.IsNullOrEmpty(PixFmt)) return 8;
+        if (PixFmt.Contains("12", StringComparison.Ordinal)) return 12;
+        if (PixFmt.Contains("10", StringComparison.Ordinal)) return 10;
+        return 8;
+    }
+
+    /// <summary>
+    /// Returns the ffmpeg pix_fmt string to use as the matched comparison format
+    /// for the VMAF SDR branch.  10/12-bit sources compare at <c>yuv420p10le</c>
+    /// (libvmaf supports up to 10-bit; 12-bit gets dithered down).  8-bit sources
+    /// compare at <c>yuv420p</c> — a 10-bit comparison would zero-pad the
+    /// reference's LSBs and bias VMAF scores low.
+    /// </summary>
+    public string GetVmafCompareFormat() =>
+        GetBitDepth() >= 10 ? "yuv420p10le" : "yuv420p";
+
+    /// <summary>
     /// Maximum r_frame_rate / avg_frame_rate ratio we treat as CFR.  Above this,
     /// the stream is variable-frame-rate (VFR): r_frame_rate (LCD of timestamps)
     /// has inflated toward the highest rate seen while avg_frame_rate stays near

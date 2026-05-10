@@ -10,6 +10,13 @@ public sealed class VideoSummary
     public FfprobeRoot? Probe { get; set; }
     public bool IsHdr { get; set; }
 
+    /// <summary>
+    /// HDR side-data extracted from the source.  Used to set the VMAF tonemap
+    /// nominal peak luminance.  Null for SDR sources or when ffprobe couldn't
+    /// extract any HDR side-data.
+    /// </summary>
+    public HdrMetadata? HdrMetadata { get; set; }
+
     public ContentDetectionResult? ContentDetection { get; set; }
     public RestoreDecision? Restore { get; set; }
     public TuningResult? Tuning { get; set; }

@@ -22,7 +22,8 @@ public static class VmafTuner
 {
     public static async Task<TuningResult> TuneAsync(
         Config cfg, GpuGate gpu, CpuGate cpu, string input, string outDir,
-        RestoreDecision restore, bool isHdr, string vmafModelPath,
+        RestoreDecision restore, bool isHdr, HdrMetadata? hdrMetadata,
+        string sdrCompareFormat, string vmafModelVersion,
         CancellationToken ct)
     {
         var probe = await Ffprobe.RunAsync(cfg, input, ct);
@@ -117,7 +118,7 @@ public static class VmafTuner
                 // 2. VMAF — competes for CPU slot via CpuGate.  Held only for
                 //    the ffmpeg/libvmaf process; the JSON parse is unmetered.
                 using (await cpu.AcquireAsync(ct))
-                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, vmafLog, vmafModelPath, ct);
+                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, sdrCompareFormat, vmafLog, vmafModelVersion, ct);
 
                 var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
                 return new SampleMetric

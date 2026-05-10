@@ -55,7 +55,6 @@ dotnet run --project CompressMKV.CLI -- \
 
 - .NET 10 SDK
 - `ffmpeg` and `ffprobe` on `$PATH`, with `libvmaf`, `libzimg`, `idet`,
-  `fieldmatch`, `bwdif`, and `decimate` (any modern build)
+  `fieldmatch`, `bwdif`, and `decimate` (any modern build). VMAF models are
+  built into libvmaf — no separate model-file install required.
 - NVIDIA GPU with NVENC + NVDEC for production runs (tests do not require it)
-- VMAF models for production runs (Arch Linux: `pacman -S vmaf`, models land
-  in `/usr/share/model/`)

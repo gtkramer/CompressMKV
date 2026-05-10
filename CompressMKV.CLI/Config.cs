@@ -8,10 +8,11 @@ public sealed class Config
     public string Ffprobe { get; set; } = "ffprobe";
 
     // --- VMAF model selection ---
-    // On Arch Linux: install 'vmaf' package → models at /usr/share/model/
-    public string VmafModelDir { get; set; } = "/usr/share/model";
-    public string VmafStandardModelName { get; set; } = "vmaf_v0.6.1.json";
-    public string Vmaf4kModelName { get; set; } = "vmaf_4k_v0.6.1.json";
+    // libvmaf has the standard models compiled in; no file-on-disk required.
+    // The version names below are passed to libvmaf as `model=version=NAME`.
+    // ResolveVmafModelVersion picks between them by source resolution.
+    public string VmafStandardModelVersion { get; set; } = "vmaf_v0.6.1";
+    public string Vmaf4kModelVersion { get; set; } = "vmaf_4k_v0.6.1";
 
     public int NvencSlots { get; set; } = 2;
     public int NvdecSlots { get; set; } = 2;
@@ -112,13 +113,14 @@ public sealed class Config
     // --- Model resolution helper ---
 
     /// <summary>
-    /// Selects the appropriate VMAF model based on source resolution.
-    /// 4K model for ≥ 3840×2160; standard model for everything else.
+    /// Selects the appropriate libvmaf built-in model version based on source
+    /// resolution.  4K model for ≥ 3840×2160; standard (1080p-tuned) model for
+    /// everything else.  Returned string is the libvmaf version identifier
+    /// (e.g. "vmaf_v0.6.1") suitable for `model=version=NAME` in the filter.
     /// </summary>
-    public string ResolveVmafModelPath(int? width, int? height)
+    public string ResolveVmafModelVersion(int? width, int? height)
     {
         bool is4k = (width ?? 0) >= 3840 || (height ?? 0) >= 2160;
-        string modelName = is4k ? Vmaf4kModelName : VmafStandardModelName;
-        return Path.Combine(VmafModelDir, modelName);
+        return is4k ? Vmaf4kModelVersion : VmafStandardModelVersion;
     }
 }
