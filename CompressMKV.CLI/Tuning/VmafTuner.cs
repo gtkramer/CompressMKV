@@ -23,7 +23,7 @@ public static class VmafTuner
     public static async Task<TuningResult> TuneAsync(
         Config cfg, GpuGate gpu, CpuGate cpu, string input, string outDir,
         RestoreDecision restore, bool isHdr, HdrMetadata? hdrMetadata,
-        string sdrCompareFormat, string vmafModelVersion,
+        PipelineFormat format, string vmafModelVersion,
         CancellationToken ct)
     {
         var probe = await Ffprobe.RunAsync(cfg, input, ct);
@@ -113,12 +113,12 @@ public static class VmafTuner
 
                 // 1. GPU encode — competes for NVENC slot via GpuGate.
                 using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, ct))
-                    await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, ct);
+                    await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
 
                 // 2. VMAF — competes for CPU slot via CpuGate.  Held only for
                 //    the ffmpeg/libvmaf process; the JSON parse is unmetered.
                 using (await cpu.AcquireAsync(ct))
-                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, sdrCompareFormat, vmafLog, vmafModelVersion, ct);
+                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
 
                 var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
                 return new SampleMetric

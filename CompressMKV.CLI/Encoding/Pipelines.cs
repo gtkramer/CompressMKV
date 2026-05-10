@@ -54,7 +54,8 @@ public static class Pipelines
     //  Includes multipass, spatial/temporal AQ, CFR.
     // ----------------------------------------------------------------
     public static async Task EncodeSampleFromRefAsync(
-        Config cfg, string refInput, string output, int cq, CancellationToken ct)
+        Config cfg, string refInput, string output, int cq,
+        PipelineFormat format, CancellationToken ct)
     {
         if (File.Exists(output)) File.Delete(output);
 
@@ -73,7 +74,7 @@ public static class Pipelines
             "-spatial-aq", "1",
             "-temporal-aq", "1",
             "-rc-lookahead", cfg.RcLookahead.ToString(CultureInfo.InvariantCulture),
-            "-pix_fmt", "p010le",
+            "-pix_fmt", format.EncodePixFmt,
             "-fps_mode", "cfr",
             output
         };
@@ -92,7 +93,7 @@ public static class Pipelines
     // ----------------------------------------------------------------
     public static async Task RunVmafDirectAsync(
         Config cfg, string refInput, string encInput, bool isHdr,
-        HdrMetadata? hdrMetadata, string sdrCompareFormat,
+        HdrMetadata? hdrMetadata, PipelineFormat format,
         string vmafLog, string vmafModelVersion, CancellationToken ct)
     {
         if (File.Exists(vmafLog)) File.Delete(vmafLog);
@@ -133,13 +134,15 @@ public static class Pipelines
         else
         {
             // SDR: compare at the source's matched bit depth.  An 8-bit reference
-            // converted to yuv420p10le would have zero-padded LSBs while the
+            // converted to yuv420p10le would have zero-padded LSBs while a
             // 10-bit encode has genuine LSB content — the resulting LSB
-            // differences are sub-perceptual but contribute small bias to VMAF.
-            // sdrCompareFormat comes from FfprobeStream.GetVmafCompareFormat().
+            // differences are sub-perceptual but contribute a small bias to VMAF.
+            // format.VmafCompareFormat resolves to yuv420p for 8-bit sources,
+            // yuv420p10le for 10/12-bit sources (libvmaf caps at 10-bit).
+            string compareFmt = format.VmafCompareFormat;
             filter = string.Concat(
-                $"[0:v]format={sdrCompareFormat}[ref];",
-                $"[1:v]format={sdrCompareFormat}[enc];",
+                $"[0:v]format={compareFmt}[ref];",
+                $"[1:v]format={compareFmt}[enc];",
                 $"[enc][ref]libvmaf={vmafOpts}");
         }
 
@@ -169,7 +172,7 @@ public static class Pipelines
     // ----------------------------------------------------------------
     public static async Task EncodeFullNvencAsync(
         Config cfg, string input, string output, RestoreDecision restore,
-        int cq, CancellationToken ct)
+        int cq, PipelineFormat format, CancellationToken ct)
     {
         bool isIvtc = restore.Mode == RestoreMode.Ivtc;
         string loglevel = isIvtc ? "warning" : "error";
@@ -202,7 +205,7 @@ public static class Pipelines
             "-spatial-aq", "1",
             "-temporal-aq", "1",
             "-rc-lookahead", cfg.RcLookahead.ToString(CultureInfo.InvariantCulture),
-            "-pix_fmt", "p010le",
+            "-pix_fmt", format.EncodePixFmt,
             "-fps_mode:v", "cfr",
             "-c:a", "copy",
             "-c:s", "copy",

@@ -285,10 +285,13 @@ public static class Program
             Console.WriteLine($"  HDR npl: {npl} nits (from {source})");
         }
 
-        // Pick the matched-bit-depth comparison format for the VMAF SDR branch.
-        // 8-bit sources compare at yuv420p; 10/12-bit at yuv420p10le.  Avoids
-        // biasing VMAF low when an 8-bit reference is zero-padded to 10 bits.
-        string sdrCompareFormat = vstream.GetVmafCompareFormat();
+        // Derive the source's pipeline format once.  Flows through every ffmpeg
+        // call so encode pix_fmt, hwaccel output format, and VMAF compare format
+        // all stay at the source's native bit depth — 8-bit sources end up in
+        // 8-bit encodes (saving ~10-15% file size vs forcing p010le), 10-bit
+        // sources stay 10-bit end-to-end.
+        var pipelineFormat = PipelineFormat.FromStream(vstream);
+        Console.WriteLine($"  Pipeline: {pipelineFormat}");
 
         // Select VMAF model version based on source resolution: 4K model for
         // ≥3840×2160, standard (1080p-tuned) otherwise.  These are libvmaf's
@@ -357,7 +360,7 @@ public static class Program
 
         // VMAF tuning: two-phase pipeline with pre-extracted reference clips.
         var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore,
-            isHdr, hdrMetadata, sdrCompareFormat, vmafModelVersion, ct);
+            isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, ct);
         timings.TuningPhase1 = tuning.Phase1Elapsed;
         timings.TuningPhase2 = tuning.Phase2Elapsed;
 
@@ -369,7 +372,7 @@ public static class Program
         sw.Restart();
         using (await cpu.AcquireAsync(ct))
         {
-            await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, ct);
+            await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, pipelineFormat, ct);
         }
         timings.FinalEncode = sw.Elapsed;
 

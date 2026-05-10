@@ -117,7 +117,12 @@ public static partial class ContentDetector
         };
 
         if (cfg.UseHwaccelForDetection)
-            argList.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", "nv12"]);
+        {
+            // Match the source's bit depth on hwaccel download so 10-bit content
+            // doesn't get silently 8-bit'd on its way into idet.
+            var format = PipelineFormat.FromStream(vstream);
+            argList.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", format.HwaccelOutputFormat]);
+        }
 
         argList.AddRange([
             "-i", input,
