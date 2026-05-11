@@ -5,24 +5,21 @@ namespace MkvHelper;
 
 /// <summary>
 /// On-disk record of the current container build.  Lives at
-/// <see cref="ArtifactPaths.StateFile"/> and is read on every command
-/// startup to find the right image tag.
+/// <see cref="ArtifactPaths.StateFile"/> and is checked on every command
+/// startup to decide whether to rebuild (Containerfile changed) or reuse
+/// (image still present and up-to-date).
 /// </summary>
 public sealed class BuildState
 {
-    /// <summary>Upstream Netflix/vmaf tag the build was made from (e.g. "v3.1.0").</summary>
-    public string UpstreamTag { get; set; } = "";
-
-    /// <summary>Podman image tag (e.g. "localhost/mkvhelper:v3.1.0").</summary>
+    /// <summary>Podman image tag (always <see cref="ContainerBuilder.ImageTag"/>).</summary>
     public string ImageTag { get; set; } = "";
 
-    public DateTime BuiltUtc { get; set; }
+    /// <summary>SHA-256 of the embedded Containerfile content at build time.
+    /// Used by <see cref="ContainerBuilder.EnsureReadyAsync"/> to detect when
+    /// the source has changed and the cached image needs a rebuild.</summary>
+    public string ContainerfileSha256 { get; set; } = "";
 
-    /// <summary>
-    /// Records of any prior builds whose image may still be in podman
-    /// storage.  `dependency remove` walks this list when cleaning up.
-    /// </summary>
-    public List<HistoricBuild> History { get; set; } = new();
+    public DateTime BuiltUtc { get; set; }
 
     private static readonly JsonSerializerOptions s_jsonOpts = new()
     {
@@ -40,7 +37,7 @@ public sealed class BuildState
         }
         catch
         {
-            return null;  // corrupt state — treat as unbuilt
+            return null;  // corrupt or schema-incompatible — treat as unbuilt
         }
     }
 
@@ -56,11 +53,4 @@ public sealed class BuildState
         if (File.Exists(ArtifactPaths.StateFile))
             File.Delete(ArtifactPaths.StateFile);
     }
-}
-
-public sealed class HistoricBuild
-{
-    public string UpstreamTag { get; set; } = "";
-    public string ImageTag { get; set; } = "";
-    public DateTime BuiltUtc { get; set; }
 }

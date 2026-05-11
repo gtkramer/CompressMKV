@@ -5,14 +5,12 @@
 //   mkvhelper compress              — VMAF-guided AV1 NVENC encode for a folder of files
 //   mkvhelper split                 — slice a multi-episode MKV into one MKV per episode
 //   mkvhelper print-chapters        — pretty-print an MKV's chapter list
-//   mkvhelper dependency build      — build the bundled CUDA-enabled ffmpeg+VMAF container
-//   mkvhelper dependency update     — rebuild only if Netflix/vmaf has a newer release
-//   mkvhelper dependency remove     — remove all built artifacts (images, source clones, state)
+//   mkvhelper container build       — build the bundled dependency container from the embedded Containerfile
+//   mkvhelper container remove      — remove the built image, build log, and state file
 //
-// On first `compress` run, if no container build exists, mkvhelper will
-// build it automatically (Netflix/vmaf Dockerfile via podman) so VMAF can
-// run on the GPU via libvmaf_cuda.  Pass `--no-container` to fall back to
-// the system ffmpeg/ffprobe (VMAF will run on CPU — much slower).
+// On any subcommand that needs the container, mkvhelper auto-builds it on
+// first use (or when the embedded Containerfile has changed since the
+// last build).  Subsequent runs reuse the image.
 
 using Spectre.Console.Cli;
 
@@ -39,18 +37,15 @@ public static class Program
                 .WithDescription("Print an MKV's chapter list (timestamps, durations, main-content classification).")
                 .WithExample("print-chapters", "--input", "season.mkv");
 
-            c.AddBranch("dependency", dep =>
+            c.AddBranch("container", cont =>
             {
-                dep.SetDescription("Manage the bundled CUDA-enabled ffmpeg+VMAF container build.");
+                cont.SetDescription("Manage the bundled dependency container (CUDA-enabled FFmpeg + libvmaf_cuda + MKVToolNix).");
 
-                dep.AddCommand<DependencyBuildCommand>("build")
-                    .WithDescription("Build the container image from the Netflix/vmaf Dockerfile.");
+                cont.AddCommand<ContainerBuildCommand>("build")
+                    .WithDescription("Build the dependency container from the embedded Containerfile.");
 
-                dep.AddCommand<DependencyUpdateCommand>("update")
-                    .WithDescription("Rebuild only if Netflix/vmaf has tagged a newer release.");
-
-                dep.AddCommand<DependencyRemoveCommand>("remove")
-                    .WithDescription("Remove all built container images, source clones, and state.");
+                cont.AddCommand<ContainerRemoveCommand>("remove")
+                    .WithDescription("Remove the built image, build log, and state file.");
             });
         });
         return app.RunAsync(args);

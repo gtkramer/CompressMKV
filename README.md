@@ -32,7 +32,8 @@ All three subcommands run their external tools (`ffmpeg`, `ffprobe`,
 `mkvextract`, `mkvmerge`) inside a single bundled container — see
 [Bundled dependency container](#bundled-dependency-container) below.  The
 host doesn't need any of these installed separately; just `podman` and
-the NVIDIA Container Toolkit.
+the NVIDIA Container Toolkit.  The container is auto-built on first use
+(or when the embedded Containerfile changes) and reused thereafter.
 
 ## Repository layout
 
@@ -92,7 +93,7 @@ podman run --rm --device nvidia.com/gpu=all \
 # 4. (Optional) Pre-warm the bundled container.  Takes 10–20 minutes
 #    the first time.  If you skip this, the first `mkvhelper` run that
 #    needs the container will build it automatically.
-mkvhelper dependency build
+mkvhelper container build
 ```
 
 ### Container storage driver
@@ -108,7 +109,7 @@ packages to be present:
 | **ext4 / xfs**              | `fuse-overlayfs`     | fuse-overlayfs        |
 | **anything else**           | `fuse-overlayfs`     | fuse-overlayfs        |
 
-If `dependency build` exits with `Error: configure storage: kernel does
+If `container build` exits with `Error: configure storage: kernel does
 not support overlay fs: 'overlay' is not supported over extfs`, that's
 the autodetect failing because `fuse-overlayfs` isn't installed and the
 kernel won't let it use overlay-over-ext4 in a user namespace.  Install
@@ -130,14 +131,18 @@ mkvhelper split --input season.mkv --series-name "My Show" --season-num 1
 # Inspect chapters before splitting
 mkvhelper print-chapters --input season.mkv --episode-chapter-threshold 600
 
-# Dependency management (the bundled container)
-mkvhelper dependency build       # build the container from the embedded Containerfile
-mkvhelper dependency update      # rebuild only if Netflix tagged a newer VMAF release
-mkvhelper dependency remove      # delete every built image and the state file
+# Container management (the bundled dependency container)
+mkvhelper container build              # build the container from the embedded Containerfile
+mkvhelper container build --no-cache   # full rebuild, ignoring podman's layer cache
+mkvhelper container remove             # remove the built image, build log, and state file
 ```
 
 On the first invocation that needs the container, the build is kicked off
-automatically (~10–20 minutes; image is reused on subsequent runs).
+automatically (~10–20 minutes; image is reused on subsequent runs).  If
+you edit the embedded [Containerfile](MkvHelper.Cli/Dependencies/Containerfile)
+and rebuild mkvhelper, the next subcommand that needs the container will
+notice the SHA-256 mismatch in `state.json` and auto-rebuild — you don't
+have to remember to invoke `container build` manually.
 
 ## Subcommand details
 
@@ -178,10 +183,11 @@ that builds one image bundling every external tool the app shells out to:
 | **FFmpeg** (pinned to a stable release tag) | NVENC, NVDEC, CUDA, libnpp; software AV1 via libdav1d (decode) + libaom + libsvtav1 (encode); x264, x265, libvpx; libopus, libvorbis, libmp3lame, libtheora; libass, libwebp, **libzimg** (zscale, for HDR tonemap). |
 | **MKVToolNix** | `mkvextract`, `mkvmerge` for the chapter subcommands — installed from Ubuntu's `mkvtoolnix` apt package inside the container. |
 
-Versions are pinned via build args inside the Containerfile (VMAF_TAG,
-FFMPEG_TAG, NV_CODEC_TAG).  Bumping is a one-line edit + `mkvhelper
-dependency build`.  `dependency update` queries Netflix/vmaf for the
-latest release and rebuilds with that tag automatically.
+Versions are pinned via build args inside the Containerfile (`VMAF_TAG`,
+`FFMPEG_TAG`, `NV_CODEC_TAG`).  Bumping is a one-line edit; the next
+subcommand that needs the container will notice the SHA-256 change and
+auto-rebuild.  Or run `mkvhelper container build` explicitly to force
+the rebuild ahead of time.
 
 The Containerfile is embedded in the binary as a managed resource
 ([EmbeddedResource entry in the csproj](MkvHelper.Cli/MkvHelper.Cli.csproj))
@@ -218,14 +224,16 @@ in-flight files).  SDR is always GPU.
 
 ```
 ~/.local/share/mkvhelper/      (XDG_DATA_HOME)
-├── state.json                 # Built VMAF tag, image tag, build timestamp
-└── build-logs/<tag>.log       # Captured stdout+stderr from podman build
+├── state.json                 # Image tag, Containerfile SHA-256, build timestamp
+└── build.log                  # Captured stdout+stderr from the most recent podman build
 ```
 
 The container image itself lives in Podman's storage
-(`~/.local/share/containers/`) and is referenced by tag — `dependency
-remove` cleans both.  Untagged intermediate layers from prior builds
-(~10 GB worth) can be reclaimed afterward with `podman image prune -f`.
+(`~/.local/share/containers/`) under the fixed tag
+`localhost/mkvhelper:current`; rebuilding replaces it in place.
+`container remove` cleans the image + state file but does NOT prune
+orphaned intermediate layers (~10 GB worth) — use `podman image prune -f`
+for that.
 
 ## Dependencies
 

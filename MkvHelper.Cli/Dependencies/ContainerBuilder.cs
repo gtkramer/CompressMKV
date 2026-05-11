@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using Spectre.Console;
 
 namespace MkvHelper;
@@ -10,15 +12,23 @@ namespace MkvHelper;
 /// the full codec set, MKVToolNix); building it produces one image that
 /// every other subcommand routes through via <see cref="ContainerTools"/>.
 ///
-/// The build context is empty — the Containerfile clones VMAF and FFmpeg
-/// from inside RUN steps — so we don't need a source tree on disk.
+/// Build context is empty — the Containerfile clones VMAF and FFmpeg from
+/// inside RUN steps — so we don't need a source tree on disk.  The image
+/// always uses the fixed tag <see cref="ImageTag"/>; rebuilding replaces
+/// the previous image (the old layers become orphaned and can be reclaimed
+/// with <c>podman image prune</c>).
 /// </summary>
 public static class ContainerBuilder
 {
+    /// <summary>Fixed image tag.  Same name across builds — each build replaces
+    /// the previous image, mirroring the "Containerfile is source of truth"
+    /// model.</summary>
+    public const string ImageTag = "localhost/mkvhelper:current";
+
     private const string ContainerfileResource = "MkvHelper.Dependencies.Containerfile";
 
     public static async Task<BuildState> BuildAsync(
-        string? tag, Action<string> onProgress, CancellationToken ct)
+        bool noCache, Action<string> onProgress, CancellationToken ct)
     {
         ArtifactPaths.EnsureDirectories();
 
@@ -30,45 +40,27 @@ public static class ContainerBuilder
                 "`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` " +
                 "before using the container, or container GPU access will fail.");
 
-        // Resolve VMAF tag — used both as a build arg (so the container
-        // builds VMAF at that tag) and as the image's own tag (so multiple
-        // VMAF versions can coexist in podman storage).
-        string resolvedTag;
-        if (string.IsNullOrWhiteSpace(tag))
-        {
-            onProgress("Querying Netflix/vmaf for the latest release tag...");
-            var latest = await ReleaseFetcher.GetLatestAsync(ct);
-            resolvedTag = latest.Tag;
-            onProgress($"Latest release: {latest.Tag} ({latest.Name}), published {latest.PublishedUtc:yyyy-MM-dd}.");
-        }
-        else
-        {
-            resolvedTag = tag;
-        }
-
-        string imageTag = ArtifactPaths.ImageTagFor(resolvedTag);
-        string buildLog = ArtifactPaths.BuildLogFor(resolvedTag);
-
-        // Materialise the embedded Containerfile to a temp path; podman
-        // reads it via -f.  Build context is the empty parent dir.
+        // Materialise the embedded Containerfile to a fresh temp dir so
+        // the build context is guaranteed empty — no stale files leak in
+        // from a prior run.
+        string containerfileContent = LoadContainerfile();
         string contextDir = Directory.CreateTempSubdirectory("mkvhelper-build-").FullName;
         string containerfilePath = Path.Combine(contextDir, "Containerfile");
-        await File.WriteAllTextAsync(containerfilePath, LoadContainerfile(), ct);
+        await File.WriteAllTextAsync(containerfilePath, containerfileContent, ct);
 
         try
         {
-            onProgress($"Building container image {imageTag} from embedded Containerfile (this can take 10–20 min on first run)...");
+            string cacheNote = noCache ? " (--no-cache: ignoring layer cache)" : "";
+            onProgress($"Building {ImageTag} from embedded Containerfile{cacheNote}.  This can take 10–20 min on the first build.");
+
             await Podman.BuildAsync(
                 contextDir: contextDir,
-                dockerfile: containerfilePath,
-                imageTag: imageTag,
-                buildLogPath: buildLog,
+                containerfile: containerfilePath,
+                imageTag: ImageTag,
+                buildLogPath: ArtifactPaths.BuildLog,
                 onLine: onProgress,
                 ct: ct,
-                buildArgs: new Dictionary<string, string>
-                {
-                    ["VMAF_TAG"] = resolvedTag,
-                });
+                noCache: noCache);
         }
         finally
         {
@@ -76,37 +68,26 @@ public static class ContainerBuilder
             catch { /* best-effort cleanup */ }
         }
 
-        onProgress($"Build succeeded.  Image: {imageTag}");
+        onProgress($"Build succeeded.  Image: {ImageTag}");
 
-        var prior = await BuildState.LoadAsync(ct);
-        var newState = new BuildState
+        var state = new BuildState
         {
-            UpstreamTag = resolvedTag,
-            ImageTag = imageTag,
+            ImageTag = ImageTag,
+            ContainerfileSha256 = Sha256(containerfileContent),
             BuiltUtc = DateTime.UtcNow,
-            History = prior?.History ?? new List<HistoricBuild>(),
         };
-        if (prior is not null && !string.IsNullOrEmpty(prior.ImageTag) && prior.ImageTag != imageTag)
-        {
-            newState.History.Add(new HistoricBuild
-            {
-                UpstreamTag = prior.UpstreamTag,
-                ImageTag = prior.ImageTag,
-                BuiltUtc = prior.BuiltUtc,
-            });
-        }
-        await newState.SaveAsync(ct);
-
-        return newState;
+        await state.SaveAsync(ct);
+        return state;
     }
 
     /// <summary>
     /// Shared startup hook for any command that needs to invoke tools
-    /// from the container.  Resolves the build (auto-building on first
-    /// use), configures <see cref="ContainerTools"/> with the requested
-    /// host-directory mounts, and returns the resolved <see cref="BuildState"/>
-    /// so the caller can log it.  Throws if podman isn't available or
-    /// the auto-build fails.
+    /// from the container.  Runs the build automatically on first use,
+    /// or when the embedded Containerfile has changed since the last
+    /// build (sha256 mismatch), or when the cached image is gone from
+    /// podman storage.  Configures <see cref="ContainerTools"/> with the
+    /// given host-directory mounts and returns the resolved
+    /// <see cref="BuildState"/>.
     /// </summary>
     public static async Task<BuildState> EnsureReadyAsync(
         IEnumerable<string> mounts, CancellationToken ct)
@@ -117,40 +98,40 @@ public static class ContainerBuilder
                 "Container Toolkit; see the README's first-run setup section.");
 
         var state = await BuildState.LoadAsync(ct);
+        string currentHash = Sha256(LoadContainerfile());
 
-        // If state references an image that's gone (e.g. the user pruned
-        // podman storage), force a rebuild.
-        if (state is not null && !await Podman.ImageExistsAsync(state.ImageTag, ct))
-        {
-            AnsiConsole.MarkupLine(
-                $"[yellow]Warning:[/] state references image " +
-                $"[bold]{Markup.Escape(state.ImageTag)}[/] " +
-                "but it's gone from podman storage.  Rebuilding...");
-            state = null;
-        }
-
+        // Decide whether to rebuild.  Three triggers, all surfaced to the
+        // user before a long auto-build kicks off so they understand what's
+        // about to happen.
+        string? rebuildReason = null;
         if (state is null)
-            state = await AutoBuildWithExplanationAsync(ct);
+            rebuildReason = "no prior build was found";
+        else if (!await Podman.ImageExistsAsync(state.ImageTag, ct))
+            rebuildReason = $"image {state.ImageTag} is missing from podman storage";
+        else if (!string.IsNullOrEmpty(state.ContainerfileSha256)
+                 && state.ContainerfileSha256 != currentHash)
+            rebuildReason = "the embedded Containerfile has changed since the last build";
 
-        ContainerTools.Configure(state.ImageTag, mounts);
+        if (rebuildReason is not null)
+            state = await AutoBuildAsync(rebuildReason, ct);
+
+        ContainerTools.Configure(state!.ImageTag, mounts);
         return state;
     }
 
     /// <summary>
-    /// First-run / orphaned-state recovery: print a one-paragraph
+    /// First-run / stale-image recovery: print a one-paragraph
     /// explanation of what's about to happen, then run the build with a
-    /// live spinner showing the latest podman line.  Used by
-    /// <see cref="EnsureReadyAsync"/>.
+    /// live spinner showing the latest podman line.
     /// </summary>
-    private static async Task<BuildState> AutoBuildWithExplanationAsync(CancellationToken ct)
+    private static async Task<BuildState> AutoBuildAsync(string reason, CancellationToken ct)
     {
-        AnsiConsole.MarkupLine("[bold]First-run dependency build[/]");
+        AnsiConsole.MarkupLine($"[bold]Auto-building mkvhelper container[/] — {Markup.Escape(reason)}.");
         AnsiConsole.MarkupLine(
-            "[grey]No mkvhelper container was found.  mkvhelper bundles every " +
-            "external tool it needs (CUDA-enabled FFmpeg, libvmaf_cuda, " +
-            "MKVToolNix) into a single podman image so the host doesn't have " +
-            "to install them separately.  First-time build typically takes " +
-            "10–20 minutes; subsequent runs reuse the image.[/]");
+            "[grey]The container bundles every external tool mkvhelper shells out to " +
+            "(CUDA-enabled FFmpeg, libvmaf_cuda, MKVToolNix) so the host doesn't have " +
+            "to install them separately.  First-time build typically takes 10–20 minutes; " +
+            "subsequent runs reuse the image until the Containerfile changes.[/]");
 
         BuildState? result = null;
         await AnsiConsole.Status()
@@ -159,10 +140,9 @@ public static class ContainerBuilder
             .StartAsync("Preparing build...", async ctx =>
             {
                 result = await BuildAsync(
-                    tag: null,
+                    noCache: false,
                     onProgress: line =>
                     {
-                        // Truncate so the spinner line stays readable.
                         string trimmed = line.Length > 100 ? line[..97] + "..." : line;
                         ctx.Status(Markup.Escape(trimmed));
                     },
@@ -172,32 +152,23 @@ public static class ContainerBuilder
     }
 
     /// <summary>
-    /// Removes everything ever produced by `dependency build`: every
-    /// container image we ever tagged, build logs, and the state file.
+    /// Removes the built container image, the build log, and the state
+    /// file.  Untagged intermediate layers from the build (~10 GB worth)
+    /// are NOT removed automatically — point the user at
+    /// <c>podman image prune -f</c> for that.
     /// </summary>
     public static async Task RemoveAllAsync(Action<string> onProgress, CancellationToken ct)
     {
-        var state = await BuildState.LoadAsync(ct);
-        if (state is null)
-        {
-            onProgress("No build state found — nothing to remove.");
-            return;
-        }
-
-        var images = new List<string>();
-        if (!string.IsNullOrEmpty(state.ImageTag)) images.Add(state.ImageTag);
-        foreach (var h in state.History)
-            if (!string.IsNullOrEmpty(h.ImageTag)) images.Add(h.ImageTag);
-
         if (await Podman.IsAvailableAsync(ct))
         {
-            foreach (var img in images.Distinct())
+            if (await Podman.ImageExistsAsync(ImageTag, ct))
             {
-                if (await Podman.ImageExistsAsync(img, ct))
-                {
-                    onProgress($"Removing podman image {img}...");
-                    await Podman.RemoveImageAsync(img, ct);
-                }
+                onProgress($"Removing podman image {ImageTag}...");
+                await Podman.RemoveImageAsync(ImageTag, ct);
+            }
+            else
+            {
+                onProgress($"Image {ImageTag} not present in podman storage — nothing to remove there.");
             }
         }
         else
@@ -205,22 +176,22 @@ public static class ContainerBuilder
             onProgress("podman not on PATH — skipping image removal (state file will still be cleared).");
         }
 
-        if (Directory.Exists(ArtifactPaths.BuildLogsDir))
+        if (File.Exists(ArtifactPaths.BuildLog))
         {
-            onProgress($"Removing build logs {ArtifactPaths.BuildLogsDir}...");
-            Directory.Delete(ArtifactPaths.BuildLogsDir, recursive: true);
+            File.Delete(ArtifactPaths.BuildLog);
+            onProgress($"Removed build log {ArtifactPaths.BuildLog}.");
         }
 
         BuildState.Delete();
         onProgress(
-            "All mkvhelper build artifacts removed.  Untagged intermediate " +
-            "layers from the build (~10 GB) can be reclaimed with " +
-            "`podman image prune -f`.");
+            "All mkvhelper container artifacts removed.  Untagged intermediate " +
+            "layers (~10 GB) can be reclaimed with `podman image prune -f`.");
     }
 
     /// <summary>
     /// Read the Containerfile out of the assembly's embedded resources.
-    /// Throws if missing — that's a build-system bug, not a runtime concern.
+    /// Throws if missing — that's a build-system bug, not a runtime
+    /// concern.
     /// </summary>
     private static string LoadContainerfile()
     {
@@ -231,5 +202,11 @@ public static class ContainerBuilder
                 "Check the <EmbeddedResource> entry in MkvHelper.Cli.csproj.");
         using var reader = new StreamReader(stream);
         return reader.ReadToEnd();
+    }
+
+    private static string Sha256(string content)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(content));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 }

@@ -40,40 +40,26 @@ public static class Podman
     }
 
     /// <summary>
-    /// Add an alias tag to an existing image.  Used to satisfy the
-    /// hard-coded `FROM vmaf` in Netflix's Dockerfile.ffmpeg without
-    /// permanently squatting on the global `vmaf` tag.
-    /// </summary>
-    public static async Task TagAsync(string source, string alias, CancellationToken ct)
-    {
-        var (code, _, err) = await Proc.RunAsync(Exe, new[] { "tag", source, alias }, ct);
-        if (code != 0)
-            throw new InvalidOperationException($"podman tag {source} {alias} failed: {err.Trim()}");
-    }
-
-    /// <summary>
-    /// Remove an alias tag from an image.  Best-effort — if the tag is
-    /// already gone (e.g. the image was deleted), don't throw.
-    /// </summary>
-    public static async Task UntagAsync(string imageTag, CancellationToken ct)
-    {
-        await Proc.RunAsync(Exe, new[] { "untag", imageTag }, ct);
-    }
-
-    /// <summary>
-    /// Build an image from a Dockerfile in <paramref name="contextDir"/>.
-    /// Streams build output to <paramref name="onLine"/> so callers can show
-    /// progress.  Build logs are simultaneously appended to a file.
-    /// Optional build args are passed through as <c>--build-arg KEY=VALUE</c>.
+    /// Build an image from a Containerfile in <paramref name="contextDir"/>.
+    /// Streams build output to <paramref name="onLine"/> so callers can
+    /// show progress.  Build output is simultaneously written to
+    /// <paramref name="buildLogPath"/>.  Optional build args are passed
+    /// through as <c>--build-arg KEY=VALUE</c>.  When <paramref name="noCache"/>
+    /// is true, podman ignores its layer cache and re-runs every step
+    /// from scratch — useful when apt repositories have new versions of
+    /// pinned-by-name packages.
     /// </summary>
     public static async Task BuildAsync(
-        string contextDir, string dockerfile, string imageTag,
+        string contextDir, string containerfile, string imageTag,
         string buildLogPath, Action<string> onLine, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? buildArgs = null)
+        IReadOnlyDictionary<string, string>? buildArgs = null,
+        bool noCache = false)
     {
         await using var logFile = new StreamWriter(buildLogPath, append: false);
 
-        var args = new List<string> { "build", "-f", dockerfile, "-t", imageTag };
+        var args = new List<string> { "build", "-f", containerfile, "-t", imageTag };
+        if (noCache)
+            args.Add("--no-cache");
         if (buildArgs is not null)
         {
             foreach (var (k, v) in buildArgs)

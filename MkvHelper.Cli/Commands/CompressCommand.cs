@@ -67,7 +67,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         }
         AnsiConsole.MarkupLine(
             $"[grey]Using container[/] [bold]{Markup.Escape(state.ImageTag)}[/] " +
-            $"[grey](Netflix/vmaf {Markup.Escape(state.UpstreamTag)}, built {state.BuiltUtc:yyyy-MM-dd}).[/]");
+            $"[grey](built {state.BuiltUtc:yyyy-MM-dd HH:mm}Z).[/]");
 
         var discovered = await VideoFileDiscovery.DiscoverAsync(cfg, cfg.InputFolder, cts.Token);
 
