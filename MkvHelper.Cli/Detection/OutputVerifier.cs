@@ -31,9 +31,7 @@ namespace MkvHelper;
 //
 // The verification is full-file (not sample-based) because the user wants
 // definitive coverage on the actual deliverable.  Cost is bounded: a
-// multi-core CPU sw-decodes 1080p AV1 at multiples of realtime, and on
-// 4K HDR you can flip Config.UseHwaccelForDetection to route through
-// NVDEC if the throughput advantage outweighs the GPU-resource cost.
+// multi-core CPU sw-decodes 1080p AV1 at multiples of realtime.
 // =========================================================================
 public static class OutputVerifier
 {

@@ -251,13 +251,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         NvencPreset = "p7",
         RcLookahead = 48,
-        UseNvdecForEncode = true,
-
-        // Sw-decode for detection + verification: NVDEC's per-frame
-        // GPU→CPU download negates its decode-rate advantage when the
-        // downstream filter (idet) is CPU-only, and frees both NVDEC
-        // engines for the final encode pipeline.  See Config docs.
-        UseHwaccelForDetection = false,
 
         PreviewMaxConfidenceToGenerate = 0.60,
         PreviewCount = 3,
@@ -307,7 +300,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         var sw = Stopwatch.StartNew();
         ContentDetectionResult detection;
-        using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, cuda: 0, ct))
         using (await cpu.AcquireAsync(ct))
         {
             detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct, logger);
@@ -392,7 +384,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         sw.Restart();
         OutputVerificationResult verification;
-        using (await gpu.AcquireAsync(nvenc: 0, nvdec: cfg.UseHwaccelForDetection ? 1 : 0, cuda: 0, ct))
         using (await cpu.AcquireAsync(ct))
         {
             verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, ct, logger);

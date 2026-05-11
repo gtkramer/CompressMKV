@@ -112,26 +112,20 @@ public static partial class ContentDetector
         // CheckAggregateAgreement depends on this.  -nostats suppresses the
         // periodic decoder progress chatter that would otherwise fill stderr
         // at info level.
+        // Detection sw-decodes intentionally.  idet is a CPU-only filter and
+        // every frame has to land in system memory anyway, so NVDEC would
+        // cost a per-frame GPU→CPU download with nothing to amortise it
+        // against — and it would tie up the dedicated NVDEC engines that
+        // the final encode pipeline actually benefits from.
         var argList = new List<string>
         {
             "-hide_banner", "-loglevel", "info", "-nostats",
             "-threads", cfg.FfmpegCpuThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        };
-
-        if (cfg.UseHwaccelForDetection)
-        {
-            // Match the source's bit depth on hwaccel download so 10-bit content
-            // doesn't get silently 8-bit'd on its way into idet.
-            var format = PipelineFormat.FromStream(vstream);
-            argList.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", format.HwaccelOutputFormat]);
-        }
-
-        argList.AddRange([
             "-i", input,
             "-an", "-sn", "-dn",
             "-vf", "idet,metadata=mode=print:file=-:direct=1",
             "-f", "null", "-"
-        ]);
+        };
 
         // ---- Per-frame accumulation ----
         var frames = new List<FrameFlag>();

@@ -163,31 +163,6 @@ public sealed class Config
     public string NvencPreset { get; set; } = "p7";
     public int RcLookahead { get; set; } = 48;
 
-    public bool UseNvdecForEncode { get; set; } = true;
-
-    // --- Content detection (single-pass full-file idet) ---
-
-    /// <summary>
-    /// Use NVDEC for the detection pass (and the post-encode verification
-    /// pass that reuses the same code path).
-    ///
-    /// Default <c>false</c>.  The detection workload is "decode every frame,
-    /// hand it to a CPU-only filter (idet), throw it away" — no encode and
-    /// no GPU-side filtering.  Pixels have to land in system memory either
-    /// way, so the NVDEC path costs us a per-frame GPU→CPU download on top
-    /// of the decode itself.  On a multi-core CPU that can sw-decode a
-    /// 1080p stream at multiples of realtime, sw decode is competitive or
-    /// faster — and it leaves the dedicated NVDEC engines free for the
-    /// final encode pipeline (which is the only place we benefit from
-    /// hardware decode).
-    ///
-    /// Flip to <c>true</c> if you're routinely processing 4K HDR sources
-    /// where NVDEC's raw throughput advantage starts to outpace the
-    /// download cost — but expect to feel the contention if multiple files
-    /// are in flight at once (NVDEC has only 2 engines on RTX 5080).
-    /// </summary>
-    public bool UseHwaccelForDetection { get; set; } = false;
-
     // Detection thresholds are internal constants in ContentDetector.
     // They are derived from 3:2 pulldown signal physics and are not user-tunable.
 

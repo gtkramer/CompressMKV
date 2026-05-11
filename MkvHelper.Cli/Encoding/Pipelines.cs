@@ -204,19 +204,14 @@ public static class Pipelines
         //     matched bit depth.  The CPU filter operates in system memory,
         //     and NVENC re-uploads at the requested -pix_fmt.
 
+        string hwOutFormat = hasCpuFilter ? format.HwaccelOutputFormat : "cuda";
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", loglevel,
             "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
+            "-hwaccel", "cuda", "-hwaccel_output_format", hwOutFormat,
+            "-i", input,
         };
-
-        if (cfg.UseNvdecForEncode)
-        {
-            string hwOutFormat = hasCpuFilter ? format.HwaccelOutputFormat : "cuda";
-            args.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", hwOutFormat]);
-        }
-
-        args.AddRange(["-i", input]);
 
         if (hasCpuFilter)
             args.AddRange(["-vf", restore.FilterGraph]);
@@ -237,12 +232,11 @@ public static class Pipelines
             "-rc-lookahead", cfg.RcLookahead.ToString(CultureInfo.InvariantCulture),
         ]);
 
-        // Only set -pix_fmt when frames will be in CPU memory (CPU filter case
-        // or no NVDEC).  In the pure-GPU pipeline NVENC selects the matched
-        // bit depth from the cuda hwframes; setting -pix_fmt would force a
+        // -pix_fmt is only valid when frames are already in CPU memory (CPU
+        // filter case).  In the pure-GPU path NVENC reads matched bit depth
+        // straight from the cuda hwframes; setting -pix_fmt would force a
         // cuda→sw conversion that the auto-scaler can't perform.
-        bool framesOnGpu = cfg.UseNvdecForEncode && !hasCpuFilter;
-        if (!framesOnGpu)
+        if (hasCpuFilter)
             args.AddRange(["-pix_fmt", format.EncodePixFmt]);
 
         args.AddRange([

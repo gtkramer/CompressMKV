@@ -112,15 +112,11 @@ public static class TestVideoFixture
         catch { /* best-effort cleanup */ }
     }
 
-    /// <summary>Builds a Config with hwaccel disabled (CI environments don't
-    /// have NVDEC).  Production thresholds — tests must produce clips that
-    /// satisfy them.  ffmpeg/ffprobe routing comes from
-    /// <see cref="ContainerTools"/>, configured in test-bypass mode by
-    /// <see cref="BuildClips"/>.</summary>
-    public static Config CreateTestConfig() => new()
-    {
-        UseHwaccelForDetection = false,
-    };
+    /// <summary>Builds a default Config for tests.  Production thresholds —
+    /// tests must produce clips that satisfy them.  ffmpeg/ffprobe routing
+    /// comes from <see cref="ContainerTools"/>, configured in test-bypass
+    /// mode by <see cref="BuildClips"/>.</summary>
+    public static Config CreateTestConfig() => new();
 
     private static async Task Run(string exe, params string[] args)
     {
