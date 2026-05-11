@@ -44,7 +44,7 @@ public static class Pipelines
             output
         ]);
 
-        var (code, _, err) = await Proc.RunAsync(cfg.Ffmpeg, args.ToArray(), ct);
+        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"reference clip extraction failed: {err}");
     }
 
@@ -79,72 +79,96 @@ public static class Pipelines
             output
         };
 
-        var (code, _, err) = await Proc.RunAsync(cfg.Ffmpeg, args.ToArray(), ct);
+        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"sample encode failed: {err}");
     }
 
     // ----------------------------------------------------------------
     //  VMAF: compare reference clip vs encoded clip directly.
     //  Both are already progressive with matching cadence/framecount.
-    //  No trim, no restore — just format conversion + libvmaf.
-    //  SDR: compare at yuv420p10le to preserve 10-bit encode precision.
-    //  HDR: tonemap both to SDR via zscale+hable before VMAF.
-    //  CPU-only — does not consume GPU resources.
+    //
+    //  Two filter paths:
+    //
+    //  - GPU (useCudaVmaf=true): libvmaf_cuda.  Frames are decoded in
+    //    software (FFV1 and AV1 both have no fast NVDEC path for this size
+    //    of clip — the encoded sample COULD use NVDEC but it'd cost an
+    //    NVDEC slot for ~12 s of decode), then uploaded with
+    //    hwupload_cuda.  The VMAF computation itself runs on CUDA cores
+    //    via libvmaf_cuda — ~10× the throughput of CPU libvmaf on a
+    //    consumer GPU per NVIDIA's published benchmarks.  Caller gates
+    //    on GpuGate.Cuda, not CpuGate, so this runs concurrently with
+    //    other CPU-heavy ffmpeg ops on other files.
+    //
+    //  - CPU (useCudaVmaf=false): the original libvmaf path.  Used when
+    //    we're running against the system ffmpeg without a CUDA-enabled
+    //    libvmaf build (i.e. the dependency container hasn't been built).
+    //
+    //  HDR path always uses CPU libvmaf for now — the zscale+tonemap
+    //  filters are CPU-bound and the tonemap_cuda alternative would
+    //  require a more invasive filter-graph rewrite.  HDR sources are
+    //  rare enough that this is acceptable; revisit if needed.
+    //
+    //  SDR: compare at matching bit depth (yuv420p for 8-bit sources,
+    //  yuv420p10le for 10-bit) so an 8-bit reference's zero-padded LSBs
+    //  don't bias the VMAF score against a 10-bit encode's real LSB
+    //  content.  libvmaf caps at 10-bit input.
     // ----------------------------------------------------------------
     public static async Task RunVmafDirectAsync(
         Config cfg, string refInput, string encInput, bool isHdr,
         HdrMetadata? hdrMetadata, PipelineFormat format,
-        string vmafLog, string vmafModelVersion, CancellationToken ct)
+        string vmafLog, string vmafModelVersion, bool useCudaVmaf,
+        CancellationToken ct)
     {
         if (File.Exists(vmafLog)) File.Delete(vmafLog);
 
+        // Escape `:` and `\` inside filter-arg values (path goes into
+        // libvmaf=log_path=...).  Filter argument syntax treats `:` as a
+        // separator and `\` as an escape; both need to be doubled.
         string esc(string p) => p.Replace(@"\", @"\\").Replace(":", @"\:");
 
-        // Use libvmaf's built-in model versions instead of file paths.  Model
-        // names like "vmaf_v0.6.1" and "vmaf_4k_v0.6.1" are compiled into
-        // libvmaf, so no /usr/share/model/ dependency is needed and the
-        // filter graph stays portable across distros.
-        // libvmaf threads: capped via Config so total CPU stays in-budget when
-        // multiple VMAF runs are in flight (gated by CpuGate at the caller).
+        // Filter name is whatever the caller's resolved decision implies.
+        // HDR is independent of CPU/GPU choice — caller already decided.
+        string filterName = useCudaVmaf ? "libvmaf_cuda" : "libvmaf";
         string vmafOpts =
             $"log_fmt=json:log_path={esc(vmafLog)}:" +
             $"model=version={vmafModelVersion}:" +
             $"n_threads={cfg.LibvmafThreads.ToString(CultureInfo.InvariantCulture)}:" +
             $"n_subsample={cfg.LibvmafSubsample.ToString(CultureInfo.InvariantCulture)}";
 
-        string filter;
+        // For HDR, both ref and encode get a tonemap chain before VMAF.
+        // npl ("nominal peak luminance") tells the tonemapper what brightness
+        // counts as the input peak — get it wrong and highlights are crushed
+        // identically in both streams, but their differences in those crushed
+        // regions become invisible to VMAF.  Resolved from HDR side-data
+        // (MaxCLL → mastering display max → 1000 nits HDR10 default).
+        // zscale is CPU-only, so the tonemap work runs on CPU even when the
+        // VMAF computation moves to GPU — the GPU benefit on HDR is just the
+        // libvmaf_cuda kernel itself.
+        string hdrTonemap(string srcLabel, int npl) =>
+            $"[{srcLabel}]zscale=t=linear:npl={npl.ToString(CultureInfo.InvariantCulture)}," +
+            "tonemap=tonemap=hable,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+
+        string compareFmt = format.VmafCompareFormat;
+        string upload = useCudaVmaf ? ",hwupload_cuda" : "";
+        string refLabel = useCudaVmaf ? "ref_cuda" : "ref";
+        string encLabel = useCudaVmaf ? "enc_cuda" : "enc";
+
+        string refChain, encChain;
         if (isHdr)
         {
-            // Tonemap both ref and encode to SDR before VMAF.  npl ("nominal peak
-            // luminance") tells the tonemapper what brightness counts as the input
-            // peak — get it wrong and highlights are crushed identically in both
-            // streams, but their differences in those crushed regions become
-            // invisible to VMAF.  Resolve from HDR side-data (MaxCLL → mastering
-            // display max → 1000 nits HDR10 default).
             int npl = (hdrMetadata ?? new HdrMetadata()).ResolveNpl();
-            string nplStr = npl.ToString(CultureInfo.InvariantCulture);
-
-            filter = string.Concat(
-                $"[0:v]zscale=t=linear:npl={nplStr},tonemap=tonemap=hable,",
-                "zscale=t=bt709:m=bt709:r=tv,format=yuv420p[ref_sdr];",
-                $"[1:v]zscale=t=linear:npl={nplStr},tonemap=tonemap=hable,",
-                "zscale=t=bt709:m=bt709:r=tv,format=yuv420p[enc_sdr];",
-                $"[enc_sdr][ref_sdr]libvmaf={vmafOpts}");
+            refChain = hdrTonemap("0:v", npl) + upload + $"[{refLabel}];";
+            encChain = hdrTonemap("1:v", npl) + upload + $"[{encLabel}];";
         }
         else
         {
-            // SDR: compare at the source's matched bit depth.  An 8-bit reference
-            // converted to yuv420p10le would have zero-padded LSBs while a
-            // 10-bit encode has genuine LSB content — the resulting LSB
-            // differences are sub-perceptual but contribute a small bias to VMAF.
-            // format.VmafCompareFormat resolves to yuv420p for 8-bit sources,
-            // yuv420p10le for 10/12-bit sources (libvmaf caps at 10-bit).
-            string compareFmt = format.VmafCompareFormat;
-            filter = string.Concat(
-                $"[0:v]format={compareFmt}[ref];",
-                $"[1:v]format={compareFmt}[enc];",
-                $"[enc][ref]libvmaf={vmafOpts}");
+            refChain = $"[0:v]format={compareFmt}{upload}[{refLabel}];";
+            encChain = $"[1:v]format={compareFmt}{upload}[{encLabel}];";
         }
+
+        string filter = string.Concat(
+            refChain, encChain,
+            $"[{encLabel}][{refLabel}]{filterName}={vmafOpts}");
 
         var args = new[]
         {
@@ -156,7 +180,7 @@ public static class Pipelines
             "-f", "null", "-"
         };
 
-        var (code, _, err) = await Proc.RunAsync(cfg.Ffmpeg, args, ct);
+        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args, ct);
         if (code != 0) throw new InvalidOperationException($"vmaf failed: {err}");
     }
 
@@ -241,7 +265,7 @@ public static class Pipelines
             output
         ]);
 
-        var (code, _, err) = await Proc.RunAsync(cfg.Ffmpeg, args.ToArray(), ct);
+        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"final encode failed: {err}");
 
         if (isIvtc) SurfaceFieldmatchWarnings(err, logger);

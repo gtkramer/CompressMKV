@@ -1,28 +1,44 @@
 namespace CompressMkv;
 
 /// <summary>
-/// Validates that the ffmpeg installation has required filter support.
-/// Call once at startup; returns zscale availability for later HDR checks.
+/// Validates the running ffmpeg installation has the filters we need.
+/// Probes whatever <see cref="FfmpegRunner"/> resolves to — system ffmpeg
+/// when no container build exists, the pinned CUDA build when it does.
 /// </summary>
+public sealed class FfmpegCapabilitiesResult
+{
+    public bool HasLibvmaf { get; init; }
+    public bool HasLibvmafCuda { get; init; }
+    public bool HasZscale { get; init; }
+}
+
 public static class FfmpegCapabilities
 {
     /// <summary>
-    /// Ensures libvmaf is available. Returns true if zscale (libzimg) is also available.
-    /// Throws <see cref="InvalidOperationException"/> if libvmaf is missing.
+    /// Probes the active ffmpeg's filter set.  Throws if libvmaf is missing
+    /// (the app fundamentally needs it).  Reports libvmaf_cuda + zscale as
+    /// soft capabilities so the pipeline can route around them.
     /// </summary>
-    public static async Task<bool> ValidateAsync(Config cfg, CancellationToken ct)
+    public static async Task<FfmpegCapabilitiesResult> ValidateAsync(CancellationToken ct)
     {
-        var (code, stdout, _) = await Proc.RunAsync(cfg.Ffmpeg, ["-filters", "-hide_banner"], ct);
+        var (code, stdout, _) = await FfmpegRunner.RunFfmpegAsync(
+            new[] { "-filters", "-hide_banner" }, ct);
+
         if (code != 0)
             throw new InvalidOperationException($"Failed to query ffmpeg filters (exit code {code}).");
 
-        if (!stdout.Contains("libvmaf"))
+        bool hasLibvmaf = stdout.Contains("libvmaf");
+        if (!hasLibvmaf)
             throw new InvalidOperationException(
-                "ffmpeg is missing libvmaf support. " +
-                "On Arch Linux: ensure the 'vmaf' package is installed " +
-                "and ffmpeg was built with --enable-libvmaf.");
+                "ffmpeg is missing libvmaf support.  Build the bundled container with " +
+                "`compressmkv dependency build` (it ships ffmpeg + libvmaf + libvmaf_cuda), " +
+                "or ensure your system ffmpeg was built with --enable-libvmaf.");
 
-        bool hasZscale = stdout.Contains("zscale");
-        return hasZscale;
+        return new FfmpegCapabilitiesResult
+        {
+            HasLibvmaf = true,
+            HasLibvmafCuda = stdout.Contains("libvmaf_cuda"),
+            HasZscale = stdout.Contains("zscale"),
+        };
     }
 }

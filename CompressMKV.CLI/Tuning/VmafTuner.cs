@@ -23,7 +23,7 @@ public static class VmafTuner
     public static async Task<TuningResult> TuneAsync(
         Config cfg, GpuGate gpu, CpuGate cpu, string input, string outDir,
         RestoreDecision restore, bool isHdr, HdrMetadata? hdrMetadata,
-        PipelineFormat format, string vmafModelVersion,
+        PipelineFormat format, string vmafModelVersion, bool useCudaVmaf,
         CancellationToken ct, IPipelineLogger? logger = null)
     {
         logger ??= NullLogger.Instance;
@@ -131,13 +131,25 @@ public static class VmafTuner
                 string vmafLog = Path.Combine(vmafDir, $"cq{cq}_{tag}.json");
 
                 // 1. GPU encode — competes for NVENC slot via GpuGate.
-                using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, ct))
+                using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, cuda: 0, ct))
                     await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
 
-                // 2. VMAF — competes for CPU slot via CpuGate.  Held only for
-                //    the ffmpeg/libvmaf process; the JSON parse is unmetered.
-                using (await cpu.AcquireAsync(ct))
-                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
+                // 2. VMAF — gate selection follows the per-file decision the
+                //    caller already resolved: GpuGate.Cuda when libvmaf_cuda
+                //    will run, CpuGate when CPU libvmaf will run.  HDR-on-GPU
+                //    is decided upstream via cfg.UseCudaVmafForHdr — by the
+                //    time we get here, useCudaVmaf already reflects that
+                //    choice and we don't second-guess it.
+                if (useCudaVmaf)
+                {
+                    using (await gpu.AcquireAsync(nvenc: 0, nvdec: 0, cuda: 1, ct))
+                        await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, useCudaVmaf, ct);
+                }
+                else
+                {
+                    using (await cpu.AcquireAsync(ct))
+                        await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, useCudaVmaf, ct);
+                }
 
                 var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
                 int done = Interlocked.Increment(ref doneSamples);

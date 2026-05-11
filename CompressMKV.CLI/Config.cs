@@ -17,6 +17,35 @@ public sealed class Config
     public int NvencSlots { get; set; } = 2;
     public int NvdecSlots { get; set; } = 2;
 
+    /// <summary>
+    /// In-flight libvmaf_cuda jobs allowed at once.  CUDA-VMAF runs on the
+    /// general-purpose CUDA cores rather than the dedicated NVENC/NVDEC
+    /// engines, so it has its own gate.  Two slots lets us keep both NVENC
+    /// engines busy with sample encodes while VMAF measures the previous
+    /// pair — without flooding the GPU with parallel VMAF processes that
+    /// would crowd out NVENC's CUDA-based AQ helpers and consume too much
+    /// VRAM.  Falls back to <see cref="MaxConcurrentCpuFfmpegOps"/>'s share
+    /// of the CPU budget when the system ffmpeg lacks libvmaf_cuda (i.e.
+    /// when the bundled container hasn't been built and we're using native
+    /// libvmaf instead).
+    /// </summary>
+    public int CudaVmafSlots { get; set; } = 2;
+
+    /// <summary>
+    /// Whether to route HDR sources through libvmaf_cuda (true) or through
+    /// the CPU libvmaf path (false, default).  HDR comparison requires a
+    /// zscale tonemap chain, and zscale is CPU-only — so even when this is
+    /// true, the tonemap work stays on CPU and only the libvmaf computation
+    /// itself moves to the GPU.  Default is false because keeping HDR on
+    /// CpuGate naturally separates the two workloads (HDR runs are
+    /// uncommon, but when they do happen they shouldn't fight SDR encodes
+    /// for the same CUDA-VMAF slots).  Flip to true to consolidate VMAF
+    /// gating on the GPU regardless of source.  No effect when libvmaf_cuda
+    /// isn't available (system ffmpeg without container) — everything
+    /// degrades to CPU libvmaf.
+    /// </summary>
+    public bool UseCudaVmafForHdr { get; set; } = false;
+
     // --- Concurrency / scheduling ---
     //
     // The pipeline has three resource pools that need to be balanced so neither
