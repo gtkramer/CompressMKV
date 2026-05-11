@@ -29,20 +29,14 @@ public sealed class Config
     /// </summary>
     public int CudaVmafSlots { get; set; } = 2;
 
-    /// <summary>
-    /// Whether to route HDR sources through libvmaf_cuda (true) or through
-    /// the CPU libvmaf path (false, default).  HDR comparison requires a
-    /// zscale tonemap chain, and zscale is CPU-only — so even when this is
-    /// true, the tonemap work stays on CPU and only the libvmaf computation
-    /// itself moves to the GPU.  Default is false because keeping HDR on
-    /// CpuGate naturally separates the two workloads (HDR runs are
-    /// uncommon, but when they do happen they shouldn't fight SDR encodes
-    /// for the same CUDA-VMAF slots).  Flip to true to consolidate VMAF
-    /// gating on the GPU regardless of source.  No effect when libvmaf_cuda
-    /// isn't available (system ffmpeg without container) — everything
-    /// degrades to CPU libvmaf.
-    /// </summary>
-    public bool UseCudaVmafForHdr { get; set; } = false;
+    // VMAF computation always runs on the GPU via libvmaf_cuda, gated by
+    // CudaVmafSlots.  For HDR sources the zscale → tonemap → zscale chain
+    // still runs on the CPU (the container's ffmpeg has no GPU tonemap
+    // filter — that would require --enable-libplacebo which we don't
+    // build), but the libvmaf computation itself — the actual perceptual
+    // quality math — always moves to GPU.  Lets NVENC sample encodes get
+    // CPU-decoded FFV1 reference frames without competing with libvmaf
+    // for cores.
 
     // --- Concurrency / scheduling ---
     //
@@ -89,15 +83,6 @@ public sealed class Config
     /// handles I/O).
     /// </summary>
     public int FfmpegGpuThreads { get; set; } = 2;
-
-    /// <summary>
-    /// `n_threads=N` setting for the libvmaf filter inside the VMAF ffmpeg
-    /// invocation.  This is the hottest CPU phase, so libvmaf should get most
-    /// of a process's CPU budget.  Total threads per VMAF process ≈
-    /// <c>FfmpegCpuThreads + LibvmafThreads</c>.
-    /// </summary>
-    public int LibvmafThreads { get; set; } =
-        Math.Clamp(Environment.ProcessorCount / 5, 2, 6);
 
     /// <summary>
     /// `n_subsample=N` setting for libvmaf.  N=1 measures every frame (most
@@ -195,10 +180,25 @@ public sealed class Config
     // --- Content detection (single-pass full-file idet) ---
 
     /// <summary>
-    /// Use hardware-accelerated decoding for the detection pass.
-    /// Requires a supported GPU (e.g. NVIDIA with NVDEC).
+    /// Use NVDEC for the detection pass (and the post-encode verification
+    /// pass that reuses the same code path).
+    ///
+    /// Default <c>false</c>.  The detection workload is "decode every frame,
+    /// hand it to a CPU-only filter (idet), throw it away" — no encode and
+    /// no GPU-side filtering.  Pixels have to land in system memory either
+    /// way, so the NVDEC path costs us a per-frame GPU→CPU download on top
+    /// of the decode itself.  On a multi-core CPU that can sw-decode a
+    /// 1080p stream at multiples of realtime, sw decode is competitive or
+    /// faster — and it leaves the dedicated NVDEC engines free for the
+    /// final encode pipeline (which is the only place we benefit from
+    /// hardware decode).
+    ///
+    /// Flip to <c>true</c> if you're routinely processing 4K HDR sources
+    /// where NVDEC's raw throughput advantage starts to outpace the
+    /// download cost — but expect to feel the contention if multiple files
+    /// are in flight at once (NVDEC has only 2 engines on RTX 5080).
     /// </summary>
-    public bool UseHwaccelForDetection { get; set; } = true;
+    public bool UseHwaccelForDetection { get; set; } = false;
 
     // Detection thresholds are internal constants in ContentDetector.
     // They are derived from 3:2 pulldown signal physics and are not user-tunable.

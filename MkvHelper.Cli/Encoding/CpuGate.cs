@@ -13,8 +13,7 @@ namespace MkvHelper;
 ///
 /// Sized to <see cref="Config.MaxConcurrentCpuFfmpegOps"/> on construction
 /// (default 4 on a 20-core CPU).  Combined with each ffmpeg using
-/// <see cref="Config.FfmpegCpuThreads"/> and libvmaf using
-/// <see cref="Config.LibvmafThreads"/>, total in-flight thread count
+/// <see cref="Config.FfmpegCpuThreads"/>, total in-flight thread count
 /// stays close to (but slightly under) the logical core count, which is
 /// what saturated-but-not-thrashing looks like.
 /// </summary>

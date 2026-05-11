@@ -83,8 +83,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             $"[grey]Concurrency:[/] {cfg.MaxConcurrentFiles} files in flight, " +
             $"{cfg.MaxConcurrentCpuFfmpegOps} CPU ffmpeg ops, " +
             $"{cfg.NvencSlots} NVENC + {cfg.NvdecSlots} NVDEC + {cfg.CudaVmafSlots} CUDA-VMAF, " +
-            $"{cfg.FfmpegCpuThreads} threads/CPU op, " +
-            $"{cfg.LibvmafThreads} threads/libvmaf.");
+            $"{cfg.FfmpegCpuThreads} threads/CPU op.");
         if (settings.ForceRedo)
             AnsiConsole.MarkupLine("[yellow]--force-redo:[/] existing log.json files will be ignored and files re-processed.");
         AnsiConsole.WriteLine();
@@ -254,7 +253,11 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         RcLookahead = 48,
         UseNvdecForEncode = true,
 
-        UseHwaccelForDetection = true,
+        // Sw-decode for detection + verification: NVDEC's per-frame
+        // GPU→CPU download negates its decode-rate advantage when the
+        // downstream filter (idet) is CPU-only, and frees both NVDEC
+        // engines for the final encode pipeline.  See Config docs.
+        UseHwaccelForDetection = false,
 
         PreviewMaxConfidenceToGenerate = 0.60,
         PreviewCount = 3,
@@ -356,15 +359,16 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             timings.Previews = sw.Elapsed;
         }
 
-        // GPU VMAF whenever the source is SDR; HDR routes to CPU libvmaf
-        // by default (see Config.UseCudaVmafForHdr docs for trade-off).
-        bool useCudaForThisFile = !isHdr || cfg.UseCudaVmafForHdr;
-        logger.LogInfo(
-            $"VMAF execution: {(useCudaForThisFile ? "GPU (libvmaf_cuda)" : "CPU (libvmaf)")} " +
-            $"[isHdr={isHdr}, UseCudaVmafForHdr={cfg.UseCudaVmafForHdr}]");
+        // VMAF computation always runs on GPU via libvmaf_cuda.  For HDR,
+        // the zscale → tonemap → zscale chain still runs on CPU within
+        // the same ffmpeg process (no GPU tonemap in the container) —
+        // that's the only CPU work in the VMAF path.
+        logger.LogInfo(isHdr
+            ? "VMAF execution: GPU (libvmaf_cuda); HDR tonemap chain on CPU"
+            : "VMAF execution: GPU (libvmaf_cuda)");
 
         var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore,
-            isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, useCudaForThisFile, ct, logger);
+            isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, ct, logger);
         timings.TuningPhase1 = tuning.Phase1Elapsed;
         timings.TuningPhase2 = tuning.Phase2Elapsed;
 

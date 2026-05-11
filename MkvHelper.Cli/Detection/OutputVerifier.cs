@@ -30,8 +30,10 @@ namespace MkvHelper;
 //     firing on non-NTSC-thirty sources.
 //
 // The verification is full-file (not sample-based) because the user wants
-// definitive coverage on the actual deliverable.  Cost is bounded: AV1
-// decode under NVDEC runs at multiple times realtime even for 4K HDR.
+// definitive coverage on the actual deliverable.  Cost is bounded: a
+// multi-core CPU sw-decodes 1080p AV1 at multiples of realtime, and on
+// 4K HDR you can flip Config.UseHwaccelForDetection to route through
+// NVDEC if the throughput advantage outweighs the GPU-resource cost.
 // =========================================================================
 public static class OutputVerifier
 {

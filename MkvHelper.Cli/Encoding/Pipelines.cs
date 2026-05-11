@@ -87,88 +87,77 @@ public static class Pipelines
     //  VMAF: compare reference clip vs encoded clip directly.
     //  Both are already progressive with matching cadence/framecount.
     //
-    //  Two filter paths:
+    //  Always libvmaf_cuda.  Frames are software-decoded (FFV1 has no
+    //  NVDEC path; AV1 sample is small enough that the NVDEC bookkeeping
+    //  overhead isn't worth a slot), uploaded to GPU via hwupload_cuda,
+    //  then libvmaf_cuda runs the VMAF computation on the GPU's CUDA
+    //  cores.  The container guarantees libvmaf was built with CUDA, so
+    //  there's no longer a CPU-libvmaf fallback path here.
     //
-    //  - GPU (useCudaVmaf=true): libvmaf_cuda.  Frames are decoded in
-    //    software (FFV1 and AV1 both have no fast NVDEC path for this size
-    //    of clip — the encoded sample COULD use NVDEC but it'd cost an
-    //    NVDEC slot for ~12 s of decode), then uploaded with
-    //    hwupload_cuda.  The VMAF computation itself runs on CUDA cores
-    //    via libvmaf_cuda — ~10× the throughput of CPU libvmaf on a
-    //    consumer GPU per NVIDIA's published benchmarks.  Caller gates
-    //    on GpuGate.Cuda, not CpuGate, so this runs concurrently with
-    //    other CPU-heavy ffmpeg ops on other files.
+    //  HDR caveat: zscale + tonemap stay on CPU (the container's ffmpeg
+    //  doesn't ship a GPU tonemap filter — that would require
+    //  --enable-libplacebo, which we don't build).  Only the libvmaf
+    //  computation moves to GPU on HDR runs; the colour-space conversion
+    //  cost stays on CPU.  Even so, gating VMAF on the CUDA slot rather
+    //  than the CpuGate keeps CpuGate slots free for the FFV1 decode that
+    //  feeds NVENC — the actual hot path for end-to-end throughput.
     //
-    //  - CPU (useCudaVmaf=false): the original libvmaf path.  Used when
-    //    we're running against the system ffmpeg without a CUDA-enabled
-    //    libvmaf build (i.e. the dependency container hasn't been built).
-    //
-    //  HDR path always uses CPU libvmaf for now — the zscale+tonemap
-    //  filters are CPU-bound and the tonemap_cuda alternative would
-    //  require a more invasive filter-graph rewrite.  HDR sources are
-    //  rare enough that this is acceptable; revisit if needed.
-    //
-    //  SDR: compare at matching bit depth (yuv420p for 8-bit sources,
-    //  yuv420p10le for 10-bit) so an 8-bit reference's zero-padded LSBs
-    //  don't bias the VMAF score against a 10-bit encode's real LSB
-    //  content.  libvmaf caps at 10-bit input.
+    //  Bit depth: for SDR, compare at matching bit depth (yuv420p for
+    //  8-bit, yuv420p10le for 10-bit) so an 8-bit reference's zero-padded
+    //  LSBs don't bias the score against a 10-bit encode's real LSB
+    //  content.  libvmaf caps at 10-bit.
     // ----------------------------------------------------------------
     public static async Task RunVmafDirectAsync(
         Config cfg, string refInput, string encInput, bool isHdr,
         HdrMetadata? hdrMetadata, PipelineFormat format,
-        string vmafLog, string vmafModelVersion, bool useCudaVmaf,
+        string vmafLog, string vmafModelVersion,
         CancellationToken ct)
     {
         if (File.Exists(vmafLog)) File.Delete(vmafLog);
 
         // Escape `:` and `\` inside filter-arg values (path goes into
-        // libvmaf=log_path=...).  Filter argument syntax treats `:` as a
-        // separator and `\` as an escape; both need to be doubled.
+        // libvmaf_cuda=log_path=...).  Filter argument syntax treats `:`
+        // as a separator and `\` as an escape; both need to be doubled.
         string esc(string p) => p.Replace(@"\", @"\\").Replace(":", @"\:");
 
-        // Filter name is whatever the caller's resolved decision implies.
-        // HDR is independent of CPU/GPU choice — caller already decided.
-        string filterName = useCudaVmaf ? "libvmaf_cuda" : "libvmaf";
+        // libvmaf_cuda runs the perceptual math on CUDA cores, not CPU
+        // threads — passing n_threads to it spawns a thread pool that
+        // races with vmaf_read_pictures and silently fails after the
+        // first frame (the filter just emits "problem during
+        // vmaf_read_pictures" and EINVAL).  n_subsample is fine.
         string vmafOpts =
             $"log_fmt=json:log_path={esc(vmafLog)}:" +
             $"model=version={vmafModelVersion}:" +
-            $"n_threads={cfg.LibvmafThreads.ToString(CultureInfo.InvariantCulture)}:" +
             $"n_subsample={cfg.LibvmafSubsample.ToString(CultureInfo.InvariantCulture)}";
 
-        // For HDR, both ref and encode get a tonemap chain before VMAF.
-        // npl ("nominal peak luminance") tells the tonemapper what brightness
-        // counts as the input peak — get it wrong and highlights are crushed
-        // identically in both streams, but their differences in those crushed
-        // regions become invisible to VMAF.  Resolved from HDR side-data
+        // For HDR, both ref and encode get a CPU-side tonemap chain
+        // before being uploaded to GPU.  npl ("nominal peak luminance")
+        // tells the tonemapper what brightness counts as the input peak
+        // — get it wrong and highlights are crushed identically in both
+        // streams, but their differences in those crushed regions become
+        // invisible to VMAF.  Resolved from HDR side-data
         // (MaxCLL → mastering display max → 1000 nits HDR10 default).
-        // zscale is CPU-only, so the tonemap work runs on CPU even when the
-        // VMAF computation moves to GPU — the GPU benefit on HDR is just the
-        // libvmaf_cuda kernel itself.
         string hdrTonemap(string srcLabel, int npl) =>
             $"[{srcLabel}]zscale=t=linear:npl={npl.ToString(CultureInfo.InvariantCulture)}," +
             "tonemap=tonemap=hable,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
 
         string compareFmt = format.VmafCompareFormat;
-        string upload = useCudaVmaf ? ",hwupload_cuda" : "";
-        string refLabel = useCudaVmaf ? "ref_cuda" : "ref";
-        string encLabel = useCudaVmaf ? "enc_cuda" : "enc";
-
         string refChain, encChain;
         if (isHdr)
         {
             int npl = (hdrMetadata ?? new HdrMetadata()).ResolveNpl();
-            refChain = hdrTonemap("0:v", npl) + upload + $"[{refLabel}];";
-            encChain = hdrTonemap("1:v", npl) + upload + $"[{encLabel}];";
+            refChain = hdrTonemap("0:v", npl) + ",hwupload_cuda[ref_cuda];";
+            encChain = hdrTonemap("1:v", npl) + ",hwupload_cuda[enc_cuda];";
         }
         else
         {
-            refChain = $"[0:v]format={compareFmt}{upload}[{refLabel}];";
-            encChain = $"[1:v]format={compareFmt}{upload}[{encLabel}];";
+            refChain = $"[0:v]format={compareFmt},hwupload_cuda[ref_cuda];";
+            encChain = $"[1:v]format={compareFmt},hwupload_cuda[enc_cuda];";
         }
 
         string filter = string.Concat(
             refChain, encChain,
-            $"[{encLabel}][{refLabel}]{filterName}={vmafOpts}");
+            $"[enc_cuda][ref_cuda]libvmaf_cuda={vmafOpts}");
 
         var args = new[]
         {

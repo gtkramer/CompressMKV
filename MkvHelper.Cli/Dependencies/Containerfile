@@ -8,15 +8,24 @@
 #   - libvmaf (with CUDA)               — the libvmaf_cuda filter, used by
 #                                         the GPU VMAF tuning path.
 #   - FFmpeg (CUDA + full codec set)    — NVENC/NVDEC, libvmaf_cuda,
-#                                         software AV1 (libaom + libdav1d
-#                                         + libsvtav1), x264/x265/vpx,
-#                                         libnpp, zscale, and the usual
-#                                         audio/subtitle codecs.
+#                                         software AV1 (libaom + libdav1d),
+#                                         x264/x265/vpx, libnpp, zscale,
+#                                         and the usual audio/subtitle
+#                                         codecs.
 #   - MKVToolNix (mkvextract, mkvmerge) — used by `mkvhelper split` and
 #                                         `mkvhelper print-chapters`.
 #
 # All upstream versions are pinned via build args.  Bump VMAF_TAG /
 # FFMPEG_TAG / NV_CODEC_TAG together when refreshing.
+#
+# HDR tonemap for VMAF runs on CPU via `zscale → tonemap`.  We tested
+# `tonemap_cuda` (jellyfin-ffmpeg fork) and `tonemap_opencl` and found
+# both unworkable end-to-end: tonemap_cuda breaks the libvmaf_cuda chain
+# after the first frame (hwframes context mismatch), and tonemap_opencl
+# does not accept p010 / 10-bit input on NVIDIA's ICD.  The win we
+# wanted — moving VMAF off CPU — is fully captured by `libvmaf_cuda`
+# itself, which dominates the perceptual-math cost; the zscale+tonemap
+# prep is cheap by comparison.
 #
 # Base image is the NVIDIA CUDA devel image because its toolchain ships
 # nvcc + the CUDA dev headers/libs at the standard `/usr/local/cuda`
@@ -167,7 +176,8 @@ RUN cd /tmp \
         --enable-libvorbis \
         --enable-libmp3lame \
         --enable-libtheora \
-        # Subtitles + image + colour-space
+        # Subtitles + image + colour-space (zscale powers HDR→SDR tonemap
+        # on CPU before frames are uploaded to GPU for libvmaf_cuda).
         --enable-libass \
         --enable-libwebp \
         --enable-libzimg \

@@ -20,7 +20,16 @@
       "Read(//home/george/.local/share/mkvhelper/build-logs/**)",
       "Bash(curl -s \"https://api.github.com/repos/FFmpeg/FFmpeg/releases?per_page=5\")",
       "Bash(curl -s \"https://api.github.com/repos/FFmpeg/nv-codec-headers/tags?per_page=5\")",
-      "Bash(curl -s \"https://api.github.com/repos/Netflix/vmaf/releases/latest\")"
+      "Bash(curl -s \"https://api.github.com/repos/Netflix/vmaf/releases/latest\")",
+      "Read(//home/george/.local/share/mkvhelper/**)",
+      "Bash(dotnet msbuild *)",
+      "Read(//tmp/**)",
+      "Bash(podman images *)",
+      "Bash(tee /tmp/build5.log)",
+      "Bash(podman run *)",
+      "Bash(curl -s \"https://api.github.com/repos/jellyfin/jellyfin-ffmpeg/contents/debian/patches?ref=v7.1.3-6\")",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/jellyfin/jellyfin-ffmpeg/v7.1.3-6/debian/patches/series\")"
     ]
   }
 }

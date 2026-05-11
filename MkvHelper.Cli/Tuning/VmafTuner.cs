@@ -27,15 +27,15 @@ namespace MkvHelper;
 ///     without oversubscribing the CPU.
 ///   - GPU NVENC sample encodes gate on <see cref="GpuGate"/> separately
 ///     — they're mostly idle on CPU and run in parallel with CPU-heavy VMAF.
-///   - Per-process thread counts come from <see cref="Config.FfmpegCpuThreads"/>,
-///     <see cref="Config.FfmpegGpuThreads"/>, and <see cref="Config.LibvmafThreads"/>.
+///   - Per-process thread counts come from <see cref="Config.FfmpegCpuThreads"/>
+///     and <see cref="Config.FfmpegGpuThreads"/>.
 /// </summary>
 public static class VmafTuner
 {
     public static async Task<TuningResult> TuneAsync(
         Config cfg, GpuGate gpu, CpuGate cpu, string input, string outDir,
         RestoreDecision restore, bool isHdr, HdrMetadata? hdrMetadata,
-        PipelineFormat format, string vmafModelVersion, bool useCudaVmaf,
+        PipelineFormat format, string vmafModelVersion,
         CancellationToken ct, IPipelineLogger? logger = null)
     {
         logger ??= NullLogger.Instance;
@@ -132,7 +132,7 @@ public static class VmafTuner
 
                 var agg = await ProbeCqAsync(
                     cfg, gpu, cpu, refClips, windows, samplesDir, vmafDir,
-                    isHdr, hdrMetadata, format, vmafModelVersion, useCudaVmaf,
+                    isHdr, hdrMetadata, format, vmafModelVersion,
                     cq, logger, ct);
                 probeSw.Stop();
                 cqResults.Add(agg);
@@ -185,9 +185,15 @@ public static class VmafTuner
         Config cfg, GpuGate gpu, CpuGate cpu, string[] refClips,
         IReadOnlyList<SampleWindow> windows, string samplesDir, string vmafDir,
         bool isHdr, HdrMetadata? hdrMetadata, PipelineFormat format,
-        string vmafModelVersion, bool useCudaVmaf,
+        string vmafModelVersion,
         int cq, IPipelineLogger logger, CancellationToken ct)
     {
+        // CpuGate intentionally unused here — both per-sample steps
+        // gate on the GPU now (NVENC slot for the encode, CUDA slot for
+        // libvmaf_cuda).  CpuGate stays free for Phase 1 ref extraction
+        // and for the FFV1-decode CPU work that feeds NVENC.
+        _ = cpu;
+
         int doneSamples = 0;
         var sampleTasks = Enumerable.Range(0, windows.Count).Select(async i =>
         {
@@ -200,19 +206,13 @@ public static class VmafTuner
             using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, cuda: 0, ct))
                 await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
 
-            // 2. VMAF — gate selection follows the per-file decision the
-            //    caller already resolved: GpuGate.Cuda when libvmaf_cuda
-            //    will run, CpuGate when CPU libvmaf will run.
-            if (useCudaVmaf)
-            {
-                using (await gpu.AcquireAsync(nvenc: 0, nvdec: 0, cuda: 1, ct))
-                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, useCudaVmaf, ct);
-            }
-            else
-            {
-                using (await cpu.AcquireAsync(ct))
-                    await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, useCudaVmaf, ct);
-            }
+            // 2. VMAF runs on GPU via libvmaf_cuda — always.  HDR's
+            //    zscale tonemap chain still happens on CPU inside the
+            //    same ffmpeg process (no GPU tonemap available in our
+            //    container build), but the libvmaf computation itself
+            //    is on the GPU.
+            using (await gpu.AcquireAsync(nvenc: 0, nvdec: 0, cuda: 1, ct))
+                await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
 
             var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
             int done = Interlocked.Increment(ref doneSamples);
