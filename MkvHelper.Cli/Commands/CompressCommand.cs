@@ -237,7 +237,11 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         NvdecSlots = 2,
         CudaVmafSlots = 2,
 
-        CandidateCq = [16, 18, 20, 22, 24, 26, 28, 30, 32, 34],
+        // CQ binary search range — full NVENC AV1 range is 0..63; we
+        // narrow to the practically-useful window (see Config docs).
+        MinCq = 8,
+        MaxCq = 55,
+
         SampleCount = 16,
         SampleWindowSeconds = 12,
         RandomSeed = 12345,
@@ -245,10 +249,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         TargetMeanVmaf = 97.0,
         TargetP05Vmaf = 95.0,
         TargetP01Vmaf = 90.0,
-
-        HdrApplyCqLadderShift = true,
-        HdrCqLadderDelta = 2,
-        MinCq = 0,
 
         NvencPreset = "p7",
         RcLookahead = 48,

@@ -109,18 +109,28 @@ public sealed class Config
     /// </summary>
     public int LibvmafSubsample { get; set; } = 1;
 
-    /// <summary>
-    /// CQ ladder for the tuning search.  Range 16–34 in steps of 2:
-    ///   - Lower bound 16: near-lossless quality safety floor.  Below 16
-    ///     the encoder rarely improves on already-perceptually-transparent
-    ///     output and we'd just be wasting bits.
-    ///   - Upper bound 34: practical maximum compression for AV1 NVENC; CQs
-    ///     above this consistently fail the 97/95 quality gates on real content.
-    ///   - Step 2: ten ladder rungs gives reasonable granularity (~0.5 VMAF
-    ///     points per step on typical content); step 1 would double the search
-    ///     work for sub-perceptual differences between adjacent rungs.
-    /// </summary>
-    public List<int> CandidateCq { get; set; } = new();
+    // -- CQ search range --
+    //
+    // The tuning search looks for the highest CQ (most compression) that still
+    // meets the VMAF gates below.  A binary search over the [MinCq, MaxCq]
+    // integer range converges in ~log2(N) probes regardless of where the
+    // answer lies — so the bounds are about pruning regions where the answer
+    // is determined a priori, not about constraining the search granularity.
+    //
+    // NVENC AV1 supports CQ 0–63.  We default to a tighter window because:
+    //   - Below MinCq=8: encodes are already perceptually transparent at any
+    //     quality target we'd realistically set; smaller CQ just wastes bits.
+    //   - Above MaxCq=55: real content uniformly fails the 97/95/90 gates;
+    //     no point sampling there.
+    // Bump MaxCq toward 63 if you're working with content that can survive
+    // very aggressive compression; bump MinCq toward 0 if you target archive-
+    // grade quality (mean ≥ 99).</summary>
+
+    /// <summary>Lower bound (inclusive) of the binary CQ search.  Must be ≥ 0.</summary>
+    public int MinCq { get; set; } = 8;
+
+    /// <summary>Upper bound (inclusive) of the binary CQ search.  Must be ≤ 63 (NVENC AV1 hard ceiling).</summary>
+    public int MaxCq { get; set; } = 55;
 
     /// <summary>
     /// Target number of stratified random sample windows.  16 × 12s = 192s
@@ -172,25 +182,10 @@ public sealed class Config
     /// </summary>
     public double TargetP01Vmaf { get; set; } = 90.0;
 
-    /// <summary>
-    /// Enables a uniform CQ-ladder shift for HDR content.  HDR's wider dynamic
-    /// range makes quantization errors more visible — the same CQ on HDR yields
-    /// lower VMAF scores than on SDR.  Shifting the ladder toward higher quality
-    /// compensates.
-    /// </summary>
-    public bool HdrApplyCqLadderShift { get; set; } = true;
-
-    /// <summary>
-    /// HDR CQ ladder shift in CQ units.  Default 2 = "shift the whole search
-    /// 2 CQ steps toward higher quality" for HDR.  Empirical heuristic;
-    /// industry recommendations span 1–5 and modern AV1 may need less.
-    /// </summary>
-    public int HdrCqLadderDelta { get; set; } = 2;
-
-    /// <summary>
-    /// Floor for the shifted CQ ladder so the HDR shift can't drive CQ negative.
-    /// </summary>
-    public int MinCq { get; set; } = 0;
+    // No HDR-specific CQ shift.  An HDR source whose perceived quality at a
+    // given CQ is worse than its SDR equivalent will fail the VMAF gates and
+    // the search will descend to a lower CQ on its own — driving selection
+    // from measurement rather than a fixed offset.
 
     public string NvencPreset { get; set; } = "p7";
     public int RcLookahead { get; set; } = 48;
