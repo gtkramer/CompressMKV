@@ -14,6 +14,13 @@ public static class Proc
         {
             FileName = exe,
             UseShellExecute = false,
+            // Redirect stdin so the child never inherits our terminal handle.
+            // Without this, ffmpeg in particular flips the terminal into
+            // non-canonical mode to listen for its `q`/`+`/`-` shortcuts and
+            // — if killed via cancellation — never restores it, leaving the
+            // user's shell with echo disabled after the run.  See proc(5)
+            // termios behavior for why this happens at child exit time.
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
@@ -30,6 +37,9 @@ public static class Proc
         p.ErrorDataReceived += (_, e) => { if (e.Data == null) tcsErr.TrySetResult(true); else stderr.AppendLine(e.Data); };
 
         if (!p.Start()) throw new InvalidOperationException($"Failed to start {exe}");
+        // Close the stdin pipe immediately so any child that tries to read
+        // sees EOF instead of blocking.  We never feed data to subprocesses.
+        p.StandardInput.Close();
         p.BeginOutputReadLine();
         p.BeginErrorReadLine();
 
@@ -50,6 +60,10 @@ public static class Proc
         {
             FileName = exe,
             UseShellExecute = false,
+            // See RunAsync above for why we redirect stdin.  Same rationale
+            // applies — these long-running ffmpeg decodes are exactly the
+            // ones most likely to be killed mid-flight via cancellation.
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
@@ -67,6 +81,7 @@ public static class Proc
         };
 
         if (!p.Start()) throw new InvalidOperationException($"Failed to start {exe}");
+        p.StandardInput.Close();
         p.BeginErrorReadLine();
 
         await using var reg = ct.Register(() =>
