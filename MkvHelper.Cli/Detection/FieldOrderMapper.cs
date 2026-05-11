@@ -1,16 +1,17 @@
 namespace MkvHelper;
 
 /// <summary>
-/// Maps ffprobe field_order values to <see cref="FieldParity"/>.
+/// Maps ffprobe's <c>field_order</c> string to <see cref="FieldParity"/>.
+///
+/// ffprobe emits one of <c>progressive | tt | bb | tb | bt | tff | bff | unknown</c>.
+/// Only <c>tt/tff</c> and <c>bb/bff</c> represent a clean parity commitment;
+/// <c>tb/bt</c> are mixed (top/bottom OR bottom/top transitions) and
+/// <c>progressive/unknown</c> aren't parity claims at all — all of those
+/// return <see cref="FieldParity.Auto"/> so the downstream parity detector
+/// gets the final say from idet.
 /// </summary>
 public static class FieldOrderMapper
 {
-    // ffprobe field_order values vary. Common ones:
-    // progressive, tt, bb, tb, bt, tff, bff, unknown
-    // We'll map:
-    //  - tt / tff => Tff
-    //  - bb / bff => Bff
-    // Others => Auto (unknown/mixed)
     public static FieldParity MapToParity(string fieldOrderLower)
     {
         if (string.IsNullOrWhiteSpace(fieldOrderLower)) return FieldParity.Auto;
@@ -21,7 +22,6 @@ public static class FieldOrderMapper
         if (fieldOrderLower.Contains("bb") || fieldOrderLower.Contains("bff"))
             return FieldParity.Bff;
 
-        // progressive/unknown/tb/bt -> not a clean parity commitment
         return FieldParity.Auto;
     }
 }

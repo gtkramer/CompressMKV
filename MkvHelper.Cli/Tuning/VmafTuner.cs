@@ -206,11 +206,9 @@ public static class VmafTuner
             using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, cuda: 0, ct))
                 await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
 
-            // 2. VMAF runs on GPU via libvmaf_cuda — always.  HDR's
-            //    zscale tonemap chain still happens on CPU inside the
-            //    same ffmpeg process (no GPU tonemap available in our
-            //    container build), but the libvmaf computation itself
-            //    is on the GPU.
+            // 2. VMAF — gates on the CUDA slot (libvmaf_cuda runs on the
+            //    general-purpose CUDA cores).  See Pipelines.RunVmafDirectAsync
+            //    for the HDR tonemap chain rationale.
             using (await gpu.AcquireAsync(nvenc: 0, nvdec: 0, cuda: 1, ct))
                 await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
 

@@ -37,7 +37,6 @@ public static class Selector
 
     public static Selection Select(Config cfg, List<CqAggregate> results)
     {
-        // Pick the highest CQ that passes all three frame-level VMAF thresholds.
         var pass = results
             .Where(r => r.MeanVmaf >= cfg.TargetMeanVmaf
                      && r.P05Vmaf  >= cfg.TargetP05Vmaf

@@ -287,9 +287,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         bool isHdr = SourceClassifier.IsHdr(vstream);
         logger.LogInfo($"HDR: {isHdr}");
 
-        // Container guarantees zscale + libvmaf_cuda are present, so no
-        // capability probe is needed.
-
         HdrMetadata? hdrMetadata = isHdr
             ? await SourceClassifier.ExtractHdrMetadataAsync(cfg, input, ct)
             : null;
@@ -359,10 +356,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             timings.Previews = sw.Elapsed;
         }
 
-        // VMAF computation always runs on GPU via libvmaf_cuda.  For HDR,
-        // the zscale → tonemap → zscale chain still runs on CPU within
-        // the same ffmpeg process (no GPU tonemap in the container) —
-        // that's the only CPU work in the VMAF path.
         logger.LogInfo(isHdr
             ? "VMAF execution: GPU (libvmaf_cuda); HDR tonemap chain on CPU"
             : "VMAF execution: GPU (libvmaf_cuda)");

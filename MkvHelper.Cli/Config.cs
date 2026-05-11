@@ -22,21 +22,9 @@ public sealed class Config
     /// engines busy with sample encodes while VMAF measures the previous
     /// pair — without flooding the GPU with parallel VMAF processes that
     /// would crowd out NVENC's CUDA-based AQ helpers and consume too much
-    /// VRAM.  Falls back to <see cref="MaxConcurrentCpuFfmpegOps"/>'s share
-    /// of the CPU budget when the system ffmpeg lacks libvmaf_cuda (i.e.
-    /// when the bundled container hasn't been built and we're using native
-    /// libvmaf instead).
+    /// VRAM.
     /// </summary>
     public int CudaVmafSlots { get; set; } = 2;
-
-    // VMAF computation always runs on the GPU via libvmaf_cuda, gated by
-    // CudaVmafSlots.  For HDR sources the zscale → tonemap → zscale chain
-    // still runs on the CPU (the container's ffmpeg has no GPU tonemap
-    // filter — that would require --enable-libplacebo which we don't
-    // build), but the libvmaf computation itself — the actual perceptual
-    // quality math — always moves to GPU.  Lets NVENC sample encodes get
-    // CPU-decoded FFV1 reference frames without competing with libvmaf
-    // for cores.
 
     // --- Concurrency / scheduling ---
     //
@@ -109,7 +97,7 @@ public sealed class Config
     //     no point sampling there.
     // Bump MaxCq toward 63 if you're working with content that can survive
     // very aggressive compression; bump MinCq toward 0 if you target archive-
-    // grade quality (mean ≥ 99).</summary>
+    // grade quality (mean ≥ 99).
 
     /// <summary>Lower bound (inclusive) of the binary CQ search.  Must be ≥ 0.</summary>
     public int MinCq { get; set; } = 8;

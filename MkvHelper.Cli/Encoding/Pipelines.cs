@@ -87,18 +87,16 @@ public static class Pipelines
     //  VMAF: compare reference clip vs encoded clip directly.
     //  Both are already progressive with matching cadence/framecount.
     //
-    //  Always libvmaf_cuda.  Frames are software-decoded (FFV1 has no
-    //  NVDEC path; AV1 sample is small enough that the NVDEC bookkeeping
-    //  overhead isn't worth a slot), uploaded to GPU via hwupload_cuda,
-    //  then libvmaf_cuda runs the VMAF computation on the GPU's CUDA
-    //  cores.  The container guarantees libvmaf was built with CUDA, so
-    //  there's no longer a CPU-libvmaf fallback path here.
+    //  Frames are software-decoded (FFV1 has no NVDEC path; AV1 sample
+    //  is small enough that NVDEC bookkeeping isn't worth a slot),
+    //  uploaded to GPU via hwupload_cuda, then libvmaf_cuda runs the
+    //  perceptual math on CUDA cores.
     //
-    //  HDR caveat: zscale + tonemap stay on CPU (the container's ffmpeg
-    //  doesn't ship a GPU tonemap filter — that would require
-    //  --enable-libplacebo, which we don't build).  Only the libvmaf
-    //  computation moves to GPU on HDR runs; the colour-space conversion
-    //  cost stays on CPU.  Even so, gating VMAF on the CUDA slot rather
+    //  HDR caveat: zscale + tonemap stay on CPU.  GPU tonemap routes
+    //  (tonemap_cuda, tonemap_opencl, libplacebo) all failed to compose
+    //  with libvmaf_cuda in this version of FFmpeg — see the Containerfile
+    //  header.  Only libvmaf itself moves to GPU on HDR runs; the colour-
+    //  space conversion cost stays on CPU.  Gating on the CUDA slot rather
     //  than the CpuGate keeps CpuGate slots free for the FFV1 decode that
     //  feeds NVENC — the actual hot path for end-to-end throughput.
     //
