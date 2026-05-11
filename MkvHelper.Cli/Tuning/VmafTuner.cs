@@ -22,18 +22,17 @@ namespace MkvHelper;
 /// lower, fail the gates, and the search will descend on its own.
 ///
 /// Concurrency model:
-///   - CPU-heavy ffmpeg ops (ref extraction, VMAF) gate on a global
-///     <see cref="CpuGate"/> so work flows naturally across files
-///     without oversubscribing the CPU.
-///   - GPU NVENC sample encodes gate on <see cref="GpuGate"/> separately
-///     — they're mostly idle on CPU and run in parallel with CPU-heavy VMAF.
-///   - Per-process thread counts come from <see cref="Config.FfmpegCpuThreads"/>
-///     and <see cref="Config.FfmpegGpuThreads"/>.
+///   Every op declares its cost via <see cref="ResourceRequest"/> and
+///   acquires from the global <see cref="ResourcePool"/>.  Phase 1 ops
+///   request CPU only; Phase 2 sample encodes request CPU + NVENC;
+///   VMAF measurements request CPU + CUDA.  The pool's strict-FIFO
+///   ordering means earlier files in the batch take priority; later
+///   files run opportunistically when resources are free.
 /// </summary>
 public static class VmafTuner
 {
     public static async Task<TuningResult> TuneAsync(
-        Config cfg, GpuGate gpu, CpuGate cpu, string input, string outDir,
+        Config cfg, ResourcePool pool, string input, string outDir,
         RestoreDecision restore, bool isHdr, HdrMetadata? hdrMetadata,
         PipelineFormat format, string vmafModelVersion,
         CancellationToken ct, IPipelineLogger? logger = null)
@@ -72,9 +71,10 @@ public static class VmafTuner
         //  so it represents the true progressive reference for VMAF.
         //  Fast-seek (-ss before -i) → minimal decode overhead.
         //
-        //  Throttled by the CpuGate — the global gate caps total in-flight
-        //  CPU ffmpeg ops (across all files) at Config.MaxConcurrentCpuFfmpegOps,
-        //  so this saturates the CPU without thrashing.  No batch barriers.
+        //  Throttled by ResourcePool — each extraction declares its CPU
+        //  cost via cfg.RefExtractRequest; the pool admits as many as the
+        //  CPU pool has room for, naturally balancing against Phase 2 /
+        //  Detection / VMAF work on other files.
         // =======================================================
         logger.SetStage("Phase 1", $"extracting {windows.Count} reference clips");
         logger.LogInfo($"Phase 1: extracting {windows.Count} FFV1 reference clips (cadence-restored).");
@@ -85,7 +85,7 @@ public static class VmafTuner
         var refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
-            using (await cpu.AcquireAsync(ct))
+            using (await pool.AcquireAsync(cfg.RefExtractRequest, ct))
                 await Pipelines.ExtractReferenceClipAsync(cfg, input, refPath, w, restore, ct);
             refClips[i] = refPath;
             int done = Interlocked.Increment(ref extractedCount);
@@ -109,8 +109,8 @@ public static class VmafTuner
         //  `lo`, with a fallback to "best mean" if nothing ever passed.
         //
         //  Each probe fires all sample tasks in parallel:
-        //    1. acquire NVENC slot (GpuGate) → encode → release
-        //    2. acquire CUDA-VMAF or CPU slot → VMAF → release
+        //    1. acquire (CPU + NVENC) from ResourcePool → encode → release
+        //    2. acquire (CPU + CUDA) from ResourcePool   → VMAF → release
         // =======================================================
         var phase2Sw = Stopwatch.StartNew();
         int probeCount = 0;
@@ -131,7 +131,7 @@ public static class VmafTuner
                 logger.LogInfo($"Phase 2 probe {probeCount}/~{expectedProbes}: CQ={cq}...");
 
                 var agg = await ProbeCqAsync(
-                    cfg, gpu, cpu, refClips, windows, samplesDir, vmafDir,
+                    cfg, pool, refClips, windows, samplesDir, vmafDir,
                     isHdr, hdrMetadata, format, vmafModelVersion,
                     cq, logger, ct);
                 probeSw.Stop();
@@ -182,18 +182,12 @@ public static class VmafTuner
     /// GPU/CPU gates.
     /// </summary>
     private static async Task<CqAggregate> ProbeCqAsync(
-        Config cfg, GpuGate gpu, CpuGate cpu, string[] refClips,
+        Config cfg, ResourcePool pool, string[] refClips,
         IReadOnlyList<SampleWindow> windows, string samplesDir, string vmafDir,
         bool isHdr, HdrMetadata? hdrMetadata, PipelineFormat format,
         string vmafModelVersion,
         int cq, IPipelineLogger logger, CancellationToken ct)
     {
-        // CpuGate intentionally unused here — both per-sample steps
-        // gate on the GPU now (NVENC slot for the encode, CUDA slot for
-        // libvmaf_cuda).  CpuGate stays free for Phase 1 ref extraction
-        // and for the FFV1-decode CPU work that feeds NVENC.
-        _ = cpu;
-
         int doneSamples = 0;
         var sampleTasks = Enumerable.Range(0, windows.Count).Select(async i =>
         {
@@ -202,14 +196,15 @@ public static class VmafTuner
             string encPath = Path.Combine(samplesDir, $"cq{cq}_{tag}.mkv");
             string vmafLog = Path.Combine(vmafDir, $"cq{cq}_{tag}.json");
 
-            // 1. GPU encode — competes for NVENC slot via GpuGate.
-            using (await gpu.AcquireAsync(nvenc: 1, nvdec: 0, cuda: 0, ct))
+            // 1. Sample encode — declares CPU (for FFV1 decode + orchestration)
+            //    and one NVENC slot.
+            using (await pool.AcquireAsync(cfg.SampleEncodeRequest, ct))
                 await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
 
-            // 2. VMAF — gates on the CUDA slot (libvmaf_cuda runs on the
-            //    general-purpose CUDA cores).  See Pipelines.RunVmafDirectAsync
-            //    for the HDR tonemap chain rationale.
-            using (await gpu.AcquireAsync(nvenc: 0, nvdec: 0, cuda: 1, ct))
+            // 2. VMAF — declares CPU (for FFV1+AV1 decode + zscale/tonemap on
+            //    HDR + format conversion) and one CUDA lane.  See
+            //    Pipelines.RunVmafDirectAsync for the HDR tonemap chain.
+            using (await pool.AcquireAsync(cfg.VmafRequest, ct))
                 await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
 
             var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);

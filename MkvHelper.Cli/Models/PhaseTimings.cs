@@ -2,10 +2,10 @@ namespace MkvHelper;
 
 /// <summary>
 /// Wall-clock breakdown for a single file's pipeline.  Lets you see directly
-/// where time is being spent and whether the resource gates produced the
-/// expected utilization profile.  Total ≠ sum of phases — phases overlap
-/// across files via the global <see cref="CpuGate"/> and <see cref="GpuGate"/>,
-/// so per-file totals reflect wall-clock with that file's gate-waits included.
+/// where time is being spent and whether the <see cref="ResourcePool"/>
+/// produced the expected utilization profile.  Total ≠ sum of phases —
+/// phases overlap across files via the pool, so per-file totals reflect
+/// wall-clock with that file's pool-waits included.
 /// </summary>
 public sealed class PhaseTimings
 {

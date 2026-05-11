@@ -80,21 +80,19 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             return 0;
         }
         AnsiConsole.MarkupLine(
-            $"[grey]Concurrency:[/] {cfg.MaxConcurrentFiles} files in flight, " +
-            $"{cfg.MaxConcurrentCpuFfmpegOps} CPU ffmpeg ops, " +
-            $"{cfg.NvencSlots} NVENC + {cfg.NvdecSlots} NVDEC + {cfg.CudaVmafSlots} CUDA-VMAF, " +
-            $"{cfg.FfmpegCpuThreads} threads/CPU op.");
+            $"[grey]Resource pool:[/] {cfg.CpuPool} CPU threads, " +
+            $"{cfg.NvencSlots} NVENC + {cfg.NvdecSlots} NVDEC + {cfg.CudaSlots} CUDA lanes.  " +
+            $"[grey]Files admit unbounded; pool gates per-op.[/]");
         if (settings.ForceRedo)
             AnsiConsole.MarkupLine("[yellow]--force-redo:[/] existing log.json files will be ignored and files re-processed.");
         AnsiConsole.WriteLine();
 
-        var gpu = new GpuGate(cfg.NvencSlots, cfg.NvdecSlots, cfg.CudaVmafSlots);
-        var cpu = new CpuGate(cfg.MaxConcurrentCpuFfmpegOps);
+        var pool = new ResourcePool(cfg.CpuPool, cfg.NvencSlots, cfg.NvdecSlots, cfg.CudaSlots);
         var overall = new OverallSummary { StartedUtc = DateTime.UtcNow, Config = cfg };
         var reporter = new StageReporter(discovered.Count);
 
         var workTask = ProcessAllFilesAsync(
-            cfg, gpu, cpu, discovered, settings.ForceRedo,
+            cfg, pool, discovered, settings.ForceRedo,
             overall, reporter, cts.Token);
 
         await AnsiConsole.Live(reporter.BuildRenderable())
@@ -141,15 +139,21 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
     // ----------------------------------------------------------------
 
     private static async Task ProcessAllFilesAsync(
-        Config cfg, GpuGate gpu, CpuGate cpu, List<DiscoveredVideo> files,
+        Config cfg, ResourcePool pool, List<DiscoveredVideo> files,
         bool forceRedo, OverallSummary overall, StageReporter reporter, CancellationToken ct)
     {
+        // Files admit unbounded — every file's tasks queue against the pool
+        // immediately on startup.  The pool's strict-FIFO ordering means the
+        // earlier files in the list naturally get resources first; later
+        // files opportunistically run their CPU-only phases (Detection,
+        // Phase 1, Verification) while earlier files hold the GPU pools
+        // for Phase 2 sample encodes and the final encode.
         await Parallel.ForEachAsync(
             files.Select((dv, i) => (dv, idx: i + 1)),
             new ParallelOptions
             {
                 CancellationToken = ct,
-                MaxDegreeOfParallelism = cfg.MaxConcurrentFiles,
+                MaxDegreeOfParallelism = -1,
             },
             async (item, fileCt) =>
             {
@@ -187,7 +191,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
                 try
                 {
-                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, discovered.Probe, fileCt, logger);
+                    var summary = await ProcessOneAsync(cfg, pool, file, discovered.Probe, fileCt, logger);
                     lock (overall) overall.Videos.Add(summary);
                     var (resultText, level) = SummariseResult(summary);
                     reporter.CompleteFile(slot, resultText, level);
@@ -232,9 +236,11 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         InputFolder = input,
         OutputFolder = output ?? "./out",
 
+        // Pool capacities — defaults are the right values for the target
+        // machine (20-core CPU + RTX 5080).  See Config docs.
         NvencSlots = 2,
         NvdecSlots = 2,
-        CudaVmafSlots = 2,
+        CudaSlots = 2,
 
         // CQ binary search range — full NVENC AV1 range is 0..63; we
         // narrow to the practically-useful window (see Config docs).
@@ -260,7 +266,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
     };
 
     private static async Task<VideoSummary> ProcessOneAsync(
-        Config cfg, GpuGate gpu, CpuGate cpu, string input, FfprobeRoot probe,
+        Config cfg, ResourcePool pool, string input, FfprobeRoot probe,
         CancellationToken ct, IPipelineLogger logger)
     {
         await Task.CompletedTask;
@@ -300,7 +306,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         var sw = Stopwatch.StartNew();
         ContentDetectionResult detection;
-        using (await cpu.AcquireAsync(ct))
+        using (await pool.AcquireAsync(cfg.DetectionRequest, ct))
         {
             detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct, logger);
         }
@@ -331,6 +337,15 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 for (int pi = 1; pi <= cfg.PreviewCount; pi++) previewTs.Add(pi * step);
             }
 
+            // IVTC and Deint previews for the same timestamp are independent —
+            // fire both concurrently and let the pool gate admission.
+            async Task RunPreview(string outPath, RestoreMode mode, double t)
+            {
+                using (await pool.AcquireAsync(cfg.PreviewRequest, ct))
+                    await PreviewGenerator.MakeLosslessPreviewAsync(
+                        cfg, input, outPath, mode, detection.DetectedParity, t, ct);
+            }
+
             foreach (var t in previewTs)
             {
                 ct.ThrowIfCancellationRequested();
@@ -338,10 +353,9 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 string ivtcPrev = Path.Combine(previewDir, $"preview_ivtc_{baseTag}.mkv");
                 string deintPrev = Path.Combine(previewDir, $"preview_deint_{baseTag}.mkv");
 
-                using (await cpu.AcquireAsync(ct))
-                    await PreviewGenerator.MakeLosslessPreviewAsync(cfg, input, ivtcPrev, RestoreMode.Ivtc, detection.DetectedParity, t, ct);
-                using (await cpu.AcquireAsync(ct))
-                    await PreviewGenerator.MakeLosslessPreviewAsync(cfg, input, deintPrev, RestoreMode.Deinterlace, detection.DetectedParity, t, ct);
+                await Task.WhenAll(
+                    RunPreview(ivtcPrev, RestoreMode.Ivtc, t),
+                    RunPreview(deintPrev, RestoreMode.Deinterlace, t));
 
                 restore.Previews.Add(new PreviewArtifact { TimestampSeconds = t, IvtcPath = ivtcPrev, DeintPath = deintPrev });
             }
@@ -352,7 +366,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             ? "VMAF execution: GPU (libvmaf_cuda); HDR tonemap chain on CPU"
             : "VMAF execution: GPU (libvmaf_cuda)");
 
-        var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore,
+        var tuning = await VmafTuner.TuneAsync(cfg, pool, input, outDir, restore,
             isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, ct, logger);
         timings.TuningPhase1 = tuning.Phase1Elapsed;
         timings.TuningPhase2 = tuning.Phase2Elapsed;
@@ -368,23 +382,18 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         int finalCq = tuning.Selection.SelectedCq;
         var finalOut = Path.Combine(outDir, $"{id}_av1_cq{finalCq}{cfg.OutputExtension}");
         sw.Restart();
-        using (await cpu.AcquireAsync(ct))
-        {
-            await FinalEncoder.EncodeAsync(cfg, gpu, input, finalOut, restore, finalCq, pipelineFormat, ct, logger);
-        }
+        await FinalEncoder.EncodeAsync(cfg, pool, input, finalOut, restore, finalCq, pipelineFormat, ct, logger);
         timings.FinalEncode = sw.Elapsed;
         logger.LogInfo($"Final encode written: {finalOut}");
 
-        SizeGuardOutcome sizeGuard;
-        using (await cpu.AcquireAsync(ct))
-        {
-            sizeGuard = await SizeGuard.MaybeFallbackAsync(cfg, input, finalOut, restore, logger, ct);
-        }
+        // SizeGuard does the (instant) size check inline; it acquires a small
+        // CPU slice from the pool only if the remux fallback actually fires.
+        var sizeGuard = await SizeGuard.MaybeFallbackAsync(cfg, pool, input, finalOut, restore, logger, ct);
         finalOut = sizeGuard.OutputPath;
 
         sw.Restart();
         OutputVerificationResult verification;
-        using (await cpu.AcquireAsync(ct))
+        using (await pool.AcquireAsync(cfg.VerificationRequest, ct))
         {
             verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, ct, logger);
         }

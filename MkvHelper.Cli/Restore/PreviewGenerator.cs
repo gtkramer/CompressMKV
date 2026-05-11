@@ -17,7 +17,7 @@ public static class PreviewGenerator
         var args = new List<string>
         {
             "-y","-hide_banner","-loglevel","error",
-            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
+            "-threads", cfg.PreviewThreads.ToString(CultureInfo.InvariantCulture),
             "-ss", startSeconds.ToString("F3", CultureInfo.InvariantCulture),
             "-i", input,
             "-t", cfg.PreviewDurationSeconds.ToString("F3", CultureInfo.InvariantCulture),

@@ -19,10 +19,11 @@ public static class Pipelines
     {
         if (File.Exists(output)) File.Delete(output);
 
+        string threads = cfg.RefExtractThreads.ToString(CultureInfo.InvariantCulture);
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", "error",
-            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
+            "-threads", threads,
             "-ss", w.StartSeconds.ToString("F3", CultureInfo.InvariantCulture),
             "-i", input,
             "-t", w.LengthSeconds.ToString("F3", CultureInfo.InvariantCulture),
@@ -40,7 +41,7 @@ public static class Pipelines
             "-c:v", "ffv1",
             "-level", "3",
             "-slicecrc", "1",
-            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
+            "-threads", threads,
             output
         ]);
 
@@ -62,7 +63,7 @@ public static class Pipelines
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", "error",
-            "-threads", cfg.FfmpegGpuThreads.ToString(CultureInfo.InvariantCulture),
+            "-threads", cfg.SampleEncodeThreads.ToString(CultureInfo.InvariantCulture),
             "-i", refInput,
             "-map", "0:v:0", "-an",
             "-c:v", "av1_nvenc",
@@ -96,9 +97,8 @@ public static class Pipelines
     //  (tonemap_cuda, tonemap_opencl, libplacebo) all failed to compose
     //  with libvmaf_cuda in this version of FFmpeg — see the Containerfile
     //  header.  Only libvmaf itself moves to GPU on HDR runs; the colour-
-    //  space conversion cost stays on CPU.  Gating on the CUDA slot rather
-    //  than the CpuGate keeps CpuGate slots free for the FFV1 decode that
-    //  feeds NVENC — the actual hot path for end-to-end throughput.
+    //  space conversion cost stays on CPU and is accounted for via
+    //  cfg.VmafThreads (filter_threads is pinned to match).
     //
     //  Bit depth: for SDR, compare at matching bit depth (yuv420p for
     //  8-bit, yuv420p10le for 10-bit) so an 8-bit reference's zero-padded
@@ -157,10 +157,15 @@ public static class Pipelines
             refChain, encChain,
             $"[enc_cuda][ref_cuda]libvmaf_cuda={vmafOpts}");
 
+        // -threads sizes the decoder thread pool (FFV1 + AV1); -filter_threads
+        // sizes the filtergraph engine running zscale/tonemap/format/hwupload.
+        // Total CPU consumption stays inside cfg.VmafThreads, which is what
+        // the ResourcePool reserved.
         var args = new[]
         {
             "-hide_banner", "-loglevel", "error",
-            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
+            "-threads", cfg.VmafFfmpegThreads.ToString(CultureInfo.InvariantCulture),
+            "-filter_threads", cfg.VmafFilterThreads.ToString(CultureInfo.InvariantCulture),
             "-i", refInput,
             "-i", encInput,
             "-lavfi", filter,
@@ -208,7 +213,7 @@ public static class Pipelines
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", loglevel,
-            "-threads", cfg.FfmpegCpuThreads.ToString(CultureInfo.InvariantCulture),
+            "-threads", cfg.FinalEncodeThreads.ToString(CultureInfo.InvariantCulture),
             "-hwaccel", "cuda", "-hwaccel_output_format", hwOutFormat,
             "-i", input,
         };

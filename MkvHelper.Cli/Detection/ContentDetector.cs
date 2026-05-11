@@ -120,7 +120,7 @@ public static partial class ContentDetector
         var argList = new List<string>
         {
             "-hide_banner", "-loglevel", "info", "-nostats",
-            "-threads", cfg.FfmpegCpuThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "-threads", cfg.DetectionThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "-i", input,
             "-an", "-sn", "-dn",
             "-vf", "idet,metadata=mode=print:file=-:direct=1",

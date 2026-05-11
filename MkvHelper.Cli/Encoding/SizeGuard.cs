@@ -34,7 +34,7 @@ public sealed class SizeGuardOutcome
 public static class SizeGuard
 {
     public static async Task<SizeGuardOutcome> MaybeFallbackAsync(
-        Config cfg, string input, string encodedOutput, RestoreDecision restore,
+        Config cfg, ResourcePool pool, string input, string encodedOutput, RestoreDecision restore,
         IPipelineLogger logger, CancellationToken ct)
     {
         long inputBytes = new FileInfo(input).Length;
@@ -90,7 +90,10 @@ public static class SizeGuard
 
         try
         {
-            await RemuxPassthroughAsync(cfg, input, passthroughOut, ct);
+            // Pool gate only here: file-size comparison above is instant,
+            // but the remux (-c copy) holds a CPU slice while ffmpeg runs.
+            using (await pool.AcquireAsync(cfg.SizeGuardRemuxRequest, ct))
+                await RemuxPassthroughAsync(cfg, input, passthroughOut, ct);
         }
         catch (Exception ex)
         {

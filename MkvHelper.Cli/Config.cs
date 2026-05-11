@@ -12,65 +12,87 @@ public sealed class Config
     public string VmafStandardModelVersion { get; set; } = "vmaf_v0.6.1";
     public string Vmaf4kModelVersion { get; set; } = "vmaf_4k_v0.6.1";
 
+    // --- Resource pool capacities ---
+    //
+    // Every pipeline operation declares its cost (CPU threads + GPU engines/lanes)
+    // via a ResourceRequest; ResourcePool gates admission across all files
+    // against the totals below.  No separate cap on "files in flight" — the
+    // pool admits as many ops in parallel as the resources allow.
+    //
+    // CPU thread counts on each ffmpeg call are pinned to match the request
+    // they were admitted with, so the pool's accounting is exact rather than
+    // an estimate.  See the per-op *Threads properties below.
+
+    /// <summary>Total CPU threads available for pipeline ffmpeg ops.  Defaults
+    /// to <see cref="Environment.ProcessorCount"/>.</summary>
+    public int CpuPool { get; set; } = Environment.ProcessorCount;
+
+    /// <summary>NVENC engine count.  RTX 5080 = 2.  Final encodes hold one for
+    /// the duration of the file; Phase 2 sample encodes hold one for ~5s each.</summary>
     public int NvencSlots { get; set; } = 2;
+
+    /// <summary>NVDEC engine count.  RTX 5080 = 2.  Used by the final encode
+    /// pipeline; detection and verification sw-decode intentionally.</summary>
     public int NvdecSlots { get; set; } = 2;
 
     /// <summary>
-    /// In-flight libvmaf_cuda jobs allowed at once.  CUDA-VMAF runs on the
-    /// general-purpose CUDA cores rather than the dedicated NVENC/NVDEC
-    /// engines, so it has its own gate.  Two slots lets us keep both NVENC
-    /// engines busy with sample encodes while VMAF measures the previous
-    /// pair — without flooding the GPU with parallel VMAF processes that
-    /// would crowd out NVENC's CUDA-based AQ helpers and consume too much
-    /// VRAM.
+    /// libvmaf_cuda compute lanes.  CUDA-compute is shared between libvmaf_cuda
+    /// (the only generic-CUDA-compute filter we use) and NVENC's AQ helpers.
+    /// Two lanes lets us keep both NVENC engines busy with sample encodes while
+    /// VMAF measures the previous pair — without flooding the GPU with parallel
+    /// libvmaf_cuda processes that would crowd out NVENC's AQ kernels and
+    /// consume too much VRAM.
     /// </summary>
-    public int CudaVmafSlots { get; set; } = 2;
+    public int CudaSlots { get; set; } = 2;
 
-    // --- Concurrency / scheduling ---
+    // --- Per-operation CPU thread counts ---
     //
-    // The pipeline has three resource pools that need to be balanced so neither
-    // the CPU nor the GPU sits idle and neither ends up thrashing:
-    //
-    //   1. Cross-file parallelism (Parallel.ForEachAsync over input files)
-    //   2. CPU-heavy ffmpeg ops (Phase 1 ref extraction + Phase 2 VMAF +
-    //      detection + verification + final-encode restoration)
-    //   3. GPU NVENC sample encodes (gated separately via GpuGate)
-    //
-    // Defaults are computed from Environment.ProcessorCount so the same config
-    // is reasonable on different machines.  All three values can be overridden
-    // explicitly if you want to tune for a specific workload.
+    // Each operation declares how many CPU threads it consumes; the same
+    // number is pinned on ffmpeg via -threads / -filter_threads so the
+    // declared cost matches actual consumption.  Resource pool accounting
+    // is therefore exact, not estimated.
+
+    /// <summary>Threads for the full-file idet pass (Detection + Verification).
+    /// CPU sw-decode + filter + idet — splits cleanly across cores.</summary>
+    public int DetectionThreads { get; set; } = 4;
+
+    /// <summary>Threads for one lossless x264 preview encode.</summary>
+    public int PreviewThreads { get; set; } = 4;
+
+    /// <summary>Threads for one FFV1 reference-clip extraction (Phase 1).
+    /// FFV1 encode is slice-parallel — more threads = faster, up to ~6.</summary>
+    public int RefExtractThreads { get; set; } = 4;
+
+    /// <summary>Threads for one Phase 2 sample encode from FFV1.  NVENC does
+    /// the encode; CPU handles FFV1 decode + I/O.  Low: 2 is enough.</summary>
+    public int SampleEncodeThreads { get; set; } = 2;
 
     /// <summary>
-    /// Maximum number of input files in flight at once.  Matches the GPU's
-    /// NVENC engine count by default — going higher just queues files at the
-    /// GpuGate while burning CPU on Phase 1 / VMAF for files that can't yet
-    /// encode.  The RTX 5080 has 2 NVENC engines.
+    /// CPU threads for one Phase 2 VMAF measurement.  The process runs two
+    /// CPU decoders (FFV1 ref + AV1 sample) plus the filtergraph (zscale /
+    /// tonemap on HDR, format conversion, hwupload_cuda); libvmaf_cuda itself
+    /// is GPU-bound and consumes no CPU.  6 covers all of those without
+    /// oversubscribing.
     /// </summary>
-    public int MaxConcurrentFiles { get; set; } = 2;
+    public int VmafThreads { get; set; } = 6;
 
     /// <summary>
-    /// Maximum CPU-heavy ffmpeg processes running concurrently across ALL files.
-    /// Single global semaphore — when one file is in Phase 1 and another is
-    /// in Phase 2, the pool self-balances.  Defaults to <c>cores / 5</c>
-    /// (clamped to 2..8) so a 20-core CPU runs 4 concurrent CPU ffmpeg ops.
+    /// `-threads` value passed to ffmpeg for VMAF ops.  Sized so a single
+    /// VMAF process's two decoders plus filtergraph fit inside
+    /// <see cref="VmafThreads"/> total.  Decoders use this directly; filter
+    /// threads come from <see cref="VmafFilterThreads"/>.
     /// </summary>
-    public int MaxConcurrentCpuFfmpegOps { get; set; } =
-        Math.Clamp(Environment.ProcessorCount / 5, 2, 8);
+    public int VmafFfmpegThreads { get; set; } = 2;
 
-    /// <summary>
-    /// `-threads N` setting for CPU-heavy ffmpeg invocations (Phase 1 ref
-    /// extraction, detection, verification, final-encode restore).  Sized so
-    /// <c>MaxConcurrentCpuFfmpegOps × FfmpegCpuThreads ≈ ProcessorCount</c>.
-    /// </summary>
-    public int FfmpegCpuThreads { get; set; } =
-        Math.Clamp(Environment.ProcessorCount / 5, 2, 6);
+    /// <summary>`-filter_threads` value for VMAF ops.  Bounds the filtergraph's
+    /// per-frame parallelism (zscale + tonemap + format + hwupload).</summary>
+    public int VmafFilterThreads { get; set; } = 2;
 
-    /// <summary>
-    /// `-threads N` setting for GPU-bound ffmpeg invocations (Phase 2 sample
-    /// encodes from FFV1, where NVENC does the heavy work and ffmpeg just
-    /// handles I/O).
-    /// </summary>
-    public int FfmpegGpuThreads { get; set; } = 2;
+    /// <summary>Threads for the final full-file encode.  Two cases share this
+    /// setting: Progressive (NVDEC→NVENC pure-GPU, minimal CPU) and IVTC/
+    /// Deinterlace (CPU filter in the middle).  Worst-case sizing matches the
+    /// IVTC/Deint case so the pool's reservation is always sufficient.</summary>
+    public int FinalEncodeThreads { get; set; } = 4;
 
     /// <summary>
     /// `n_subsample=N` setting for libvmaf.  N=1 measures every frame (most
@@ -81,6 +103,17 @@ public sealed class Config
     /// imperceptible quality) outweighs the speed gain from subsampling.
     /// </summary>
     public int LibvmafSubsample { get; set; } = 1;
+
+    // --- ResourceRequest factories (one per operation) ---
+
+    public ResourceRequest DetectionRequest    => new(Cpu: DetectionThreads);
+    public ResourceRequest VerificationRequest => new(Cpu: DetectionThreads);
+    public ResourceRequest PreviewRequest      => new(Cpu: PreviewThreads);
+    public ResourceRequest RefExtractRequest   => new(Cpu: RefExtractThreads);
+    public ResourceRequest SampleEncodeRequest => new(Cpu: SampleEncodeThreads, Nvenc: 1);
+    public ResourceRequest VmafRequest         => new(Cpu: VmafThreads, Cuda: 1);
+    public ResourceRequest FinalEncodeRequest  => new(Cpu: FinalEncodeThreads, Nvenc: 1, Nvdec: 1);
+    public ResourceRequest SizeGuardRemuxRequest => new(Cpu: 1);
 
     // -- CQ search range --
     //
