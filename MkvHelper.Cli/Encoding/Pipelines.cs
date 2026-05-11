@@ -44,7 +44,7 @@ public static class Pipelines
             output
         ]);
 
-        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args.ToArray(), ct);
+        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"reference clip extraction failed: {err}");
     }
 
@@ -79,7 +79,7 @@ public static class Pipelines
             output
         };
 
-        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args.ToArray(), ct);
+        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"sample encode failed: {err}");
     }
 
@@ -180,7 +180,7 @@ public static class Pipelines
             "-f", "null", "-"
         };
 
-        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args, ct);
+        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args, ct);
         if (code != 0) throw new InvalidOperationException($"vmaf failed: {err}");
     }
 
@@ -265,7 +265,7 @@ public static class Pipelines
             output
         ]);
 
-        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args.ToArray(), ct);
+        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"final encode failed: {err}");
 
         if (isIvtc) SurfaceFieldmatchWarnings(err, logger);

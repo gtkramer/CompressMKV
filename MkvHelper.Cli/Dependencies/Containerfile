@@ -1,0 +1,162 @@
+# syntax=docker/dockerfile:1
+#
+# mkvhelper one-stop dependency container.
+#
+# Bundles every external tool mkvhelper shells out to, built from source
+# against pinned upstream releases:
+#
+#   - libvmaf (with CUDA)               — the libvmaf_cuda filter, used by
+#                                         the GPU VMAF tuning path.
+#   - FFmpeg (CUDA + full codec set)    — NVENC/NVDEC, libvmaf_cuda,
+#                                         software AV1 (libaom + libdav1d
+#                                         + libsvtav1), x264/x265/vpx,
+#                                         libnpp, zscale, and the usual
+#                                         audio/subtitle codecs.
+#   - MKVToolNix (mkvextract, mkvmerge) — used by `mkvhelper split` and
+#                                         `mkvhelper print-chapters`.
+#
+# All upstream versions are pinned via build args.  Bump VMAF_TAG /
+# FFMPEG_TAG / NV_CODEC_TAG together when refreshing.
+#
+# Base image is the NVIDIA CUDA devel image because its toolchain ships
+# nvcc + the CUDA dev headers/libs at the standard `/usr/local/cuda`
+# location.  CPATH/LIBRARY_PATH are exported below so downstream
+# `./configure` and meson invocations auto-discover CUDA headers + libs
+# without needing per-call --extra-cflags/--extra-ldflags.
+
+FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ARG VMAF_TAG=v3.1.0
+ARG FFMPEG_TAG=n8.1.1
+ARG NV_CODEC_TAG=n13.0.19.0
+
+# NVCC target: single-arch, PTX-only.
+#
+# PTX from compute_75 (Turing) is forward-compatible and JITs to native
+# code on any GPU sm_75+ (Turing → Blackwell → future) at first kernel
+# launch.  Single-arch is mandatory because FFmpeg's configure check
+# runs `nvcc … -ptx` which is incompatible with multi-arch flags.  The
+# JIT is one-time per container start and gets cached in the GPU
+# driver's compute cache afterwards.
+ARG NVCC_FLAGS="-gencode arch=compute_75,code=compute_75 -O2"
+
+# Make CUDA headers + libs auto-discoverable by gcc/ld so downstream
+# build systems don't have to pass --extra-cflags=-I/usr/local/cuda/include
+# etc.  The nvidia/cuda devel image populates these paths but doesn't
+# wire them into the toolchain's default search lists.
+ENV CPATH=/usr/local/cuda/include
+ENV LIBRARY_PATH=/usr/local/cuda/lib64
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV PATH=/usr/local/cuda/bin:${PATH}
+
+# Combined apt install: build tooling, FFmpeg codec deps, MKVToolNix.
+# `--no-install-recommends` keeps the image lean.
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        # Build tooling
+        build-essential \
+        ca-certificates \
+        git \
+        meson \
+        nasm \
+        ninja-build \
+        pkg-config \
+        python3 \
+        python3-pip \
+        python3-venv \
+        wget \
+        xxd \
+        # FFmpeg codec / format dev libs
+        libaom-dev \
+        libass-dev \
+        libdav1d-dev \
+        libfreetype6-dev \
+        libfribidi-dev \
+        libmp3lame-dev \
+        libopus-dev \
+        libsvtav1-dev \
+        libtheora-dev \
+        libvorbis-dev \
+        libvpx-dev \
+        libwebp-dev \
+        libx264-dev \
+        libx265-dev \
+        libzimg-dev \
+        # MKVToolNix CLI tools (mkvextract, mkvmerge, mkvinfo, ...)
+        mkvtoolnix \
+    && rm -rf /var/lib/apt/lists/*
+
+# nv-codec-headers — required for FFmpeg's NVENC/NVDEC support.  Pinned.
+RUN cd /tmp \
+    && wget -q "https://github.com/FFmpeg/nv-codec-headers/archive/${NV_CODEC_TAG}.tar.gz" \
+    && tar xf "${NV_CODEC_TAG}.tar.gz" \
+    && cd nv-codec-headers-* \
+    && make install \
+    && cd /tmp && rm -rf nv-codec-headers-* "${NV_CODEC_TAG}.tar.gz"
+
+# libvmaf with CUDA support, pinned.  meson auto-detects CUDA via the
+# CPATH/LIBRARY_PATH env vars exported above.
+RUN cd /tmp \
+    && git clone --depth=1 --branch="${VMAF_TAG}" https://github.com/Netflix/vmaf.git \
+    && cd vmaf/libvmaf \
+    && meson setup build \
+        --buildtype=release \
+        -Denable_cuda=true \
+        -Denable_tests=false \
+        -Denable_docs=false \
+    && meson install -C build \
+    && ldconfig \
+    && cd /tmp && rm -rf vmaf
+
+# FFmpeg with the full codec set, pinned.
+#
+# --enable-gpl + --enable-nonfree pulls in x264, x265, libnpp, etc.  The
+# resulting binary is non-redistributable, which is fine for a per-user
+# build that never leaves the user's machine.
+RUN cd /tmp \
+    && git clone --depth=1 --branch="${FFMPEG_TAG}" https://github.com/FFmpeg/FFmpeg.git \
+    && cd FFmpeg \
+    && ./configure \
+        --prefix=/usr/local \
+        --enable-gpl \
+        --enable-nonfree \
+        --enable-version3 \
+        --enable-shared \
+        --disable-static \
+        --disable-doc \
+        --disable-debug \
+        --disable-stripping \
+        # NVIDIA stack
+        --enable-cuda \
+        --enable-cuda-nvcc \
+        --enable-cuvid \
+        --enable-nvenc \
+        --enable-nvdec \
+        --enable-ffnvcodec \
+        --enable-libnpp \
+        # VMAF (CUDA-enabled because libvmaf was built with -Denable_cuda)
+        --enable-libvmaf \
+        # AV1 software (decode + encode), to round out the hardware path
+        --enable-libdav1d \
+        --enable-libaom \
+        --enable-libsvtav1 \
+        # Other software video codecs
+        --enable-libx264 \
+        --enable-libx265 \
+        --enable-libvpx \
+        # Audio
+        --enable-libopus \
+        --enable-libvorbis \
+        --enable-libmp3lame \
+        --enable-libtheora \
+        # Subtitles + image + colour-space
+        --enable-libass \
+        --enable-libwebp \
+        --enable-libzimg \
+        --nvccflags="${NVCC_FLAGS}" \
+    && make -j"$(nproc)" \
+    && make install \
+    && ldconfig \
+    && cd /tmp && rm -rf FFmpeg
+
+WORKDIR /work

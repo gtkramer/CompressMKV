@@ -54,6 +54,11 @@ public static class TestVideoFixture
     [OneTimeSetUp]
     public static async Task BuildClips()
     {
+        // Route ContainerTools.Run* through the system ffmpeg/ffprobe
+        // for the test run.  Production code goes through podman; the
+        // integration tests don't need that overhead.
+        ContainerTools.ConfigureForTesting();
+
         TempDir = Path.Combine(Path.GetTempPath(), "mkvhelper-tests-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(TempDir);
 
@@ -107,13 +112,13 @@ public static class TestVideoFixture
         catch { /* best-effort cleanup */ }
     }
 
-    /// <summary>Builds a Config pointing at the system ffmpeg/ffprobe with hwaccel
-    /// disabled (CI environments don't have NVDEC).  Production thresholds — tests
-    /// must produce clips that satisfy them.</summary>
+    /// <summary>Builds a Config with hwaccel disabled (CI environments don't
+    /// have NVDEC).  Production thresholds — tests must produce clips that
+    /// satisfy them.  ffmpeg/ffprobe routing comes from
+    /// <see cref="ContainerTools"/>, configured in test-bypass mode by
+    /// <see cref="BuildClips"/>.</summary>
     public static Config CreateTestConfig() => new()
     {
-        Ffmpeg = Ffmpeg,
-        Ffprobe = Ffprobe,
         UseHwaccelForDetection = false,
     };
 

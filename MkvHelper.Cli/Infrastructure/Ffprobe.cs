@@ -11,7 +11,7 @@ public static class Ffprobe
     public static async Task<FfprobeRoot> RunAsync(Config cfg, string input, CancellationToken ct)
     {
         var args = new[] { "-v","error","-print_format","json","-show_format","-show_streams", input };
-        var (code, stdout, stderr) = await FfmpegRunner.RunFfprobeAsync(args, ct);
+        var (code, stdout, stderr) = await ContainerTools.RunFfprobeAsync(args, ct);
         if (code != 0) throw new InvalidOperationException($"ffprobe failed: {stderr}");
 
         var opt = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };

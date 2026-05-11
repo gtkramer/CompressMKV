@@ -24,7 +24,7 @@ public sealed class DependencyBuildCommand : AsyncCommand<DependencyBuildSetting
 
         try
         {
-            var state = await VmafBuilder.BuildAsync(
+            var state = await ContainerBuilder.BuildAsync(
                 tag: settings.Tag,
                 onProgress: line => AnsiConsole.MarkupLine($"[grey]›[/] {Markup.Escape(line)}"),
                 ct: cts.Token);
@@ -71,7 +71,7 @@ public sealed class DependencyUpdateCommand : AsyncCommand<DependencyUpdateSetti
             }
 
             AnsiConsole.MarkupLine($"[yellow]Building {Markup.Escape(latest.Tag)}...[/]");
-            var newState = await VmafBuilder.BuildAsync(
+            var newState = await ContainerBuilder.BuildAsync(
                 tag: latest.Tag,
                 onProgress: line => AnsiConsole.MarkupLine($"[grey]›[/] {Markup.Escape(line)}"),
                 ct: cts.Token);
@@ -106,8 +106,7 @@ public sealed class DependencyRemoveCommand : AsyncCommand<DependencyRemoveSetti
 
         AnsiConsole.MarkupLine(
             "This will remove all mkvhelper build artifacts: every container " +
-            $"image we built, source clones under {Markup.Escape(ArtifactPaths.VmafSourceRoot)}, " +
-            "and the build-state file.");
+            "image we built, build logs, and the state file.");
 
         if (!settings.Yes)
         {
@@ -120,7 +119,7 @@ public sealed class DependencyRemoveCommand : AsyncCommand<DependencyRemoveSetti
 
         try
         {
-            await VmafBuilder.RemoveAllAsync(
+            await ContainerBuilder.RemoveAllAsync(
                 onProgress: line => AnsiConsole.MarkupLine($"[grey]›[/] {Markup.Escape(line)}"),
                 ct: cts.Token);
             return 0;

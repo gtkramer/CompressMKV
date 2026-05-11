@@ -83,12 +83,18 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
         string inputFile = settings.InputFile!;
         string seriesName = settings.SeriesName!;
 
-        if (!await MkvTools.IsMkvextractAvailableAsync(cts.Token) ||
-            !await MkvTools.IsMkvmergeAvailableAsync(cts.Token))
+        // Ensure the dependency container is ready and mount the directory
+        // that holds the input + the output episodes.  mkvextract/mkvmerge
+        // run inside the container via ContainerTools.
+        string mountDir = Path.GetDirectoryName(Path.GetFullPath(inputFile))
+            ?? throw new InvalidOperationException($"Input file has no directory: {inputFile}");
+        try
         {
-            AnsiConsole.MarkupLine(
-                "[red]Missing dependency:[/] this command requires `mkvextract` and `mkvmerge` " +
-                "(MKVToolNix) on PATH.  On Arch Linux: `sudo pacman -S mkvtoolnix-cli`.");
+            await ContainerBuilder.EnsureReadyAsync(mounts: [mountDir], ct: cts.Token);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Container setup failed:[/] {Markup.Escape(ex.Message)}");
             return 1;
         }
 

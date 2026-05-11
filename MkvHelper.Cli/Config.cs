@@ -4,8 +4,6 @@ public sealed class Config
 {
     public string InputFolder { get; set; } = "";
     public string OutputFolder { get; set; } = "";
-    public string Ffmpeg { get; set; } = "ffmpeg";
-    public string Ffprobe { get; set; } = "ffprobe";
 
     // --- VMAF model selection ---
     // libvmaf has the standard models compiled in; no file-on-disk required.

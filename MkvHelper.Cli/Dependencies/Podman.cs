@@ -64,22 +64,27 @@ public static class Podman
     /// Build an image from a Dockerfile in <paramref name="contextDir"/>.
     /// Streams build output to <paramref name="onLine"/> so callers can show
     /// progress.  Build logs are simultaneously appended to a file.
+    /// Optional build args are passed through as <c>--build-arg KEY=VALUE</c>.
     /// </summary>
     public static async Task BuildAsync(
         string contextDir, string dockerfile, string imageTag,
-        string buildLogPath, Action<string> onLine, CancellationToken ct)
+        string buildLogPath, Action<string> onLine, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? buildArgs = null)
     {
         await using var logFile = new StreamWriter(buildLogPath, append: false);
 
-        var args = new[]
+        var args = new List<string> { "build", "-f", dockerfile, "-t", imageTag };
+        if (buildArgs is not null)
         {
-            "build",
-            "-f", dockerfile,
-            "-t", imageTag,
-            contextDir
-        };
+            foreach (var (k, v) in buildArgs)
+            {
+                args.Add("--build-arg");
+                args.Add($"{k}={v}");
+            }
+        }
+        args.Add(contextDir);
 
-        var (code, stderr) = await Proc.RunStreamingAsync(Exe, args, line =>
+        var (code, stderr) = await Proc.RunStreamingAsync(Exe, args.ToArray(), line =>
         {
             logFile.WriteLine(line);
             onLine(line);

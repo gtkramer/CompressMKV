@@ -17,7 +17,10 @@
       "Read(//home/george/Projects/C#/MKVHelper/**)",
       "Bash(git mv *)",
       "Bash(ls -la /home/george/.local/share/mkvhelper/build-logs/)",
-      "Read(//home/george/.local/share/mkvhelper/build-logs/**)"
+      "Read(//home/george/.local/share/mkvhelper/build-logs/**)",
+      "Bash(curl -s \"https://api.github.com/repos/FFmpeg/FFmpeg/releases?per_page=5\")",
+      "Bash(curl -s \"https://api.github.com/repos/FFmpeg/nv-codec-headers/tags?per_page=5\")",
+      "Bash(curl -s \"https://api.github.com/repos/Netflix/vmaf/releases/latest\")"
     ]
   }
 }

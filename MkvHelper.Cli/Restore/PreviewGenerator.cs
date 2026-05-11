@@ -40,7 +40,7 @@ public static class PreviewGenerator
             output
         });
 
-        var (code, _, err) = await FfmpegRunner.RunFfmpegAsync(args.ToArray(), ct);
+        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"preview encode failed: {err}");
     }
 }

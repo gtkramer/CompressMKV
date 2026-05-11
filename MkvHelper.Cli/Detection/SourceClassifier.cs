@@ -35,7 +35,7 @@ public static class SourceClassifier
             input
         };
 
-        var (code, stdout, _) = await FfmpegRunner.RunFfprobeAsync(args, ct);
+        var (code, stdout, _) = await ContainerTools.RunFfprobeAsync(args, ct);
         if (code != 0 || string.IsNullOrEmpty(stdout)) return null;
 
         try

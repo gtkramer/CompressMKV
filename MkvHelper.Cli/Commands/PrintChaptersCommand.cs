@@ -41,11 +41,17 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-        if (!await MkvTools.IsMkvextractAvailableAsync(cts.Token))
+        // Ensure the dependency container is ready and mount the directory
+        // holding the input file.  mkvextract runs inside the container.
+        string mountDir = Path.GetDirectoryName(Path.GetFullPath(settings.InputFile!))
+            ?? throw new InvalidOperationException($"Input file has no directory: {settings.InputFile}");
+        try
         {
-            AnsiConsole.MarkupLine(
-                "[red]Missing dependency:[/] this command requires `mkvextract` (MKVToolNix) on PATH.  " +
-                "On Arch Linux: `sudo pacman -S mkvtoolnix-cli`.");
+            await ContainerBuilder.EnsureReadyAsync(mounts: [mountDir], ct: cts.Token);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Container setup failed:[/] {Markup.Escape(ex.Message)}");
             return 1;
         }
 

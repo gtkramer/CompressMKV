@@ -28,6 +28,12 @@ ones with real video content (skipping audio-only files, embedded cover
 art, single-image files).  Output is always written as `.mkv` since
 that's the right home for AV1 + multi-track audio + subtitle pass-through.
 
+All three subcommands run their external tools (`ffmpeg`, `ffprobe`,
+`mkvextract`, `mkvmerge`) inside a single bundled container — see
+[Bundled dependency container](#bundled-dependency-container) below.  The
+host doesn't need any of these installed separately; just `podman` and
+the NVIDIA Container Toolkit.
+
 ## Repository layout
 
 ```
@@ -39,7 +45,7 @@ MkvHelper/
 ├── MkvHelper.Cli/               Main app (executable: `mkvhelper`)
 │   ├── Commands/                Spectre.Console.Cli subcommand classes
 │   ├── Chapters/                MKV chapter XML models + mkvtoolnix wrapper
-│   ├── Dependencies/            Container build orchestration (podman, git, GitHub)
+│   ├── Dependencies/            Container build orchestration + Containerfile
 │   ├── Detection/               §7.2.2 classification (idet → 5 categories)
 │   ├── Restore/                 §7.2.3 action selection + filter chains
 │   ├── Encoding/                ffmpeg pipeline + AV1 NVENC encode + size guard
@@ -67,7 +73,7 @@ runs to green with no external test data.
 
 ## First-run setup
 
-The GPU-accelerated VMAF pipeline (`compress`) runs inside a Podman container
+Every subcommand routes its external tooling through a Podman container
 that needs the host's NVIDIA driver passed through.  Once per machine:
 
 ```bash
@@ -81,11 +87,11 @@ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 
 # 3. Sanity check — should print `nvidia-smi` output from inside a container.
 podman run --rm --device nvidia.com/gpu=all \
-    docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+    docker.io/nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi
 
-# 4. (Optional) Pre-warm the bundled ffmpeg+libvmaf_cuda container.  Takes
-#    10–20 minutes the first time.  If you skip this, `mkvhelper compress`
-#    will run it automatically on first invocation.
+# 4. (Optional) Pre-warm the bundled container.  Takes 10–20 minutes
+#    the first time.  If you skip this, the first `mkvhelper` run that
+#    needs the container will build it automatically.
 mkvhelper dependency build
 ```
 
@@ -108,14 +114,6 @@ the autodetect failing because `fuse-overlayfs` isn't installed and the
 kernel won't let it use overlay-over-ext4 in a user namespace.  Install
 `fuse-overlayfs` (`sudo pacman -S fuse-overlayfs`) and re-run.
 
-If you can't or don't want to run a container, pass `--no-container` to any
-`compress` invocation — VMAF will fall back to the system libvmaf on CPU
-(much slower; functionally identical otherwise).
-
-The `split` and `print-chapters` subcommands shell out to MKVToolNix
-(`mkvextract`, `mkvmerge`) and have no container dependency.  On Arch
-Linux: `sudo pacman -S mkvtoolnix-cli`.
-
 ## Run
 
 ```bash
@@ -132,13 +130,13 @@ mkvhelper split --input season.mkv --series-name "My Show" --season-num 1
 # Inspect chapters before splitting
 mkvhelper print-chapters --input season.mkv --episode-chapter-threshold 600
 
-# Dependency management (CUDA-enabled ffmpeg + libvmaf_cuda container)
-mkvhelper dependency build       # build the runtime container from Netflix/vmaf
-mkvhelper dependency update      # rebuild only if Netflix tagged a newer release
-mkvhelper dependency remove      # delete every built image + clone + state file
+# Dependency management (the bundled container)
+mkvhelper dependency build       # build the container from the embedded Containerfile
+mkvhelper dependency update      # rebuild only if Netflix tagged a newer VMAF release
+mkvhelper dependency remove      # delete every built image and the state file
 ```
 
-On first `compress` run with no container present, the build is kicked off
+On the first invocation that needs the container, the build is kicked off
 automatically (~10–20 minutes; image is reused on subsequent runs).
 
 ## Subcommand details
@@ -151,7 +149,7 @@ restoration filter, then runs a CQ ladder search until the encode hits the
 configured VMAF thresholds (mean ≥ 97, p05 ≥ 95, p01 ≥ 90 by default).
 Per-file output dir contains the final encode plus a `decisions.log` and
 `log.json` for after-the-fact inspection.  See [VMAF on GPU](#vmaf-on-gpu)
-below for how the libvmaf_cuda path is plugged in.
+below for how libvmaf_cuda fits in.
 
 ### `split`
 
@@ -168,18 +166,45 @@ Renders the chapter table to the terminal (Spectre.Console).  Same
 threshold semantics as `split`, but doesn't touch the file — purely for
 picking a sensible threshold before committing to a split.
 
+## Bundled dependency container
+
+mkvhelper ships a single Containerfile
+([MkvHelper.Cli/Dependencies/Containerfile](MkvHelper.Cli/Dependencies/Containerfile))
+that builds one image bundling every external tool the app shells out to:
+
+| Tool | What's in the build |
+|------|---------------------|
+| **libvmaf** | Built from the pinned VMAF release with `-Denable_cuda=true` (provides `libvmaf_cuda`). |
+| **FFmpeg** (pinned to a stable release tag) | NVENC, NVDEC, CUDA, libnpp; software AV1 via libdav1d (decode) + libaom + libsvtav1 (encode); x264, x265, libvpx; libopus, libvorbis, libmp3lame, libtheora; libass, libwebp, **libzimg** (zscale, for HDR tonemap). |
+| **MKVToolNix** | `mkvextract`, `mkvmerge` for the chapter subcommands — installed from Ubuntu's `mkvtoolnix` apt package inside the container. |
+
+Versions are pinned via build args inside the Containerfile (VMAF_TAG,
+FFMPEG_TAG, NV_CODEC_TAG).  Bumping is a one-line edit + `mkvhelper
+dependency build`.  `dependency update` queries Netflix/vmaf for the
+latest release and rebuilds with that tag automatically.
+
+The Containerfile is embedded in the binary as a managed resource
+([EmbeddedResource entry in the csproj](MkvHelper.Cli/MkvHelper.Cli.csproj))
+so the published binary is self-contained — no sibling file required at
+install time.
+
+The image is built on top of `nvidia/cuda:12.8.1-devel-ubuntu22.04`, which
+ships nvcc 12.8 (Blackwell-aware) and the CUDA dev libraries at standard
+paths.  `CPATH`/`LIBRARY_PATH` are exported so downstream `./configure`
+and meson invocations auto-discover CUDA without per-call
+`--extra-cflags=-I…` flags.
+
 ## VMAF on GPU
 
-CPU libvmaf dominates the wall-clock cost of CQ tuning.  The `compress`
-workflow ships a containerised CUDA-enabled FFmpeg build (libvmaf_cuda) per
-the upstream
-[Netflix/vmaf Dockerfiles](https://github.com/Netflix/vmaf/blob/master/resource/doc/docker.md);
-it runs Phase 2 VMAF on the GPU's CUDA cores at large multiples of the
-CPU path's throughput.
+CPU libvmaf dominates the wall-clock cost of CQ tuning.  The compress
+workflow runs VMAF on the GPU's CUDA cores via libvmaf_cuda — built into
+our container per the upstream
+[Netflix/vmaf docker recipe](https://github.com/Netflix/vmaf/blob/master/resource/doc/docker.md).
+Throughput is large multiples of the CPU path on the same hardware.
 
-The container has its own gate (`GpuGate.Cuda`) separate from the dedicated
-NVENC/NVDEC engines, so VMAF jobs and NVENC sample encodes can run
-concurrently without crowding each other off the silicon.
+The container has its own gate (`GpuGate.Cuda`) separate from the
+dedicated NVENC/NVDEC engines, so VMAF jobs and NVENC sample encodes can
+run concurrently without crowding each other off the silicon.
 
 **HDR sources** route through the CPU libvmaf path by default
 (`Config.UseCudaVmafForHdr = false`).  The HDR comparison needs zscale
@@ -187,37 +212,31 @@ tonemapping, which is CPU-only — running it on GPU is supported but the
 zscale work still runs on CPU even then, so the only thing actually moved
 to GPU is the libvmaf computation itself.  Flip the toggle if you want to
 gate HDR on `GpuGate.Cuda` anyway (e.g. to free `CpuGate` slots for other
-in-flight files).  SDR is always GPU when the container is built.
+in-flight files).  SDR is always GPU.
 
 ## Artifact storage
 
-All `compress` build artifacts live under `~/.local/share/mkvhelper/`
-(XDG_DATA_HOME):
-
 ```
-mkvhelper/
-├── state.json              # Built upstream tag, image tag, source path
-├── vmaf/<tag>/             # Shallow clone of Netflix/vmaf at the built tag
-└── build-logs/<tag>.log    # Captured stdout+stderr from podman build
+~/.local/share/mkvhelper/      (XDG_DATA_HOME)
+├── state.json                 # Built VMAF tag, image tag, build timestamp
+└── build-logs/<tag>.log       # Captured stdout+stderr from podman build
 ```
 
-The container images themselves live in Podman's storage
-(`~/.local/share/containers/`) and are referenced by tag — `dependency
-remove` cleans both.
+The container image itself lives in Podman's storage
+(`~/.local/share/containers/`) and is referenced by tag — `dependency
+remove` cleans both.  Untagged intermediate layers from prior builds
+(~10 GB worth) can be reclaimed afterward with `podman image prune -f`.
 
 ## Dependencies
 
 - **.NET 10 SDK** (every project targets `net10.0`).
-- **`mkvextract` and `mkvmerge`** (MKVToolNix) for `split` and `print-chapters`.
-  Arch: `sudo pacman -S mkvtoolnix-cli`.
-- **For container `compress` (recommended)**: `podman` and the NVIDIA
-  Container Toolkit.  Arch:
+- **podman** + **NVIDIA Container Toolkit** + **fuse-overlayfs** (on
+  ext4/xfs).  Everything mkvhelper actually shells out to —
+  `ffmpeg`/`ffprobe`/`mkvextract`/`mkvmerge` — lives inside the bundled
+  container, so the host doesn't need to install them separately.  Arch:
   ```bash
-  sudo pacman -S podman nvidia-container-toolkit
+  sudo pacman -S podman nvidia-container-toolkit fuse-overlayfs
   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
   ```
-- **For native `compress` fallback (`--no-container`)**: `ffmpeg` and
-  `ffprobe` on `$PATH`, with `libvmaf`, `libzimg`, `idet`, `fieldmatch`,
-  `bwdif`, and `decimate`.
 - **NVIDIA GPU with NVENC + NVDEC** for production `compress` runs (tests
   do not require it).

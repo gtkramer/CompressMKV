@@ -11,6 +11,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Containerfile shipped as an embedded resource so the published
+         binary is self-contained and doesn't need a sibling file at
+         install time. -->
+    <EmbeddedResource Include="Dependencies/Containerfile" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.55.2" />
     <PackageReference Include="Spectre.Console.Cli" Version="0.55.0" />
   </ItemGroup>

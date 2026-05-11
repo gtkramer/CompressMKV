@@ -19,16 +19,13 @@ public sealed class CompressSettings : CommandSettings
     [CommandOption("--force-redo")]
     [Description("Ignore prior log.json files and re-process every input.")]
     public bool ForceRedo { get; init; }
-
-    [CommandOption("--no-container")]
-    [Description("Use system ffmpeg/ffprobe instead of the containerised CUDA build (fallback only — VMAF will run on CPU).")]
-    public bool NoContainer { get; init; }
 }
 
 /// <summary>
-/// Main entry point for `mkvhelper compress`.  Bootstraps the runtime
-/// (container vs native ffmpeg, capability probe, file discovery), then
-/// hands off to <see cref="ProcessAllFilesAsync"/> for the parallel work.
+/// Main entry point for `mkvhelper compress`.  Bootstraps the container
+/// (auto-builds if missing), then hands off to the parallel work loop.
+/// All ffmpeg/ffprobe invocations downstream go through the container
+/// via <see cref="ContainerTools"/>.
 /// </summary>
 public sealed class CompressCommand : AsyncCommand<CompressSettings>
 {
@@ -54,21 +51,24 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         Directory.CreateDirectory(cfg.OutputFolder);
 
-        // ---- Configure ffmpeg routing (container vs native) ----
-        var routingOk = await ConfigureFfmpegRoutingAsync(cfg, settings.NoContainer, cts.Token);
-        if (!routingOk) return 1;
-
-        // ---- Validate ffmpeg capabilities ----
-        AnsiConsole.MarkupLine("[grey]Validating ffmpeg capabilities...[/]");
-        var caps = await FfmpegCapabilities.ValidateAsync(cts.Token);
+        // Ensure the dependency container is built and configure ContainerTools
+        // to route ffmpeg/ffprobe through it with input + output dirs mounted.
+        BuildState state;
+        try
+        {
+            state = await ContainerBuilder.EnsureReadyAsync(
+                mounts: [cfg.InputFolder, cfg.OutputFolder],
+                ct: cts.Token);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Container setup failed:[/] {Markup.Escape(ex.Message)}");
+            return 1;
+        }
         AnsiConsole.MarkupLine(
-            $"[green]OK:[/] libvmaf={caps.HasLibvmaf}, libvmaf_cuda={caps.HasLibvmafCuda}, zscale={caps.HasZscale}");
-        if (FfmpegRunner.UsingContainer && !caps.HasLibvmafCuda)
-            AnsiConsole.MarkupLine(
-                "[yellow]Warning:[/] container is built but libvmaf_cuda was not detected — VMAF will run on CPU.  " +
-                "This is unexpected — try `mkvhelper dependency build` to rebuild.");
+            $"[grey]Using container[/] [bold]{Markup.Escape(state.ImageTag)}[/] " +
+            $"[grey](Netflix/vmaf {Markup.Escape(state.UpstreamTag)}, built {state.BuiltUtc:yyyy-MM-dd}).[/]");
 
-        // ---- Discover input files ----
         var discovered = await VideoFileDiscovery.DiscoverAsync(cfg, cfg.InputFolder, cts.Token);
 
         AnsiConsole.MarkupLine($"[bold]Found {discovered.Count} video file(s)[/] under {Markup.Escape(cfg.InputFolder)}");
@@ -95,7 +95,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         var reporter = new StageReporter(discovered.Count);
 
         var workTask = ProcessAllFilesAsync(
-            cfg, gpu, cpu, discovered, caps, settings.ForceRedo,
+            cfg, gpu, cpu, discovered, settings.ForceRedo,
             overall, reporter, cts.Token);
 
         await AnsiConsole.Live(reporter.BuildRenderable())
@@ -137,106 +137,13 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         return overall.Errors.Count == 0 ? 0 : 1;
     }
 
-    /// <summary>
-    /// Decides whether to run ffmpeg/ffprobe via the bundled container or via
-    /// the system binary, building the container on first use if needed.
-    /// </summary>
-    private static async Task<bool> ConfigureFfmpegRoutingAsync(Config cfg, bool noContainer, CancellationToken ct)
-    {
-        if (noContainer)
-        {
-            FfmpegRunner.ConfigureNative(cfg.Ffmpeg, cfg.Ffprobe);
-            AnsiConsole.MarkupLine("[grey]--no-container: using system ffmpeg/ffprobe (VMAF will run on CPU).[/]");
-            return true;
-        }
-
-        var state = await BuildState.LoadAsync(ct);
-
-        // If we have a state file, verify the image is still in podman storage.
-        // If podman wiped it, we need to rebuild.
-        if (state is not null && await Podman.IsAvailableAsync(ct))
-        {
-            if (!await Podman.ImageExistsAsync(state.ImageTag, ct))
-            {
-                AnsiConsole.MarkupLine(
-                    $"[yellow]Warning:[/] state references image [bold]{Markup.Escape(state.ImageTag)}[/] " +
-                    "but it's gone from podman storage.  Rebuilding...");
-                state = null;
-            }
-        }
-
-        if (state is null)
-        {
-            // First run (or rebuilt podman storage): explain the build, then do it.
-            if (!await Podman.IsAvailableAsync(ct))
-            {
-                AnsiConsole.MarkupLine(
-                    "[yellow]podman is not available[/] — falling back to system ffmpeg/ffprobe.  " +
-                    "Install `podman` + the NVIDIA Container Toolkit to use the GPU-accelerated VMAF pipeline " +
-                    "(see `mkvhelper dependency build --help`).");
-                FfmpegRunner.ConfigureNative(cfg.Ffmpeg, cfg.Ffprobe);
-                return true;
-            }
-
-            AnsiConsole.MarkupLine("[bold]First-run dependency build[/]");
-            AnsiConsole.MarkupLine(
-                "[grey]No CUDA-enabled ffmpeg+VMAF build was found.  mkvhelper runs VMAF " +
-                "on the GPU (libvmaf_cuda) for a large speedup over the CPU path; the build " +
-                "comes from the Netflix/vmaf Dockerfile and is bundled in a podman image.  " +
-                "First-time build typically takes 5–15 minutes; subsequent runs reuse the image.[/]");
-
-            try
-            {
-                state = await BuildWithProgressAsync(ct);
-            }
-            catch (Exception ex)
-            {
-                AnsiConsole.MarkupLine($"[red]Build failed:[/] {Markup.Escape(ex.Message)}");
-                AnsiConsole.MarkupLine(
-                    "[yellow]Falling back to system ffmpeg/ffprobe.[/]  " +
-                    "Re-run `mkvhelper dependency build` to retry, or pass `--no-container` to silence this prompt.");
-                FfmpegRunner.ConfigureNative(cfg.Ffmpeg, cfg.Ffprobe);
-                return true;
-            }
-        }
-
-        // Container available: route through it.
-        FfmpegRunner.ConfigureContainer(state.ImageTag, new[] { cfg.InputFolder, cfg.OutputFolder });
-        AnsiConsole.MarkupLine(
-            $"[grey]Using container[/] [bold]{Markup.Escape(state.ImageTag)}[/] " +
-            $"[grey](Netflix/vmaf {Markup.Escape(state.UpstreamTag)}, built {state.BuiltUtc:yyyy-MM-dd}).[/]");
-        return true;
-    }
-
-    private static async Task<BuildState> BuildWithProgressAsync(CancellationToken ct)
-    {
-        BuildState? result = null;
-        await AnsiConsole.Status()
-            .AutoRefresh(true)
-            .Spinner(Spinner.Known.Dots)
-            .StartAsync("Preparing build...", async ctx =>
-            {
-                result = await VmafBuilder.BuildAsync(
-                    tag: null,
-                    onProgress: line =>
-                    {
-                        // Truncate so the spinner line stays readable.
-                        string trimmed = line.Length > 100 ? line[..97] + "..." : line;
-                        ctx.Status(Markup.Escape(trimmed));
-                    },
-                    ct: ct);
-            });
-        return result!;
-    }
-
     // ----------------------------------------------------------------
-    //  Per-file work loop (extracted from old Program.cs)
+    //  Per-file work loop
     // ----------------------------------------------------------------
 
     private static async Task ProcessAllFilesAsync(
         Config cfg, GpuGate gpu, CpuGate cpu, List<DiscoveredVideo> files,
-        FfmpegCapabilitiesResult caps, bool forceRedo,
-        OverallSummary overall, StageReporter reporter, CancellationToken ct)
+        bool forceRedo, OverallSummary overall, StageReporter reporter, CancellationToken ct)
     {
         await Parallel.ForEachAsync(
             files.Select((dv, i) => (dv, idx: i + 1)),
@@ -281,7 +188,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
                 try
                 {
-                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, discovered.Probe, caps, fileCt, logger);
+                    var summary = await ProcessOneAsync(cfg, gpu, cpu, file, discovered.Probe, fileCt, logger);
                     lock (overall) overall.Videos.Add(summary);
                     var (resultText, level) = SummariseResult(summary);
                     reporter.CompleteFile(slot, resultText, level);
@@ -325,8 +232,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
     {
         InputFolder = input,
         OutputFolder = output ?? "./out",
-        Ffmpeg = "ffmpeg",
-        Ffprobe = "ffprobe",
 
         NvencSlots = 2,
         NvdecSlots = 2,
@@ -360,7 +265,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
     private static async Task<VideoSummary> ProcessOneAsync(
         Config cfg, GpuGate gpu, CpuGate cpu, string input, FfprobeRoot probe,
-        FfmpegCapabilitiesResult caps, CancellationToken ct, IPipelineLogger logger)
+        CancellationToken ct, IPipelineLogger logger)
     {
         await Task.CompletedTask;
         var totalSw = Stopwatch.StartNew();
@@ -371,7 +276,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         logger.LogInfo($"Input: {input}");
         logger.LogInfo($"Output dir: {outDir}");
-        logger.LogInfo($"ffmpeg routing: {(FfmpegRunner.UsingContainer ? $"container ({FfmpegRunner.ImageTag})" : "native (system binary)")}");
+        logger.LogInfo($"Container image: {ContainerTools.ImageTag}");
 
         var vstream = probe.Streams?.FirstOrDefault(s => s.IsActualVideo())
                      ?? throw new InvalidOperationException("No usable video stream found.");
@@ -379,10 +284,8 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         bool isHdr = SourceClassifier.IsHdr(vstream);
         logger.LogInfo($"HDR: {isHdr}");
 
-        if (isHdr && !caps.HasZscale)
-            throw new InvalidOperationException(
-                "HDR content detected but ffmpeg lacks zscale (libzimg).  " +
-                "VMAF measurement for HDR requires tone-mapping via zscale.");
+        // Container guarantees zscale + libvmaf_cuda are present, so no
+        // capability probe is needed.
 
         HdrMetadata? hdrMetadata = isHdr
             ? await SourceClassifier.ExtractHdrMetadataAsync(cfg, input, ct)
@@ -453,14 +356,12 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             timings.Previews = sw.Elapsed;
         }
 
-        // Resolve per-file VMAF execution: GPU when libvmaf_cuda is available
-        // AND (source is SDR OR the HDR-on-GPU toggle is enabled).  Logged so
-        // it shows up in decisions.log alongside the other per-file decisions.
-        bool useCudaForThisFile = caps.HasLibvmafCuda && (!isHdr || cfg.UseCudaVmafForHdr);
+        // GPU VMAF whenever the source is SDR; HDR routes to CPU libvmaf
+        // by default (see Config.UseCudaVmafForHdr docs for trade-off).
+        bool useCudaForThisFile = !isHdr || cfg.UseCudaVmafForHdr;
         logger.LogInfo(
             $"VMAF execution: {(useCudaForThisFile ? "GPU (libvmaf_cuda)" : "CPU (libvmaf)")} " +
-            $"[caps.libvmaf_cuda={caps.HasLibvmafCuda}, isHdr={isHdr}, " +
-            $"UseCudaVmafForHdr={cfg.UseCudaVmafForHdr}]");
+            $"[isHdr={isHdr}, UseCudaVmafForHdr={cfg.UseCudaVmafForHdr}]");
 
         var tuning = await VmafTuner.TuneAsync(cfg, gpu, cpu, input, outDir, restore,
             isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, useCudaForThisFile, ct, logger);

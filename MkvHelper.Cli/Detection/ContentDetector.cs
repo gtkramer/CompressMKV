@@ -166,7 +166,7 @@ public static partial class ContentDetector
             }
         }
 
-        var (exitCode, stderr) = await FfmpegRunner.RunFfmpegStreamingAsync(argList.ToArray(), ProcessLine, ct);
+        var (exitCode, stderr) = await ContainerTools.RunFfmpegStreamingAsync(argList.ToArray(), ProcessLine, ct);
 
         logger.LogInfo($"Detection: decoded {frames.Count:N0} frames.");
         if (exitCode != 0)
