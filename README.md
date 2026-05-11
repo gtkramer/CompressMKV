@@ -71,8 +71,8 @@ The GPU-accelerated VMAF pipeline (`compress`) runs inside a Podman container
 that needs the host's NVIDIA driver passed through.  Once per machine:
 
 ```bash
-# 1. Install podman + the NVIDIA Container Toolkit (Arch Linux).
-#    podman is in [extra]; the toolkit is in [extra] as of 2024.
+# 1. Install podman + the NVIDIA Container Toolkit.  See the storage-driver
+#    note below for whether you also need `fuse-overlayfs`.
 sudo pacman -S podman nvidia-container-toolkit
 
 # 2. Generate the CDI spec so podman can resolve `nvidia.com/gpu=all`.
@@ -88,6 +88,25 @@ podman run --rm --device nvidia.com/gpu=all \
 #    will run it automatically on first invocation.
 mkvhelper dependency build
 ```
+
+### Container storage driver
+
+Rootless podman picks its storage driver automatically the first time it
+initialises `~/.local/share/containers/storage/`.  You don't need to
+configure it from `mkvhelper`'s side — but the autodetect needs the right
+packages to be present:
+
+| `~/.local/share` filesystem | Extra package needed | Driver podman selects |
+|-----------------------------|----------------------|------------------------|
+| **btrfs**                   | none                 | kernel overlay (works natively over btrfs) |
+| **ext4 / xfs**              | `fuse-overlayfs`     | fuse-overlayfs        |
+| **anything else**           | `fuse-overlayfs`     | fuse-overlayfs        |
+
+If `dependency build` exits with `Error: configure storage: kernel does
+not support overlay fs: 'overlay' is not supported over extfs`, that's
+the autodetect failing because `fuse-overlayfs` isn't installed and the
+kernel won't let it use overlay-over-ext4 in a user namespace.  Install
+`fuse-overlayfs` (`sudo pacman -S fuse-overlayfs`) and re-run.
 
 If you can't or don't want to run a container, pass `--no-container` to any
 `compress` invocation — VMAF will fall back to the system libvmaf on CPU
