@@ -24,11 +24,19 @@
 # `./configure` and meson invocations auto-discover CUDA headers + libs
 # without needing per-call --extra-cflags/--extra-ldflags.
 
-FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu22.04
+FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 ARG VMAF_TAG=v3.1.0
 ARG FFMPEG_TAG=n8.1.1
-ARG NV_CODEC_TAG=n13.0.19.0
+# nv-codec-headers commit pin.  libvmaf v3.1.0 uses functions on the
+# `CudaFunctions` dynamic-loader struct (cuCtxGetStreamPriorityRange,
+# cuStreamCreateWithPriority, cuCtxSynchronize, cuMemHostAlloc/FreeHost,
+# cuMemFreeAsync) that the n13.x tag of nv-codec-headers stopped
+# exposing — n13 trimmed the loader to "what ffmpeg actually needs,"
+# breaking out-of-tree consumers like libvmaf.  This commit is what
+# upstream Netflix/vmaf v3.1.0 itself tested against in their
+# Dockerfile.ffmpeg, so we know the function set matches.
+ARG NV_CODEC_TAG=876af32a202d0de83bd1d36fe74ee0f7fcf86b0d
 
 # NVCC target: single-arch, PTX-only.
 #
@@ -74,7 +82,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libfribidi-dev \
         libmp3lame-dev \
         libopus-dev \
-        libsvtav1-dev \
         libtheora-dev \
         libvorbis-dev \
         libvpx-dev \
@@ -96,12 +103,20 @@ RUN cd /tmp \
 
 # libvmaf with CUDA support, pinned.  meson auto-detects CUDA via the
 # CPATH/LIBRARY_PATH env vars exported above.
+#
+# enable_tools=false disables the standalone `vmaf` CLI binary.  We don't
+# use it — FFmpeg's libvmaf filter consumes the .so directly — and
+# v3.1.0's tools/vmaf fails to link with the default meson rules: it gets
+# linked with `cc` (no libstdc++) but transitively pulls in svm.cpp from
+# libvmaf.a, leaving every C++ stdlib symbol unresolved.  Skipping it
+# sidesteps that meson bug entirely.
 RUN cd /tmp \
     && git clone --depth=1 --branch="${VMAF_TAG}" https://github.com/Netflix/vmaf.git \
     && cd vmaf/libvmaf \
     && meson setup build \
         --buildtype=release \
         -Denable_cuda=true \
+        -Denable_tools=false \
         -Denable_tests=false \
         -Denable_docs=false \
     && meson install -C build \
@@ -136,10 +151,13 @@ RUN cd /tmp \
         --enable-libnpp \
         # VMAF (CUDA-enabled because libvmaf was built with -Denable_cuda)
         --enable-libvmaf \
-        # AV1 software (decode + encode), to round out the hardware path
+        # AV1 software (decode + encode), to round out the hardware path.
+        # libsvtav1 is intentionally absent: noble's libsvtav1-dev ships
+        # headers + libs but no .pc file (Debian packaging bug), and we
+        # don't actually use software AV1 encoding (we use av1_nvenc).
+        # libaom remains as the reference software AV1 encoder if needed.
         --enable-libdav1d \
         --enable-libaom \
-        --enable-libsvtav1 \
         # Other software video codecs
         --enable-libx264 \
         --enable-libx265 \
@@ -160,3 +178,13 @@ RUN cd /tmp \
     && cd /tmp && rm -rf FFmpeg
 
 WORKDIR /work
+
+# Clear the inherited /opt/nvidia/nvidia_entrypoint.sh so `podman run IMAGE
+# <tool> <args>` runs the tool directly.  The base image's entrypoint just
+# prints a CUDA-version banner + license boilerplate to stdout before
+# exec'ing the user's command — useful for nvidia/cuda's intended
+# "interactive shell + version display" use, harmful for our
+# captured-stdout pipelines (every ffmpeg invocation would have to filter
+# the banner out of its stderr).  CUDA env (PATH, LD_LIBRARY_PATH, CPATH)
+# is already set above via ENV directives, so we lose nothing functional.
+ENTRYPOINT []

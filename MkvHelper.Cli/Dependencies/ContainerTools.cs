@@ -125,6 +125,9 @@ public static class ContainerTools
             podArgs.Add("-v");
             podArgs.Add($"{mount}:{mount}");
         }
+        // Image has `ENTRYPOINT []` (cleared from the inherited nvidia
+        // base) so podman treats the first CMD arg as the binary.  No
+        // `--entrypoint` needed on the run side.
         podArgs.Add(s_imageTag);
         podArgs.Add(tool);
         podArgs.AddRange(toolArgs);
