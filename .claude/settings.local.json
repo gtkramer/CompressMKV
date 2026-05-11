@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.mplayerhq.hu)",
+      "Bash(dotnet build *)",
+      "Bash(dotnet test *)",
+      "Read(//tmp/compressmkv-debug/**)",
+      "Bash(ffmpeg -y -hide_banner -loglevel error -i telecined.mkv -an -vf \"fieldmatch=order=tff:combmatch=full,bwdif=mode=send_frame:parity=tff:deint=interlaced,decimate\" -r 24000/1001 -fps_mode cfr -c:v ffv1 -level 3 ivtc_output.mkv)",
+      "Bash(ffmpeg -hide_banner -i telecined.mkv -an -vf idet -f null -)",
+      "Bash(ffmpeg -hide_banner -i ivtc_output.mkv -an -vf idet -f null -)",
+      "Bash(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -count_frames ivtc_output.mkv)",
+      "Bash(dotnet add *)",
+      "Bash(curl -s \"https://api.nuget.org/v3-flatcontainer/spectre.console.cli/index.json\")",
+      "Bash(python3 -c \"import json, sys; data = json.load\\(sys.stdin\\); print\\('Latest stable:', [v for v in data['versions'] if '-' not in v][-1]\\); print\\('Last few:', data['versions'][-10:]\\)\")",
+      "Bash(dotnet run *)",
+      "Bash(find /home/george/Projects/C#/MKVHelper -type f \\\\\\( -name \"*.cs\" -o -name \"*.csproj\" -o -name \"*.sln\" -o -name \"*.md\" -o -name \"*.props\" -o -name \"*.json\" \\\\\\) | grep -v -E '\\(bin/|obj/\\)' | sort)",
+      "Read(//home/george/Projects/C#/MKVHelper/**)",
+      "Bash(git mv *)",
+      "Bash(ls -la /home/george/.local/share/mkvhelper/build-logs/)",
+      "Read(//home/george/.local/share/mkvhelper/build-logs/**)"
+    ]
+  }
+}
