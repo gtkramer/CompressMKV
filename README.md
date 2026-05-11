@@ -1,42 +1,55 @@
-# CompressMKV
+# MKV Helper
 
-VMAF-guided AV1 NVENC compressor for arbitrary video files. Detects whether
-the source is progressive, telecined, interlaced, or a mix; restores the
-original cadence; then searches for the highest-CQ encode that hits a
-per-frame VMAF quality target.
+A multi-purpose CLI for batch processing MKV (and arbitrary other) video
+files.  Three workflows live behind one binary:
 
-Despite the name, accepts **any** video file ffmpeg can read as input,
-regardless of extension. Discovery probes every file in the input folder
-with ffprobe and keeps the ones that contain real video content (excluding
-audio-only files, embedded cover art, and single-image files). Output is
-always written as `.mkv` since that's the right home for AV1 + multi-track
-audio + subtitle pass-through.
+- **`mkvhelper compress`** — VMAF-guided AV1 NVENC compression.  Detects
+  whether the source is progressive, telecined, interlaced, or a mix;
+  restores the original cadence; then searches for the highest-CQ encode
+  that hits a per-frame VMAF quality target.  Implements the five NTSC
+  content categories from the
+  [MPlayer/MEncoder telecine guide §7.2](http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-telecine.html)
+  and uses ffmpeg-native filters (`idet`, `fieldmatch`, `bwdif`,
+  `decimate`) for both detection and restoration.
 
-Implements the five NTSC content categories from the
-[MPlayer/MEncoder telecine guide §7.2](http://www.mplayerhq.hu/DOCS/HTML/en/menc-feat-telecine.html)
-and uses ffmpeg-native filters (`idet`, `fieldmatch`, `bwdif`, `decimate`)
-exclusively for both detection and restoration.
+- **`mkvhelper split`** — slices a multi-episode MKV (a "season disc") into
+  one MKV per episode by reading the source's chapter list, identifying
+  main-content chapters via a duration threshold, and slicing on those
+  boundaries with `mkvmerge`.
+
+- **`mkvhelper print-chapters`** — pretty-prints an MKV's chapter list to
+  the terminal: timestamps, durations, and which chapters would be
+  classified as "main content" at a given threshold.  Use it as a dry run
+  before `split` to pick a sensible threshold.
+
+The `compress` workflow accepts **any** video file ffmpeg can read —
+discovery probes every file in the input folder with ffprobe and keeps the
+ones with real video content (skipping audio-only files, embedded cover
+art, single-image files).  Output is always written as `.mkv` since
+that's the right home for AV1 + multi-track audio + subtitle pass-through.
 
 ## Repository layout
 
 ```
-CompressMKV/
-├── CompressMKV.sln                Solution file
-├── Directory.Build.props          MSBuild settings shared by all projects
-├── README.md                      This file
-├── .github/                       CI workflows
-├── CompressMKV.CLI/               Main app (executable: `compressmkv`)
-│   ├── Commands/                  Spectre.Console.Cli subcommand classes
-│   ├── Dependencies/              Container build orchestration (podman, git, GitHub)
-│   ├── Detection/                 §7.2.2 classification (idet → 5 categories)
-│   ├── Restore/                   §7.2.3 action selection + filter chains
-│   ├── Encoding/                  ffmpeg pipeline + AV1 NVENC encode + size guard
-│   ├── Tuning/                    VMAF-guided CQ selection
-│   ├── Infrastructure/            ffprobe, Fps, Proc utilities
-│   ├── Models/                    summary/report DTOs
-│   ├── Config.cs                  Runtime configuration
-│   └── Program.cs                 CLI entry point
-└── CompressMKV.Tests/             NUnit test suite
+MkvHelper/
+├── MkvHelper.sln                Solution file
+├── Directory.Build.props        MSBuild settings shared by all projects
+├── README.md                    This file
+├── .github/                     CI workflows
+├── MkvHelper.Cli/               Main app (executable: `mkvhelper`)
+│   ├── Commands/                Spectre.Console.Cli subcommand classes
+│   ├── Chapters/                MKV chapter XML models + mkvtoolnix wrapper
+│   ├── Dependencies/            Container build orchestration (podman, git, GitHub)
+│   ├── Detection/               §7.2.2 classification (idet → 5 categories)
+│   ├── Restore/                 §7.2.3 action selection + filter chains
+│   ├── Encoding/                ffmpeg pipeline + AV1 NVENC encode + size guard
+│   ├── Tuning/                  VMAF-guided CQ selection
+│   ├── Infrastructure/          ffprobe, Fps, Proc utilities
+│   ├── Models/                  summary/report DTOs
+│   ├── Logging/                 Per-file decisions.log + live UI reporter
+│   ├── Config.cs                Runtime configuration
+│   └── Program.cs               CLI entry point
+└── MkvHelper.Tests/             NUnit test suite
 ```
 
 ## Build & test
@@ -54,8 +67,8 @@ runs to green with no external test data.
 
 ## First-run setup
 
-The GPU-accelerated VMAF pipeline runs inside a Podman container that needs
-the host's NVIDIA driver passed through.  Once per machine:
+The GPU-accelerated VMAF pipeline (`compress`) runs inside a Podman container
+that needs the host's NVIDIA driver passed through.  Once per machine:
 
 ```bash
 # 1. Install podman + the NVIDIA Container Toolkit (Arch Linux).
@@ -71,39 +84,76 @@ podman run --rm --device nvidia.com/gpu=all \
     docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 
 # 4. (Optional) Pre-warm the bundled ffmpeg+libvmaf_cuda container.  Takes
-#    10–20 minutes the first time.  If you skip this, `compressmkv compress`
+#    10–20 minutes the first time.  If you skip this, `mkvhelper compress`
 #    will run it automatically on first invocation.
-compressmkv dependency build
+mkvhelper dependency build
 ```
 
 If you can't or don't want to run a container, pass `--no-container` to any
 `compress` invocation — VMAF will fall back to the system libvmaf on CPU
 (much slower; functionally identical otherwise).
 
+The `split` and `print-chapters` subcommands shell out to MKVToolNix
+(`mkvextract`, `mkvmerge`) and have no container dependency.  On Arch
+Linux: `sudo pacman -S mkvtoolnix-cli`.
+
 ## Run
 
 ```bash
-# Top-level help + subcommands
-compressmkv
+# Top-level help
+mkvhelper
 
-# Main compress workflow
-compressmkv compress --input /path/to/input --output /path/to/output
+# VMAF-guided compression
+mkvhelper compress --input /path/to/input --output /path/to/output
+
+# Split a multi-episode MKV into per-episode files
+mkvhelper split --input season.mkv --series-name "My Show" --season-num 1
+# → "My Show - S01E01.mkv", "My Show - S01E02.mkv", ... in the same dir
+
+# Inspect chapters before splitting
+mkvhelper print-chapters --input season.mkv --episode-chapter-threshold 600
 
 # Dependency management (CUDA-enabled ffmpeg + libvmaf_cuda container)
-compressmkv dependency build       # build the runtime container from Netflix/vmaf
-compressmkv dependency update      # rebuild only if Netflix tagged a newer release
-compressmkv dependency remove      # delete every built image + clone + state file
+mkvhelper dependency build       # build the runtime container from Netflix/vmaf
+mkvhelper dependency update      # rebuild only if Netflix tagged a newer release
+mkvhelper dependency remove      # delete every built image + clone + state file
 ```
 
 On first `compress` run with no container present, the build is kicked off
-automatically (~10–20 minutes; image is reused on subsequent runs).  Pass
-`--no-container` to fall back to the system ffmpeg/ffprobe (VMAF will run
-on CPU instead of GPU — much slower).
+automatically (~10–20 minutes; image is reused on subsequent runs).
+
+## Subcommand details
+
+### `compress`
+
+VMAF-guided AV1 NVENC encode.  Accepts a folder of inputs (any container
+ffmpeg can read), classifies each by source type, applies the right
+restoration filter, then runs a CQ ladder search until the encode hits the
+configured VMAF thresholds (mean ≥ 97, p05 ≥ 95, p01 ≥ 90 by default).
+Per-file output dir contains the final encode plus a `decisions.log` and
+`log.json` for after-the-fact inspection.  See [VMAF on GPU](#vmaf-on-gpu)
+below for how the libvmaf_cuda path is plugged in.
+
+### `split`
+
+Reads chapters via `mkvextract`, marks each chapter as "main" if its
+duration is at or above `--episode-chapter-threshold` seconds (default 360),
+and walks for main → non-main transitions.  Each transition closes one
+episode at `i + --additional-chapters` (default 2), bundling trailing
+credits with the episode they follow.  Output filenames follow
+`{SeriesName} - S{Season:D2}E{Ep:D2}.mkv` and land beside the input file.
+
+### `print-chapters`
+
+Renders the chapter table to the terminal (Spectre.Console).  Same
+threshold semantics as `split`, but doesn't touch the file — purely for
+picking a sensible threshold before committing to a split.
 
 ## VMAF on GPU
 
-CPU libvmaf dominates the wall-clock cost of CQ tuning.  This project ships
-a containerised CUDA-enabled FFmpeg build (libvmaf_cuda) per the upstream
+CPU libvmaf dominates the wall-clock cost of CQ tuning.  The `compress`
+workflow ships a containerised CUDA-enabled FFmpeg build (libvmaf_cuda) per
+the upstream
 [Netflix/vmaf Dockerfiles](https://github.com/Netflix/vmaf/blob/master/resource/doc/docker.md);
 it runs Phase 2 VMAF on the GPU's CUDA cores at large multiples of the
 CPU path's throughput.
@@ -122,10 +172,11 @@ in-flight files).  SDR is always GPU when the container is built.
 
 ## Artifact storage
 
-All build artifacts live under `~/.local/share/compressmkv/` (XDG_DATA_HOME):
+All `compress` build artifacts live under `~/.local/share/mkvhelper/`
+(XDG_DATA_HOME):
 
 ```
-compressmkv/
+mkvhelper/
 ├── state.json              # Built upstream tag, image tag, source path
 ├── vmaf/<tag>/             # Shallow clone of Netflix/vmaf at the built tag
 └── build-logs/<tag>.log    # Captured stdout+stderr from podman build
@@ -137,13 +188,17 @@ remove` cleans both.
 
 ## Dependencies
 
-- .NET 10 SDK
-- For container mode (recommended): `podman` and the **NVIDIA Container Toolkit**.
-  On Arch Linux:
+- **.NET 10 SDK** (every project targets `net10.0`).
+- **`mkvextract` and `mkvmerge`** (MKVToolNix) for `split` and `print-chapters`.
+  Arch: `sudo pacman -S mkvtoolnix-cli`.
+- **For container `compress` (recommended)**: `podman` and the NVIDIA
+  Container Toolkit.  Arch:
   ```bash
   sudo pacman -S podman nvidia-container-toolkit
   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
   ```
-- For native fallback (`--no-container`): `ffmpeg` and `ffprobe` on `$PATH`,
-  with `libvmaf`, `libzimg`, `idet`, `fieldmatch`, `bwdif`, and `decimate`.
-- NVIDIA GPU with NVENC + NVDEC for production runs (tests do not require it).
+- **For native `compress` fallback (`--no-container`)**: `ffmpeg` and
+  `ffprobe` on `$PATH`, with `libvmaf`, `libzimg`, `idet`, `fieldmatch`,
+  `bwdif`, and `decimate`.
+- **NVIDIA GPU with NVENC + NVDEC** for production `compress` runs (tests
+  do not require it).

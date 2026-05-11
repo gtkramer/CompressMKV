@@ -2,11 +2,11 @@
 
 ## Overview
 
-CompressMKV is a CLI tool that batch-compresses MKV video files using NVIDIA NVENC AV1 hardware encoding with VMAF-guided quality tuning and automatic content-type detection (progressive, telecined, interlaced, mixed). Zero NuGet dependencies — external tools (ffmpeg, ffprobe) are invoked as child processes.
+MkvHelper is a CLI tool that batch-compresses MKV video files using NVIDIA NVENC AV1 hardware encoding with VMAF-guided quality tuning and automatic content-type detection (progressive, telecined, interlaced, mixed). Zero NuGet dependencies — external tools (ffmpeg, ffprobe) are invoked as child processes.
 
 ## Code Style
 
-- **Namespace:** All files use `namespace CompressMkv;` (file-scoped, lowercase 'v')
+- **Namespace:** All files use `namespace MkvHelper;` (file-scoped, lowercase 'v')
 - **Static logic classes:** Business logic lives in `public static class` types (e.g. `Proc`, `Pipelines`, `ContentDetector`, `VmafTuner`)
 - **Sealed data classes:** All data/model types are `public sealed class` with `{ get; set; }` properties and default initializers (`= ""`, `= new()`) — no records
 - **Enums** get XML doc comments per member
@@ -33,7 +33,7 @@ Ffprobe → SourceClassifier → ContentDetector → RestoreStrategyMapper → [
 ## Build and Test
 
 ```bash
-dotnet build CompressMKV.csproj
+dotnet build MkvHelper.csproj
 dotnet run -- --input /path/to/mkvs --output /path/to/out --vmaf-model /path/to/vmaf_model.json
 ```
 
