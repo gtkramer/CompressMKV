@@ -152,6 +152,72 @@ public static class ContainerBuilder
     }
 
     /// <summary>
+    /// Snapshot of the container's readiness, exactly as
+    /// <see cref="EnsureReadyAsync"/> would judge it on next invocation.
+    /// Computed without modifying anything — safe to call repeatedly.
+    /// </summary>
+    public sealed record ContainerStatus(
+        string ImageTag,
+        bool ImageExists,
+        BuildState? State,
+        string CurrentContainerfileSha,
+        ContainerReadiness Readiness)
+    {
+        public bool ShaMatches =>
+            State is not null
+            && !string.IsNullOrEmpty(State.ContainerfileSha256)
+            && string.Equals(State.ContainerfileSha256, CurrentContainerfileSha, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Resolution of <see cref="ContainerStatus"/> into a single bucket —
+    /// the four mutually-exclusive answers to "what would happen on the
+    /// next subcommand that needs the container?"
+    /// </summary>
+    public enum ContainerReadiness
+    {
+        /// <summary>Image exists, SHA matches: next subcommand uses it as-is.</summary>
+        Ready,
+        /// <summary>Image exists but the embedded Containerfile has changed: next subcommand auto-rebuilds.</summary>
+        Stale,
+        /// <summary>state.json exists but the image is gone from podman storage: next subcommand auto-rebuilds.</summary>
+        ImageMissing,
+        /// <summary>No prior build at all: next subcommand auto-builds from scratch.</summary>
+        NotBuilt,
+    }
+
+    /// <summary>
+    /// Read-only assessment of the container's current state versus the
+    /// embedded Containerfile.  Doesn't touch podman storage beyond the
+    /// existence check, doesn't trigger any builds.
+    /// </summary>
+    public static async Task<ContainerStatus> GetStatusAsync(CancellationToken ct)
+    {
+        string currentSha = Sha256(LoadContainerfile());
+        var state = await BuildState.LoadAsync(ct);
+
+        bool imageExists = false;
+        if (await Podman.IsAvailableAsync(ct))
+            imageExists = await Podman.ImageExistsAsync(ImageTag, ct);
+
+        ContainerReadiness readiness = (state, imageExists) switch
+        {
+            (null, _) => ContainerReadiness.NotBuilt,
+            (_, false) => ContainerReadiness.ImageMissing,
+            (not null, true) when string.Equals(state.ContainerfileSha256, currentSha, StringComparison.OrdinalIgnoreCase)
+                => ContainerReadiness.Ready,
+            _ => ContainerReadiness.Stale,
+        };
+
+        return new ContainerStatus(
+            ImageTag: ImageTag,
+            ImageExists: imageExists,
+            State: state,
+            CurrentContainerfileSha: currentSha,
+            Readiness: readiness);
+    }
+
+    /// <summary>
     /// Removes the built container image, the build log, and the state
     /// file.  Untagged intermediate layers from the build (~10 GB worth)
     /// are NOT removed automatically — point the user at

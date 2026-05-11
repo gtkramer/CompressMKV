@@ -44,6 +44,9 @@ public static class Program
                 cont.AddCommand<ContainerBuildCommand>("build")
                     .WithDescription("Build the dependency container from the embedded Containerfile.");
 
+                cont.AddCommand<ContainerStatusCommand>("status")
+                    .WithDescription("Show whether the container is built, missing, or stale relative to the embedded Containerfile.");
+
                 cont.AddCommand<ContainerRemoveCommand>("remove")
                     .WithDescription("Remove the built image, build log, and state file.");
             });

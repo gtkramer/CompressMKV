@@ -132,6 +132,7 @@ mkvhelper split --input season.mkv --series-name "My Show" --season-num 1
 mkvhelper print-chapters --input season.mkv --episode-chapter-threshold 600
 
 # Container management (the bundled dependency container)
+mkvhelper container status             # report whether the container is ready, stale, missing, or unbuilt
 mkvhelper container build              # build the container from the embedded Containerfile
 mkvhelper container build --no-cache   # full rebuild, ignoring podman's layer cache
 mkvhelper container remove             # remove the built image, build log, and state file
@@ -142,7 +143,17 @@ automatically (~10–20 minutes; image is reused on subsequent runs).  If
 you edit the embedded [Containerfile](MkvHelper.Cli/Dependencies/Containerfile)
 and rebuild mkvhelper, the next subcommand that needs the container will
 notice the SHA-256 mismatch in `state.json` and auto-rebuild — you don't
-have to remember to invoke `container build` manually.
+have to remember to invoke `container build` manually.  Run
+`mkvhelper container status` to see the current state without doing
+anything (exit code 0 = ready, non-zero = a rebuild would happen on the
+next subcommand).  `--quiet` suppresses output and just sets the exit
+code, which is convenient for scripts:
+
+```bash
+if ! mkvhelper container status --quiet; then
+    mkvhelper container build
+fi
+```
 
 ## Subcommand details
 
