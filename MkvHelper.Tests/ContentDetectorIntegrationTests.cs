@@ -128,6 +128,6 @@ public class ContentDetectorIntegrationTests
         var cfg = TestVideoFixture.CreateTestConfig();
         var probe = await Ffprobe.RunAsync(cfg, clipPath, CancellationToken.None);
         var vstream = probe.Streams!.First(s => s.CodecType == "video");
-        return await ContentDetector.DetectAsync(cfg, clipPath, vstream, CancellationToken.None);
+        return await ContentDetector.DetectAsync(cfg, clipPath, vstream, useHwaccel: false, CancellationToken.None);
     }
 }

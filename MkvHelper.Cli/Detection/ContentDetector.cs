@@ -99,10 +99,16 @@ public static partial class ContentDetector
     /// idet filter, computes whole-file metrics from the per-frame flag stream,
     /// and classifies into one of the five §7.2.2 categories.
     /// Source-agnostic: works on DVDs, Blu-rays, or any other container/codec.
+    ///
+    /// When <paramref name="useHwaccel"/> is true the source is decoded on
+    /// NVDEC and downloaded to system memory for the (CPU-only) idet filter;
+    /// otherwise decode runs on the CPU.  ResourcePool picks the path based
+    /// on which resources are free at admission time — see
+    /// <see cref="Config.DetectionAlternatives"/>.
     /// </summary>
     public static async Task<ContentDetectionResult> DetectAsync(
-        Config cfg, string input, FfprobeStream vstream, CancellationToken ct,
-        IPipelineLogger? logger = null)
+        Config cfg, string input, FfprobeStream vstream, bool useHwaccel,
+        CancellationToken ct, IPipelineLogger? logger = null)
     {
         logger ??= NullLogger.Instance;
         // ---- Build ffmpeg args ----
@@ -112,20 +118,30 @@ public static partial class ContentDetector
         // CheckAggregateAgreement depends on this.  -nostats suppresses the
         // periodic decoder progress chatter that would otherwise fill stderr
         // at info level.
-        // Detection sw-decodes intentionally.  idet is a CPU-only filter and
-        // every frame has to land in system memory anyway, so NVDEC would
-        // cost a per-frame GPU→CPU download with nothing to amortise it
-        // against — and it would tie up the dedicated NVDEC engines that
-        // the final encode pipeline actually benefits from.
+        int threads = useHwaccel ? cfg.DetectionGpuThreads : cfg.DetectionCpuThreads;
         var argList = new List<string>
         {
             "-hide_banner", "-loglevel", "info", "-nostats",
-            "-threads", cfg.DetectionThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "-threads", threads.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        };
+
+        if (useHwaccel)
+        {
+            // Decode on NVDEC and have ffmpeg auto-download to system memory
+            // in the source's native bit depth, so idet sees the same sw
+            // frames it would have on the CPU path.  -hwaccel_output_format
+            // is what triggers the auto-download — without it the decoder
+            // produces hwframes that idet can't consume.
+            var format = PipelineFormat.FromStream(vstream);
+            argList.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", format.HwaccelOutputFormat]);
+        }
+
+        argList.AddRange([
             "-i", input,
             "-an", "-sn", "-dn",
             "-vf", "idet,metadata=mode=print:file=-:direct=1",
             "-f", "null", "-"
-        };
+        ]);
 
         // ---- Per-frame accumulation ----
         var frames = new List<FrameFlag>();

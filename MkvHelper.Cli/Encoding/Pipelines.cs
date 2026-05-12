@@ -12,23 +12,41 @@ public static class Pipelines
     //  Phase 1: Extract a lossless reference clip with restored cadence.
     //  One per sample window — reused across all CQ levels.
     //  FFV1 lossless preserves full source fidelity at any bit depth.
+    //
+    //  Decode side can run on CPU or NVDEC; FFV1 encode is always CPU
+    //  (no NVENC FFV1 encoder exists).  ResourcePool picks the path
+    //  based on which resources are free — see Config.RefExtractAlternatives.
     // ----------------------------------------------------------------
     public static async Task ExtractReferenceClipAsync(
         Config cfg, string input, string output, SampleWindow w,
-        RestoreDecision restore, CancellationToken ct)
+        RestoreDecision restore, FfprobeStream vstream, bool useHwaccel,
+        CancellationToken ct)
     {
         if (File.Exists(output)) File.Delete(output);
 
-        string threads = cfg.RefExtractThreads.ToString(CultureInfo.InvariantCulture);
+        int threadCount = useHwaccel ? cfg.RefExtractGpuThreads : cfg.RefExtractCpuThreads;
+        string threads = threadCount.ToString(CultureInfo.InvariantCulture);
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", "error",
             "-threads", threads,
+        };
+
+        if (useHwaccel)
+        {
+            // NVDEC decode → auto-download in source's native bit depth.
+            // CPU filters (IVTC/Deint when present) and the FFV1 encoder
+            // run in system memory; the GPU just handles decode.
+            var format = PipelineFormat.FromStream(vstream);
+            args.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", format.HwaccelOutputFormat]);
+        }
+
+        args.AddRange([
             "-ss", w.StartSeconds.ToString("F3", CultureInfo.InvariantCulture),
             "-i", input,
             "-t", w.LengthSeconds.ToString("F3", CultureInfo.InvariantCulture),
             "-map", "0:v:0", "-an",
-        };
+        ]);
 
         if (!string.IsNullOrWhiteSpace(restore.FilterGraph))
             args.AddRange(["-vf", restore.FilterGraph]);

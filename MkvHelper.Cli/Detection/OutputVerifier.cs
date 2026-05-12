@@ -49,8 +49,8 @@ public static class OutputVerifier
     const double MaxResidualCadenceRate = 0.05;
 
     public static async Task<OutputVerificationResult> VerifyAsync(
-        Config cfg, string outputPath, RestoreDecision restore, CancellationToken ct,
-        IPipelineLogger? logger = null)
+        Config cfg, string outputPath, RestoreDecision restore, bool useHwaccel,
+        CancellationToken ct, IPipelineLogger? logger = null)
     {
         logger ??= NullLogger.Instance;
         var result = new OutputVerificationResult
@@ -98,7 +98,7 @@ public static class OutputVerifier
         ContentDetectionResult detection;
         try
         {
-            detection = await ContentDetector.DetectAsync(cfg, outputPath, vstream, ct, logger);
+            detection = await ContentDetector.DetectAsync(cfg, outputPath, vstream, useHwaccel, ct, logger);
         }
         catch (Exception ex)
         {

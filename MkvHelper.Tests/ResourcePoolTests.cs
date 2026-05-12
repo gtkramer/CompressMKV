@@ -124,33 +124,153 @@ public class ResourcePoolTests
     }
 
     [Test]
-    public async Task StrictFifo_PreventsSmallOpStarvation()
+    public async Task HeadSkip_NonConflictingOpsBypassBlockedHead()
     {
-        // The point of FIFO: if a big op is at head waiting for resources,
-        // smaller ops behind it must not slip in ahead even if they'd fit.
-        var pool = new ResourcePool(cpu: 8, nvenc: 2, nvdec: 2, cuda: 2);
+        // Head-skip lets ops whose resources don't conflict with the blocked
+        // head proceed immediately, instead of stalling in line.  Anti-
+        // starvation still holds: the head gets first dibs on every release
+        // and runs as soon as ITS resource frees.
+        var pool = new ResourcePool(cpu: 4, nvenc: 2, nvdec: 2, cuda: 1);
 
-        // Take 6 CPU, leaving 2 available.
-        var blocker = await pool.AcquireAsync(new(Cpu: 6), CancellationToken.None);
+        // Hold the only CUDA slot.
+        var cudaHolder = await pool.AcquireAsync(new(Cuda: 1), CancellationToken.None);
 
-        // Big op needs 8 CPU — currently can't fit (only 2 free).  Queued at head.
-        var big = pool.AcquireAsync(new(Cpu: 8), CancellationToken.None);
+        // Big op needs CUDA — currently can't fit.  Queue it.
+        var vmaf = pool.AcquireAsync(new(Cpu: 2, Cuda: 1), CancellationToken.None);
+        await Task.Delay(50);
+        Assert.That(vmaf.IsCompleted, Is.False);
 
-        // Small op (1 CPU) queued behind big.  2 CPU is available, but big is at head.
-        var small = pool.AcquireAsync(new(Cpu: 1), CancellationToken.None);
+        // Small op needs only CPU.  Under head-skip, it does NOT have to
+        // wait behind the queued VMAF — they don't compete for the same
+        // resource.  Fast path admits it immediately.
+        var small = await pool.AcquireAsync(new(Cpu: 2), CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.That(vmaf.IsCompleted, Is.False, "VMAF still waits for CUDA");
+        small.Dispose();
+
+        // Release CUDA → next release scan grants the head VMAF.
+        cudaHolder.Dispose();
+        var rVmaf = await vmaf.WaitAsync(TimeSpan.FromSeconds(1));
+        rVmaf.Dispose();
+    }
+
+    [Test]
+    public async Task HeadSkip_GrantsHeadFirstWhenItsResourceFrees()
+    {
+        // Even with head-skip, a head waiter blocked on resource X gets
+        // priority for X as soon as X frees.  No later waiter can hoard
+        // X ahead of the head.
+        var pool = new ResourcePool(cpu: 8, nvenc: 2, nvdec: 2, cuda: 1);
+
+        var cudaHolder = await pool.AcquireAsync(new(Cuda: 1), CancellationToken.None);
+
+        // Head wants CUDA.
+        var head = pool.AcquireAsync(new(Cpu: 2, Cuda: 1), CancellationToken.None);
+
+        // Later waiter also wants CUDA.
+        var later = pool.AcquireAsync(new(Cpu: 2, Cuda: 1), CancellationToken.None);
 
         await Task.Delay(50);
-        Assert.That(big.IsCompleted, Is.False, "big waits because it doesn't fit");
-        Assert.That(small.IsCompleted, Is.False, "small must wait behind big (strict FIFO)");
+        Assert.That(head.IsCompleted, Is.False);
+        Assert.That(later.IsCompleted, Is.False);
 
-        // Release blocker → 8 CPU free.  Big should now run; small still queued.
-        blocker.Dispose();
-        var rBig = await big.WaitAsync(TimeSpan.FromSeconds(1));
-        Assert.That(small.IsCompleted, Is.False);
+        // Release CUDA → head gets it (FIFO order within same resource).
+        cudaHolder.Dispose();
+        var rHead = await head.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.That(later.IsCompleted, Is.False, "later must wait its turn");
 
-        rBig.Dispose();
-        var rSmall = await small.WaitAsync(TimeSpan.FromSeconds(1));
-        rSmall.Dispose();
+        rHead.Dispose();
+        var rLater = await later.WaitAsync(TimeSpan.FromSeconds(1));
+        rLater.Dispose();
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-alternative requests (AcquireAnyAsync)
+    // ------------------------------------------------------------------
+
+    [Test]
+    public async Task AcquireAny_GrantsFirstAlternativeThatFits()
+    {
+        // CPU-preferred ordering: when CPU is free, take CPU.
+        var pool = new ResourcePool(cpu: 8, nvenc: 2, nvdec: 2, cuda: 2);
+
+        var cpuAlt = new ResourceRequest(Cpu: 4);
+        var gpuAlt = new ResourceRequest(Cpu: 2, Nvdec: 1);
+
+        var result = await pool.AcquireAnyAsync(new[] { cpuAlt, gpuAlt }, CancellationToken.None);
+        Assert.That(result.AlternativeIndex, Is.EqualTo(0));
+        Assert.That(result.Granted, Is.EqualTo(cpuAlt));
+        result.Lease.Dispose();
+    }
+
+    [Test]
+    public async Task AcquireAny_FallsBackToSecondAlternativeWhenFirstDoesntFit()
+    {
+        // CPU is mostly consumed (only 1 free) → the cpuAlt (needs 4) won't
+        // fit, but the gpuAlt (needs 1 CPU + 1 NVDEC) does.  Fall back to it.
+        var pool = new ResourcePool(cpu: 4, nvenc: 2, nvdec: 2, cuda: 2);
+
+        var cpuHolder = await pool.AcquireAsync(new(Cpu: 3), CancellationToken.None);
+
+        var cpuAlt = new ResourceRequest(Cpu: 4);
+        var gpuAlt = new ResourceRequest(Cpu: 1, Nvdec: 1);
+
+        var result = await pool.AcquireAnyAsync(new[] { cpuAlt, gpuAlt }, CancellationToken.None);
+        Assert.That(result.AlternativeIndex, Is.EqualTo(1));
+        Assert.That(result.Granted, Is.EqualTo(gpuAlt));
+        result.Lease.Dispose();
+        cpuHolder.Dispose();
+    }
+
+    [Test]
+    public async Task AcquireAny_QueuesWhenNoAlternativeFits()
+    {
+        // The cpuAlt needs 4 CPU (only 1 free), and the gpuAlt's NVDEC slot
+        // is held — neither fits, so the waiter queues.  Freeing NVDEC lets
+        // the gpu alternative satisfy the queued waiter.
+        var pool = new ResourcePool(cpu: 4, nvenc: 2, nvdec: 1, cuda: 2);
+
+        var cpuHolder = await pool.AcquireAsync(new(Cpu: 3), CancellationToken.None);
+        var nvdecHolder = await pool.AcquireAsync(new(Nvdec: 1), CancellationToken.None);
+
+        var cpuAlt = new ResourceRequest(Cpu: 4);
+        var gpuAlt = new ResourceRequest(Cpu: 1, Nvdec: 1);
+
+        var task = pool.AcquireAnyAsync(new[] { cpuAlt, gpuAlt }, CancellationToken.None);
+        await Task.Delay(50);
+        Assert.That(task.IsCompleted, Is.False);
+
+        // Free NVDEC → waiter wakes via the GPU alternative.
+        nvdecHolder.Dispose();
+        var result = await task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.That(result.AlternativeIndex, Is.EqualTo(1));
+        result.Lease.Dispose();
+        cpuHolder.Dispose();
+    }
+
+    [Test]
+    public async Task AcquireAny_QueuedWaiterPicksWhicheverAlternativeBecomesFree()
+    {
+        // The queued waiter is woken by whichever of its alternatives
+        // becomes satisfiable first.  Demonstrates the "either path works"
+        // semantics from the queue side.
+        var pool = new ResourcePool(cpu: 4, nvenc: 2, nvdec: 1, cuda: 2);
+
+        var cpuHolder = await pool.AcquireAsync(new(Cpu: 4), CancellationToken.None);
+        var nvdecHolder = await pool.AcquireAsync(new(Nvdec: 1), CancellationToken.None);
+
+        var cpuAlt = new ResourceRequest(Cpu: 4);
+        var gpuAlt = new ResourceRequest(Cpu: 1, Nvdec: 1);
+
+        var task = pool.AcquireAnyAsync(new[] { cpuAlt, gpuAlt }, CancellationToken.None);
+        await Task.Delay(50);
+
+        // Free CPU first → the cpu alternative wins.
+        cpuHolder.Dispose();
+        var result = await task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.That(result.AlternativeIndex, Is.EqualTo(0));
+        result.Lease.Dispose();
+        nvdecHolder.Dispose();
     }
 
     [Test]

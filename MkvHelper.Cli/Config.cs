@@ -51,17 +51,33 @@ public sealed class Config
     // number is pinned on ffmpeg via -threads / -filter_threads so the
     // declared cost matches actual consumption.  Resource pool accounting
     // is therefore exact, not estimated.
+    //
+    // Phases whose decode side can run on either CPU or NVDEC declare two
+    // costs (one per path) and a corresponding *Alternatives list that the
+    // ResourcePool picks from at admission time.  This lets work flow to
+    // whichever resource is currently free instead of pinning to one.
 
-    /// <summary>Threads for the full-file idet pass (Detection + Verification).
-    /// CPU sw-decode + filter + idet — splits cleanly across cores.</summary>
-    public int DetectionThreads { get; set; } = 4;
+    /// <summary>Threads for the full-file idet pass (Detection + Verification)
+    /// when the source is decoded on CPU.  Splits decode + idet across cores.</summary>
+    public int DetectionCpuThreads { get; set; } = 4;
+
+    /// <summary>Threads for the full-file idet pass when decode is offloaded
+    /// to NVDEC.  Lower than the CPU variant — only orchestration + the
+    /// CPU-side idet filter remain on the CPU (decode happens on the
+    /// dedicated NVDEC engine).</summary>
+    public int DetectionGpuThreads { get; set; } = 2;
 
     /// <summary>Threads for one lossless x264 preview encode.</summary>
     public int PreviewThreads { get; set; } = 4;
 
-    /// <summary>Threads for one FFV1 reference-clip extraction (Phase 1).
-    /// FFV1 encode is slice-parallel — more threads = faster, up to ~6.</summary>
-    public int RefExtractThreads { get; set; } = 4;
+    /// <summary>Threads for one FFV1 reference-clip extraction (Phase 1)
+    /// when source decode runs on CPU.  FFV1 encode is slice-parallel.</summary>
+    public int RefExtractCpuThreads { get; set; } = 4;
+
+    /// <summary>Threads for one FFV1 reference-clip extraction when source
+    /// decode is offloaded to NVDEC.  Encode is still on CPU but the decode
+    /// half no longer fights for cores.</summary>
+    public int RefExtractGpuThreads { get; set; } = 2;
 
     /// <summary>Threads for one Phase 2 sample encode from FFV1.  NVENC does
     /// the encode; CPU handles FFV1 decode + I/O.  Low: 2 is enough.</summary>
@@ -105,14 +121,33 @@ public sealed class Config
     public int LibvmafSubsample { get; set; } = 1;
 
     // --- ResourceRequest factories (one per operation) ---
+    //
+    // Phases listed as *Alternatives expose both a CPU-only and a GPU-decode
+    // shape; ResourcePool.AcquireAnyAsync picks the first that fits.  CPU
+    // path is listed first so it's preferred when both are free — that keeps
+    // NVDEC engines available for the final encode pipeline, which always
+    // needs them.  When the CPU pool is saturated (typically at the start
+    // of a batch where every file wants Detection at once), the GPU path
+    // is granted instead so files don't sit idle waiting for CPU.
 
-    public ResourceRequest DetectionRequest    => new(Cpu: DetectionThreads);
-    public ResourceRequest VerificationRequest => new(Cpu: DetectionThreads);
-    public ResourceRequest PreviewRequest      => new(Cpu: PreviewThreads);
-    public ResourceRequest RefExtractRequest   => new(Cpu: RefExtractThreads);
-    public ResourceRequest SampleEncodeRequest => new(Cpu: SampleEncodeThreads, Nvenc: 1);
-    public ResourceRequest VmafRequest         => new(Cpu: VmafThreads, Cuda: 1);
-    public ResourceRequest FinalEncodeRequest  => new(Cpu: FinalEncodeThreads, Nvenc: 1, Nvdec: 1);
+    public IReadOnlyList<ResourceRequest> DetectionAlternatives =>
+    [
+        new(Cpu: DetectionCpuThreads),
+        new(Cpu: DetectionGpuThreads, Nvdec: 1),
+    ];
+
+    public IReadOnlyList<ResourceRequest> VerificationAlternatives => DetectionAlternatives;
+
+    public IReadOnlyList<ResourceRequest> RefExtractAlternatives =>
+    [
+        new(Cpu: RefExtractCpuThreads),
+        new(Cpu: RefExtractGpuThreads, Nvdec: 1),
+    ];
+
+    public ResourceRequest PreviewRequest        => new(Cpu: PreviewThreads);
+    public ResourceRequest SampleEncodeRequest   => new(Cpu: SampleEncodeThreads, Nvenc: 1);
+    public ResourceRequest VmafRequest           => new(Cpu: VmafThreads, Cuda: 1);
+    public ResourceRequest FinalEncodeRequest    => new(Cpu: FinalEncodeThreads, Nvenc: 1, Nvdec: 1);
     public ResourceRequest SizeGuardRemuxRequest => new(Cpu: 1);
 
     // -- CQ search range --

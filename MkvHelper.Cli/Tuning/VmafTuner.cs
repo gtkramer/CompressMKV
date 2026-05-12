@@ -34,7 +34,7 @@ public static class VmafTuner
     public static async Task<TuningResult> TuneAsync(
         Config cfg, ResourcePool pool, string input, string outDir,
         RestoreDecision restore, bool isHdr, HdrMetadata? hdrMetadata,
-        PipelineFormat format, string vmafModelVersion,
+        PipelineFormat format, string vmafModelVersion, FfprobeStream vstream,
         CancellationToken ct, IPipelineLogger? logger = null)
     {
         logger ??= NullLogger.Instance;
@@ -85,8 +85,13 @@ public static class VmafTuner
         var refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
-            using (await pool.AcquireAsync(cfg.RefExtractRequest, ct))
-                await Pipelines.ExtractReferenceClipAsync(cfg, input, refPath, w, restore, ct);
+            var admit = await pool.AcquireAnyAsync(cfg.RefExtractAlternatives, ct);
+            using (admit.Lease)
+            {
+                bool useHwaccel = admit.Granted.Nvdec > 0;
+                await Pipelines.ExtractReferenceClipAsync(
+                    cfg, input, refPath, w, restore, vstream, useHwaccel, ct);
+            }
             refClips[i] = refPath;
             int done = Interlocked.Increment(ref extractedCount);
             logger.SetStage("Phase 1", $"extracted {done}/{windows.Count} refs");

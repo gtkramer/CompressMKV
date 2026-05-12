@@ -77,7 +77,7 @@ public class RestoreRoundtripIntegrationTests
         };
 
         var result = await OutputVerifier.VerifyAsync(
-            TestVideoFixture.CreateTestConfig(), output, restore, CancellationToken.None);
+            TestVideoFixture.CreateTestConfig(), output, restore, useHwaccel: false, CancellationToken.None);
 
         Assert.That(result.Passed, Is.True,
             $"IVTC verification should pass on a successful round-trip. " +
@@ -103,7 +103,7 @@ public class RestoreRoundtripIntegrationTests
         };
 
         var result = await OutputVerifier.VerifyAsync(
-            TestVideoFixture.CreateTestConfig(), output, restore, CancellationToken.None);
+            TestVideoFixture.CreateTestConfig(), output, restore, useHwaccel: false, CancellationToken.None);
 
         Assert.That(result.Passed, Is.True,
             $"Deinterlace verification should pass. " +
@@ -126,6 +126,7 @@ public class RestoreRoundtripIntegrationTests
             TestVideoFixture.CreateTestConfig(),
             TestVideoFixture.InterlacedClip,
             restore,
+            useHwaccel: false,
             CancellationToken.None);
 
         Assert.That(result.Passed, Is.False,
@@ -147,6 +148,7 @@ public class RestoreRoundtripIntegrationTests
             TestVideoFixture.CreateTestConfig(),
             TestVideoFixture.ProgressiveClip,
             restore,
+            useHwaccel: false,
             CancellationToken.None);
 
         Assert.That(result.Skipped, Is.True);
@@ -195,6 +197,6 @@ public class RestoreRoundtripIntegrationTests
         var cfg = TestVideoFixture.CreateTestConfig();
         var probe = await Ffprobe.RunAsync(cfg, path, CancellationToken.None);
         var vstream = probe.Streams!.First(s => s.CodecType == "video");
-        return await ContentDetector.DetectAsync(cfg, path, vstream, CancellationToken.None);
+        return await ContentDetector.DetectAsync(cfg, path, vstream, useHwaccel: false, CancellationToken.None);
     }
 }

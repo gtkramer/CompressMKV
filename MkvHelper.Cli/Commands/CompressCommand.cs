@@ -306,9 +306,12 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         var sw = Stopwatch.StartNew();
         ContentDetectionResult detection;
-        using (await pool.AcquireAsync(cfg.DetectionRequest, ct))
+        var detectAdmit = await pool.AcquireAnyAsync(cfg.DetectionAlternatives, ct);
+        using (detectAdmit.Lease)
         {
-            detection = await ContentDetector.DetectAsync(cfg, input, vstream, ct, logger);
+            bool useHwaccel = detectAdmit.Granted.Nvdec > 0;
+            logger.LogInfo($"Detection: decoder = {(useHwaccel ? "NVDEC" : "CPU")}");
+            detection = await ContentDetector.DetectAsync(cfg, input, vstream, useHwaccel, ct, logger);
         }
         timings.Detection = sw.Elapsed;
 
@@ -367,7 +370,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             : "VMAF execution: GPU (libvmaf_cuda)");
 
         var tuning = await VmafTuner.TuneAsync(cfg, pool, input, outDir, restore,
-            isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, ct, logger);
+            isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, vstream, ct, logger);
         timings.TuningPhase1 = tuning.Phase1Elapsed;
         timings.TuningPhase2 = tuning.Phase2Elapsed;
 
@@ -393,9 +396,12 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         sw.Restart();
         OutputVerificationResult verification;
-        using (await pool.AcquireAsync(cfg.VerificationRequest, ct))
+        var verifyAdmit = await pool.AcquireAnyAsync(cfg.VerificationAlternatives, ct);
+        using (verifyAdmit.Lease)
         {
-            verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, ct, logger);
+            bool useHwaccel = verifyAdmit.Granted.Nvdec > 0;
+            logger.LogInfo($"Verification: decoder = {(useHwaccel ? "NVDEC" : "CPU")}");
+            verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, useHwaccel, ct, logger);
         }
         timings.Verification = sw.Elapsed;
         timings.Total = totalSw.Elapsed;
