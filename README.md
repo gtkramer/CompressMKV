@@ -207,7 +207,8 @@ CompressMKV/
 │   ├── Models/                  Summary / report DTOs (log.json shape)
 │   └── Logging/                 Per-file decisions.log + live UI reporter
 └── MkvHelper.Tests/             NUnit test suite
-    └── (Integration namespace)  Tests that route through the dependency container
+    ├── Unit/                    Pure-logic tests (no external processes, <1 s total)
+    └── Integration/             Tests that route through the dependency container
 ```
 
 ## Bundled dependency container

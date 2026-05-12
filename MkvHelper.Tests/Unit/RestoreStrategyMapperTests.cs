@@ -1,4 +1,4 @@
-namespace MkvHelper.Tests;
+namespace MkvHelper.Tests.Unit;
 
 /// <summary>
 /// Decision-table tests for §7.2.3 action selection.  Each test corresponds

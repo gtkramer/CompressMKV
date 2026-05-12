@@ -1,4 +1,4 @@
-namespace MkvHelper.Tests;
+namespace MkvHelper.Tests.Unit;
 
 [TestFixture]
 [Category("Unit")]

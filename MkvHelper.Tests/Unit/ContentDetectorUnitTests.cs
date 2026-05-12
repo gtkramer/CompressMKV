@@ -1,4 +1,4 @@
-namespace MkvHelper.Tests;
+namespace MkvHelper.Tests.Unit;
 
 /// <summary>
 /// Pure-logic tests for ContentDetector — no ffmpeg invocations.

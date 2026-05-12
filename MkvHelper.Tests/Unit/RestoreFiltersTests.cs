@@ -1,4 +1,4 @@
-namespace MkvHelper.Tests;
+namespace MkvHelper.Tests.Unit;
 
 /// <summary>
 /// Composition tests for the §7.2.3 ffmpeg filter chains.  These tests build

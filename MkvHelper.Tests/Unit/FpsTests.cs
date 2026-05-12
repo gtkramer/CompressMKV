@@ -1,4 +1,4 @@
-namespace MkvHelper.Tests;
+namespace MkvHelper.Tests.Unit;
 
 [TestFixture]
 public class FpsTests
