@@ -29,7 +29,8 @@
       "Bash(podman run *)",
       "Bash(curl -s \"https://api.github.com/repos/jellyfin/jellyfin-ffmpeg/contents/debian/patches?ref=v7.1.3-6\")",
       "Bash(python3 -c ' *)",
-      "Bash(curl -s \"https://raw.githubusercontent.com/jellyfin/jellyfin-ffmpeg/v7.1.3-6/debian/patches/series\")"
+      "Bash(curl -s \"https://raw.githubusercontent.com/jellyfin/jellyfin-ffmpeg/v7.1.3-6/debian/patches/series\")",
+      "Bash(./mkvhelper container *)"
     ]
   }
 }
