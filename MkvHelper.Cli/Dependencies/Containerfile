@@ -87,8 +87,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libaom-dev \
         libass-dev \
         libdav1d-dev \
-        libfreetype6-dev \
+        # drawtext stack: freetype (glyph rasteriser) + fribidi (bi-di shaping)
+        # + harfbuzz (complex-script shaping; required by FFmpeg ≥ 7.0 even for
+        # Latin) + fontconfig (lets drawtext resolve the default "Sans" font
+        # without an explicit fontfile=) + a font (DejaVu is what fontconfig
+        # picks for "Sans" out of the box).  All five are needed for the
+        # integration-test fixture's `drawtext=...` call to compile and run.
+        libfreetype-dev \
         libfribidi-dev \
+        libharfbuzz-dev \
+        libfontconfig-dev \
+        fonts-dejavu-core \
         libmp3lame-dev \
         libopus-dev \
         libtheora-dev \
@@ -181,12 +190,16 @@ RUN cd /tmp \
         --enable-libass \
         --enable-libwebp \
         --enable-libzimg \
-        # libfreetype/libfribidi enable the `drawtext` filter, used by
-        # the integration test fixture's synthetic-clip builder (a frame
-        # counter overlay is what gives idet the right amount of motion
-        # signal to classify the synthesised source as progressive).
+        # drawtext filter dependency stack — needed by the integration-test
+        # fixture's synthetic-clip builder (frame-number overlay gives idet
+        # the right amount of motion to classify as progressive).  FFmpeg
+        # ≥ 7.0 silently drops drawtext from the build unless harfbuzz is
+        # enabled; fontconfig lets it resolve "Sans" without an explicit
+        # fontfile= argument.
         --enable-libfreetype \
         --enable-libfribidi \
+        --enable-libharfbuzz \
+        --enable-libfontconfig \
         --nvccflags="${NVCC_FLAGS}" \
     && make -j"$(nproc)" \
     && make install \
