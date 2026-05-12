@@ -13,5 +13,5 @@ public sealed class VmafResult
     /// Per-frame VMAF scores from the "frames" array in the JSON log.
     /// Used for robust percentile computation across all samples.
     /// </summary>
-    public List<double> FrameScores { get; set; } = new();
+    public List<double> FrameScores { get; set; } = [];
 }

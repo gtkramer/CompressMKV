@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Threading;
 using Spectre.Console;
 using Spectre.Console.Cli;
 
@@ -31,8 +32,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 {
     protected override async Task<int> ExecuteAsync(CommandContext context, CompressSettings settings, CancellationToken token)
     {
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        using CancellationTokenSource cts = ConsoleCancellation.LinkToConsole(token);
 
         if (string.IsNullOrWhiteSpace(settings.Input))
         {
@@ -40,7 +40,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             return 2;
         }
 
-        var cfg = BuildConfig(settings.Input!, settings.Output);
+        Config cfg = BuildConfig(settings.Input!, settings.Output);
 
         if (!Directory.Exists(cfg.InputFolder))
         {
@@ -69,7 +69,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             $"[grey]Using container[/] [bold]{Markup.Escape(state.ImageTag)}[/] " +
             $"[grey](built {state.BuiltUtc:yyyy-MM-dd HH:mm}Z).[/]");
 
-        var discovered = await VideoFileDiscovery.DiscoverAsync(cfg, cfg.InputFolder, cts.Token);
+        List<DiscoveredVideo> discovered = await VideoFileDiscovery.DiscoverAsync(cfg, cfg.InputFolder, cts.Token);
 
         AnsiConsole.MarkupLine($"[bold]Found {discovered.Count} video file(s)[/] under {Markup.Escape(cfg.InputFolder)}");
         if (discovered.Count == 0)
@@ -98,9 +98,9 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             cfg.InputFolder, cfg.OutputFolder, cfg.CpuPool, cfg.NvencSlots,
             cfg.NvdecSlots, cfg.CudaSlots, discovered.Count, settings.ForceRedo);
 
-        var pool = new ResourcePool(cfg.CpuPool, cfg.NvencSlots, cfg.NvdecSlots, cfg.CudaSlots);
-        var overall = new OverallSummary { StartedUtc = DateTime.UtcNow, Config = cfg };
-        var reporter = new StageReporter(discovered.Count);
+        ResourcePool pool = new(cfg.CpuPool, cfg.NvencSlots, cfg.NvdecSlots, cfg.CudaSlots);
+        OverallSummary overall = new() { StartedUtc = DateTime.UtcNow, Config = cfg };
+        StageReporter reporter = new(discovered.Count);
 
         // Background sampler: real CPU + GPU + pool snapshot every N seconds.
         // Disabled when SystemSamplerIntervalSeconds is 0.
@@ -108,7 +108,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             ? new SystemSampler(pool, TimeSpan.FromSeconds(cfg.SystemSamplerIntervalSeconds), cts.Token)
             : null;
 
-        var workTask = ProcessAllFilesAsync(
+        Task workTask = ProcessAllFilesAsync(
             cfg, pool, discovered, settings.ForceRedo,
             overall, reporter, cts.Token);
 
@@ -132,7 +132,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         if (sampler is not null) await sampler.DisposeAsync();
 
         overall.FinishedUtc = DateTime.UtcNow;
-        var overallPath = Path.Combine(cfg.OutputFolder, $"overall_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
+        string overallPath = Path.Combine(cfg.OutputFolder, $"overall_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
         await JsonIO.WriteAsync(overallPath, overall, cts.Token);
 
         Serilog.Log.Logger.Information(
@@ -142,16 +142,16 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         await Serilog.Log.CloseAndFlushAsync();
 
         AnsiConsole.WriteLine();
-        var rule = new Rule("[bold]Run summary[/]") { Justification = Justify.Left };
+        Rule rule = new("[bold]Run summary[/]") { Justification = Justify.Left };
         AnsiConsole.Write(rule);
         AnsiConsole.MarkupLine($"  [green]Completed:[/] {overall.Videos.Count - overall.Errors.Count} files");
         AnsiConsole.MarkupLine($"  [yellow]Skipped via resume:[/] {overall.Videos.Count(v => v.Tuning == null && v.OutputVerification == null)}");
         if (overall.Errors.Count > 0)
             AnsiConsole.MarkupLine($"  [red]Errored:[/] {overall.Errors.Count}");
-        var marginalCount = overall.Videos.Count(v => v.Tuning?.Selection?.IsMarginal == true);
+        int marginalCount = overall.Videos.Count(v => v.Tuning?.Selection?.IsMarginal == true);
         if (marginalCount > 0)
             AnsiConsole.MarkupLine($"  [yellow]Marginal passes:[/] {marginalCount}");
-        var passthroughCount = overall.Videos.Count(v => v.SizeGuard?.FellBack == true);
+        int passthroughCount = overall.Videos.Count(v => v.SizeGuard?.FellBack == true);
         if (passthroughCount > 0)
             AnsiConsole.MarkupLine($"  [yellow]Passthrough fallback:[/] {passthroughCount} (source already efficiently compressed)");
         AnsiConsole.MarkupLine($"  [grey]Wrote {overallPath}[/]");
@@ -167,6 +167,13 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         Config cfg, ResourcePool pool, List<DiscoveredVideo> files,
         bool forceRedo, OverallSummary overall, StageReporter reporter, CancellationToken ct)
     {
+        // Local lock guarding writes to the shared OverallSummary (Videos +
+        // Errors lists) from parallel per-file workers.  A dedicated lock
+        // object is preferred over locking on `overall` itself: it keeps the
+        // synchronization invariant visible at one site and avoids implicit
+        // contention with any future use of the OverallSummary instance.
+        Lock overallLock = new();
+
         // Files admit unbounded — every file's tasks queue against the pool
         // immediately on startup.  The pool's strict-FIFO ordering means the
         // earlier files in the list naturally get resources first; later
@@ -182,21 +189,21 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             },
             async (item, fileCt) =>
             {
-                var (discovered, idx) = item;
-                var file = discovered.Path;
-                var id = SafeId(Path.GetFileNameWithoutExtension(file));
-                var outDir = Path.Combine(cfg.OutputFolder, id);
-                var logPath = Path.Combine(outDir, "log.json");
-                var fileName = Path.GetFileName(file);
+                (DiscoveredVideo discovered, int idx) = item;
+                string file = discovered.Path;
+                string id = SafeId(Path.GetFileNameWithoutExtension(file));
+                string outDir = Path.Combine(cfg.OutputFolder, id);
+                string logPath = Path.Combine(outDir, "log.json");
+                string fileName = Path.GetFileName(file);
 
                 if (!forceRedo && File.Exists(logPath))
                 {
                     try
                     {
-                        var prior = await JsonIO.ReadAsync<VideoSummary>(logPath, fileCt);
+                        VideoSummary? prior = await JsonIO.ReadAsync<VideoSummary>(logPath, fileCt);
                         if (prior != null)
                         {
-                            lock (overall) overall.Videos.Add(prior);
+                            lock (overallLock) overall.Videos.Add(prior);
                             reporter.SkipFile(idx, fileName, "prior log.json found");
                             return;
                         }
@@ -211,14 +218,14 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 int slot = idx;
                 reporter.BeginFile(slot, idx, fileName);
 
-                using var logger = new PerFileLogger(
+                using PerFileLogger logger = new(
                     Path.Combine(outDir, "decisions.log"), id, reporter, slot);
 
                 try
                 {
-                    var summary = await ProcessOneAsync(cfg, pool, file, discovered.Probe, fileCt, logger);
-                    lock (overall) overall.Videos.Add(summary);
-                    var (resultText, level) = SummariseResult(summary);
+                    VideoSummary summary = await ProcessOneAsync(cfg, pool, file, discovered.Probe, fileCt, logger);
+                    lock (overallLock) overall.Videos.Add(summary);
+                    (string resultText, ResultLevel level) = SummariseResult(summary);
                     reporter.CompleteFile(slot, resultText, level);
                 }
                 catch (OperationCanceledException)
@@ -229,7 +236,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 catch (Exception ex)
                 {
                     logger.LogError(ex.ToString());
-                    lock (overall) overall.Errors.Add(new RunError { File = file, Error = ex.ToString() });
+                    lock (overallLock) overall.Errors.Add(new RunError { File = file, Error = ex.ToString() });
                     reporter.CompleteFile(slot, $"error: {Truncate(ex.Message, 60)}", ResultLevel.Failure);
                 }
             });
@@ -295,17 +302,17 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         CancellationToken ct, IPipelineLogger logger)
     {
         await Task.CompletedTask;
-        var totalSw = Stopwatch.StartNew();
-        var timings = new PhaseTimings();
-        var id = SafeId(Path.GetFileNameWithoutExtension(input));
-        var outDir = Path.Combine(cfg.OutputFolder, id);
+        Stopwatch totalSw = Stopwatch.StartNew();
+        PhaseTimings timings = new();
+        string id = SafeId(Path.GetFileNameWithoutExtension(input));
+        string outDir = Path.Combine(cfg.OutputFolder, id);
         Directory.CreateDirectory(outDir);
 
         logger.LogInfo($"Input: {input}");
         logger.LogInfo($"Output dir: {outDir}");
         logger.LogInfo($"Container image: {ContainerTools.ImageTag}");
 
-        var vstream = probe.Streams?.FirstOrDefault(s => s.IsActualVideo())
+        FfprobeStream vstream = probe.Streams?.FirstOrDefault(s => s.IsActualVideo())
                      ?? throw new InvalidOperationException("No usable video stream found.");
 
         bool isHdr = SourceClassifier.IsHdr(vstream);
@@ -323,15 +330,15 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             logger.LogInfo($"HDR npl: {npl} nits (from {source})");
         }
 
-        var pipelineFormat = PipelineFormat.FromStream(vstream);
+        PipelineFormat pipelineFormat = PipelineFormat.FromStream(vstream);
         logger.LogInfo($"Pipeline format: {pipelineFormat}");
 
         string vmafModelVersion = cfg.ResolveVmafModelVersion(vstream.Width, vstream.Height);
         logger.LogInfo($"VMAF model: {vmafModelVersion} (source {vstream.Width}x{vstream.Height})");
 
-        var sw = Stopwatch.StartNew();
+        Stopwatch sw = Stopwatch.StartNew();
         ContentDetectionResult detection;
-        var detectAdmit = await pool.AcquireAnyAsync(
+        AcquireResult detectAdmit = await pool.AcquireAnyAsync(
             cfg.DetectionAlternatives, ct, file: id, op: "detection");
         using (detectAdmit.Lease)
         {
@@ -344,7 +351,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         }
         timings.Detection = sw.Elapsed;
 
-        var restore = RestoreStrategyMapper.MapToRestore(detection);
+        RestoreDecision restore = RestoreStrategyMapper.MapToRestore(detection);
         logger.LogInfo($"Restore decision: {restore.Mode} (filter=\"{restore.FilterGraph}\", fps={restore.OutputFps?.ToString() ?? "native"})");
         logger.LogInfo($"  Reason: {restore.Notes}");
 
@@ -357,12 +364,12 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             sw.Restart();
             logger.SetStage("Previews", $"generating {cfg.PreviewCount}×IVTC + {cfg.PreviewCount}×Deint");
             logger.LogInfo($"Generating {cfg.PreviewCount} preview pairs (low confidence or parity mismatch).");
-            var previewDir = Path.Combine(outDir, "previews");
+            string previewDir = Path.Combine(outDir, "previews");
             Directory.CreateDirectory(previewDir);
-            restore.Previews = new List<PreviewArtifact>();
+            restore.Previews = [];
 
-            var dur = probe.Format?.DurationSeconds ?? 0;
-            var previewTs = new List<double>();
+            double dur = probe.Format?.DurationSeconds ?? 0;
+            List<double> previewTs = [];
             if (dur > 0)
             {
                 double step = dur / (cfg.PreviewCount + 1);
@@ -378,7 +385,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                         cfg, input, outPath, mode, detection.DetectedParity, t, ct);
             }
 
-            foreach (var t in previewTs)
+            foreach (double t in previewTs)
             {
                 ct.ThrowIfCancellationRequested();
                 string baseTag = $"t{t.ToString("F1", CultureInfo.InvariantCulture)}";
@@ -398,7 +405,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             ? "VMAF execution: GPU (libvmaf_cuda); HDR tonemap chain on CPU"
             : "VMAF execution: GPU (libvmaf_cuda)");
 
-        var tuning = await VmafTuner.TuneAsync(cfg, pool, input, outDir, restore,
+        TuningResult tuning = await VmafTuner.TuneAsync(cfg, pool, input, outDir, restore,
             isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, vstream, ct, logger);
         timings.TuningPhase1 = tuning.Phase1Elapsed;
         timings.TuningPhase2 = tuning.Phase2Elapsed;
@@ -407,12 +414,12 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         {
             logger.LogWarning("Selection is MARGINAL — within "
                 + $"{Selector.MarginalThresholdPoints:F1} VMAF points of threshold:");
-            foreach (var r in tuning.Selection.MarginalReasons)
+            foreach (string r in tuning.Selection.MarginalReasons)
                 logger.LogWarning($"  ! {r}");
         }
 
         int finalCq = tuning.Selection.SelectedCq;
-        var finalOut = Path.Combine(outDir, $"{id}_av1_cq{finalCq}{cfg.OutputExtension}");
+        string finalOut = Path.Combine(outDir, $"{id}_av1_cq{finalCq}{cfg.OutputExtension}");
         sw.Restart();
         await FinalEncoder.EncodeAsync(cfg, pool, input, finalOut, restore, finalCq, pipelineFormat, ct, logger);
         timings.FinalEncode = sw.Elapsed;
@@ -420,12 +427,12 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         // SizeGuard does the (instant) size check inline; it acquires a small
         // CPU slice from the pool only if the remux fallback actually fires.
-        var sizeGuard = await SizeGuard.MaybeFallbackAsync(cfg, pool, input, finalOut, restore, logger, ct);
+        SizeGuardOutcome sizeGuard = await SizeGuard.MaybeFallbackAsync(cfg, pool, input, finalOut, restore, logger, ct);
         finalOut = sizeGuard.OutputPath;
 
         sw.Restart();
         OutputVerificationResult verification;
-        var verifyAdmit = await pool.AcquireAnyAsync(
+        AcquireResult verifyAdmit = await pool.AcquireAnyAsync(
             cfg.VerificationAlternatives, ct, file: id, op: "verification");
         using (verifyAdmit.Lease)
         {
@@ -448,7 +455,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             $"final={timings.FinalEncode.TotalSeconds:F1}s, " +
             $"verify={timings.Verification.TotalSeconds:F1}s.");
 
-        var summary = new VideoSummary
+        VideoSummary summary = new()
         {
             VideoId = id,
             InputPath = input,
@@ -474,9 +481,9 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
     private static void CleanIntermediates(string outDir)
     {
-        foreach (var subDir in new[] { "refs", "samples", "vmaf", "previews" })
+        foreach (string subDir in (string[])["refs", "samples", "vmaf", "previews"])
         {
-            var path = Path.Combine(outDir, subDir);
+            string path = Path.Combine(outDir, subDir);
             if (Directory.Exists(path))
                 Directory.Delete(path, recursive: true);
         }
@@ -484,8 +491,8 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
     private static string SafeId(string s)
     {
-        var sb = new System.Text.StringBuilder(s.Length);
-        foreach (var ch in s)
+        System.Text.StringBuilder sb = new(s.Length);
+        foreach (char ch in s)
             sb.Append(char.IsLetterOrDigit(ch) || ch is '-' or '_' or '.' ? ch : '_');
         return sb.ToString();
     }

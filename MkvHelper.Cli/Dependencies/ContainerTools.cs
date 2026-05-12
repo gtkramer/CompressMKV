@@ -20,7 +20,7 @@ namespace MkvHelper;
 public static class ContainerTools
 {
     private static string s_imageTag = "";
-    private static readonly List<string> s_mounts = new();
+    private static readonly List<string> s_mounts = [];
 
     public static string ImageTag => s_imageTag;
 
@@ -37,7 +37,7 @@ public static class ContainerTools
         s_useContainer = true;
         s_imageTag = imageTag;
         s_mounts.Clear();
-        foreach (var m in hostMounts)
+        foreach (string m in hostMounts)
         {
             if (string.IsNullOrWhiteSpace(m)) continue;
             string abs = Path.GetFullPath(m);
@@ -89,14 +89,14 @@ public static class ContainerTools
 
     private static Task<(int, string, string)> RunAsync(string tool, string[] args, CancellationToken ct)
     {
-        var (exe, finalArgs) = BuildPodmanInvocation(tool, args);
+        (string exe, string[] finalArgs) = BuildPodmanInvocation(tool, args);
         return Proc.RunAsync(exe, finalArgs, ct);
     }
 
     private static Task<(int, string)> RunStreamingAsync(
         string tool, string[] args, Action<string> onLine, CancellationToken ct)
     {
-        var (exe, finalArgs) = BuildPodmanInvocation(tool, args);
+        (string exe, string[] finalArgs) = BuildPodmanInvocation(tool, args);
         return Proc.RunStreamingAsync(exe, finalArgs, onLine, ct);
     }
 
@@ -112,15 +112,15 @@ public static class ContainerTools
                 "ContainerTools.Configure must be called before any Run* invocation.  " +
                 "This is a wiring bug — the command's startup forgot to set the mounts.");
 
-        var podArgs = new List<string>
-        {
+        List<string> podArgs =
+        [
             "run", "--rm",
             "--network=none",            // ffmpeg/mkvtoolnix don't need network
             "--device", "nvidia.com/gpu=all",
             "--userns=keep-id",
             "--security-opt=label=disable",
-        };
-        foreach (var mount in s_mounts)
+        ];
+        foreach (string mount in s_mounts)
         {
             podArgs.Add("-v");
             podArgs.Add($"{mount}:{mount}");

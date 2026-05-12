@@ -5,7 +5,7 @@ namespace MkvHelper;
 
 public static class JsonIO
 {
-    private static readonly JsonSerializerOptions Opts = new()
+    private static readonly JsonSerializerOptions s_jsonOpts = new()
     {
         WriteIndented = true,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
@@ -13,14 +13,16 @@ public static class JsonIO
 
     public static async Task WriteAsync<T>(string path, T obj, CancellationToken ct)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await using var fs = File.Create(path);
-        await JsonSerializer.SerializeAsync(fs, obj, Opts, ct);
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        await using FileStream fs = File.Create(path);
+        await JsonSerializer.SerializeAsync(fs, obj, s_jsonOpts, ct);
     }
 
     public static async Task<T?> ReadAsync<T>(string path, CancellationToken ct)
     {
-        await using var fs = File.OpenRead(path);
-        return await JsonSerializer.DeserializeAsync<T>(fs, Opts, ct);
+        await using FileStream fs = File.OpenRead(path);
+        return await JsonSerializer.DeserializeAsync<T>(fs, s_jsonOpts, ct);
     }
 }

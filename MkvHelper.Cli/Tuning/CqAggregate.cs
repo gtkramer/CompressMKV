@@ -9,7 +9,7 @@ public sealed class CqAggregate
     public double P01Vmaf { get; set; }
     public double MinVmaf { get; set; }
     public int TotalFrameCount { get; set; }
-    public List<SampleMetric> Samples { get; set; } = new();
+    public List<SampleMetric> Samples { get; set; } = [];
 
     /// <summary>
     /// Aggregates from ALL per-frame VMAF scores across all samples.  With 16
@@ -34,7 +34,7 @@ public sealed class CqAggregate
     public static CqAggregate From(int cq, List<SampleMetric> samples)
     {
         // Collect ALL per-frame scores across every sample for robust percentile computation.
-        var allFrameScores = samples
+        List<double> allFrameScores = samples
             .SelectMany(s => s.FrameVmafScores)
             .OrderBy(x => x)
             .ToList();
@@ -45,7 +45,7 @@ public sealed class CqAggregate
         double p01 = Percentile(allFrameScores, 0.01);
 
         // Harmonic mean — more sensitive to quality drops than arithmetic mean.
-        var positive = allFrameScores.Where(x => x > 0).ToList();
+        List<double> positive = allFrameScores.Where(x => x > 0).ToList();
         double harmonicMean = positive.Count > 0
             ? positive.Count / positive.Sum(x => 1.0 / x)
             : 0;

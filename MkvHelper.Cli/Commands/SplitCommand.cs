@@ -75,8 +75,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
     protected override async Task<int> ExecuteAsync(
         CommandContext context, SplitSettings settings, CancellationToken token)
     {
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        using CancellationTokenSource cts = ConsoleCancellation.LinkToConsole(token);
 
         // Required-field guarantees come from Validate(); these locals just
         // narrow nullability for the rest of the method.
@@ -109,7 +108,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
             return 1;
         }
 
-        var allChapters = chapters.EditionEntry.ChapterAtoms;
+        List<ChapterAtom> allChapters = chapters.EditionEntry.ChapterAtoms;
         if (allChapters.Count == 0)
         {
             AnsiConsole.MarkupLine($"[yellow]No chapters found in {Markup.Escape(inputFile)} — nothing to split.[/]");
@@ -127,10 +126,10 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
                 $"(file has {allChapters.Count} chapters).");
             return 1;
         }
-        var chapterAtoms = allChapters.GetRange(startIndex0, allChapters.Count - startIndex0);
+        List<ChapterAtom> chapterAtoms = allChapters.GetRange(startIndex0, allChapters.Count - startIndex0);
 
         // Phase 1: classify each chapter as main vs. non-main by duration.
-        var isMain = new bool[chapterAtoms.Count];
+        bool[] isMain = new bool[chapterAtoms.Count];
         for (int i = 0; i < chapterAtoms.Count; i++)
             isMain[i] = chapterAtoms[i].GetDurationSeconds() >= settings.EpisodeChapterThreshold;
 
@@ -138,7 +137,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
         // (start, end) chapter index pairs.  endIndex = transition + additionalChapters,
         // clamped to the last chapter to handle "the last episode has fewer
         // trailing chapters than additionalChapters" cleanly.
-        var episodeRanges = new List<(int Start, int End)>();
+        List<(int Start, int End)> episodeRanges = [];
         int episodeStart = 0;
         for (int i = 0; i < chapterAtoms.Count; i++)
         {
@@ -184,7 +183,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
                 for (int i = 0; i < episodeRanges.Count; i++)
                 {
                     cts.Token.ThrowIfCancellationRequested();
-                    var (rangeStart, rangeEnd) = episodeRanges[i];
+                    (int rangeStart, int rangeEnd) = episodeRanges[i];
 
                     int episodeNum = settings.StartEpisodeNum + i;
                     string fileName = $"{seriesName} - S{settings.SeasonNum:D2}E{episodeNum:D2}.mkv";
@@ -192,7 +191,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
 
                     ctx.Status($"Writing {Markup.Escape(fileName)} ({i + 1}/{episodeRanges.Count})...");
 
-                    var renumbered = BuildEpisodeChapters(chapterAtoms, rangeStart, rangeEnd);
+                    Chapters renumbered = BuildEpisodeChapters(chapterAtoms, rangeStart, rangeEnd);
                     string startTs = chapterAtoms[rangeStart].ChapterTimeStart;
                     string endTs = chapterAtoms[rangeEnd].ChapterTimeEnd;
 
@@ -214,7 +213,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
     private static Chapters BuildEpisodeChapters(List<ChapterAtom> source, int startIdx, int endIdx)
     {
         int count = endIdx - startIdx + 1;
-        var sliced = source.GetRange(startIdx, count);
+        List<ChapterAtom> sliced = source.GetRange(startIdx, count);
         for (int i = 0; i < sliced.Count; i++)
         {
             sliced[i].ChapterDisplay.ChapterString = $"Chapter {i + 1}";

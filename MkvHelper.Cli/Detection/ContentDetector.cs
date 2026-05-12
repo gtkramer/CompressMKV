@@ -119,11 +119,11 @@ public static partial class ContentDetector
         // periodic decoder progress chatter that would otherwise fill stderr
         // at info level.
         int threads = useHwaccel ? cfg.DetectionGpuThreads : cfg.DetectionCpuThreads;
-        var argList = new List<string>
-        {
+        List<string> argList =
+        [
             "-hide_banner", "-loglevel", "info", "-nostats",
             "-threads", threads.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        };
+        ];
 
         if (useHwaccel)
         {
@@ -132,7 +132,7 @@ public static partial class ContentDetector
             // frames it would have on the CPU path.  -hwaccel_output_format
             // is what triggers the auto-download — without it the decoder
             // produces hwframes that idet can't consume.
-            var format = PipelineFormat.FromStream(vstream);
+            PipelineFormat format = PipelineFormat.FromStream(vstream);
             argList.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", format.HwaccelOutputFormat]);
         }
 
@@ -144,17 +144,17 @@ public static partial class ContentDetector
         ]);
 
         // ---- Per-frame accumulation ----
-        var frames = new List<FrameFlag>();
+        List<FrameFlag> frames = [];
         long totalTff = 0, totalBff = 0;
 
-        var regex = IdetFrameRegex();
+        Regex regex = IdetFrameRegex();
 
         logger.SetStage("Detect", "decoding full file with idet");
         logger.LogInfo("Detection: decoding full file with idet (single pass).");
 
         void ProcessLine(string line)
         {
-            var match = regex.Match(line);
+            Match match = regex.Match(line);
             if (!match.Success) return;
 
             switch (match.Groups[1].Value.ToLowerInvariant())
@@ -176,7 +176,7 @@ public static partial class ContentDetector
             }
         }
 
-        var (exitCode, stderr) = await ContainerTools.RunFfmpegStreamingAsync(argList.ToArray(), ProcessLine, ct);
+        (int exitCode, string stderr) = await ContainerTools.RunFfmpegStreamingAsync(argList.ToArray(), ProcessLine, ct);
 
         logger.LogInfo($"Detection: decoded {frames.Count:N0} frames.");
         if (exitCode != 0)
@@ -185,11 +185,11 @@ public static partial class ContentDetector
         // Parse idet's end-of-stream aggregate line ("Multi frame detection:...") from stderr.
         // This is ffmpeg's own claim about the file using the same detector we sampled per-frame.
         // Cross-checking validates our parser; significant divergence indicates a bug.
-        var (aggProg, aggTff, aggBff, aggUndet) = ParseIdetAggregate(stderr);
+        (long? aggProg, long? aggTff, long? aggBff, long? aggUndet) = ParseIdetAggregate(stderr);
 
         // ---- Per-frame counts ----
         int progCount = 0, intCount = 0, undetCount = 0;
-        foreach (var f in frames)
+        foreach (FrameFlag f in frames)
         {
             switch (f)
             {
@@ -212,10 +212,10 @@ public static partial class ContentDetector
         bool isLikelyCfr = vstream.IsLikelyCfr();
 
         // ---- Parity ----
-        var ffprobeParity = FieldOrderMapper.MapToParity(
+        FieldParity ffprobeParity = FieldOrderMapper.MapToParity(
             vstream.FieldOrder?.Trim().ToLowerInvariant() ?? "");
 
-        var (parity, parityFromNtsc) = DetectParity(totalTff, totalBff, isNtsc, ffprobeParity);
+        (FieldParity parity, bool parityFromNtsc) = DetectParity(totalTff, totalBff, isNtsc, ffprobeParity);
 
         bool parityMismatch =
             ffprobeParity != FieldParity.Auto &&
@@ -228,7 +228,7 @@ public static partial class ContentDetector
             progCount, totalTff, totalBff, undetCount);
 
         // ---- Classify ----
-        var (contentType, confidence, reason) = Classify(
+        (ContentType contentType, double confidence, string reason) = Classify(
             intCount, progFrac, cadenceRate, iInCadence, parityMismatch);
 
         logger.LogInfo($"Detection complete: {contentType} (confidence={confidence:P0})");
@@ -305,11 +305,11 @@ public static partial class ContentDetector
 
         for (int i = 1; i < windows; i++)
         {
-            var leaving = frames[i - 1];
+            FrameFlag leaving = frames[i - 1];
             if (leaving == FrameFlag.Progressive) p--;
             else if (leaving == FrameFlag.Interlaced) intl--;
 
-            var entering = frames[i + 4];
+            FrameFlag entering = frames[i + 4];
             if (entering == FrameFlag.Progressive) p++;
             else if (entering == FrameFlag.Interlaced) intl++;
 
@@ -472,9 +472,9 @@ public static partial class ContentDetector
         // idet emits "Multi frame detection:" TWICE — once at filter init (all
         // zeros), once at end-of-stream with the real counts.  Take the LAST
         // match to get the meaningful aggregate.
-        var matches = IdetAggregateRegex().Matches(stderr);
+        MatchCollection matches = IdetAggregateRegex().Matches(stderr);
         if (matches.Count == 0) return (null, null, null, null);
-        var match = matches[^1];
+        Match match = matches[^1];
 
         return (
             long.Parse(match.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture),

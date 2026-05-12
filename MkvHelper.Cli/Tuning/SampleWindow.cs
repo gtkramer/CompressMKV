@@ -1,7 +1,7 @@
 namespace MkvHelper;
 
-public sealed class SampleWindow
+public sealed record SampleWindow
 {
-    public double StartSeconds { get; set; }
-    public double LengthSeconds { get; set; }
+    public double StartSeconds { get; init; }
+    public double LengthSeconds { get; init; }
 }

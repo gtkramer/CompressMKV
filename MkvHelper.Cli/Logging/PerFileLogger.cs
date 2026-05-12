@@ -38,7 +38,7 @@ public sealed class PerFileLogger : IPipelineLogger, IDisposable
     public string VideoId { get; }
 
     /// <summary>Warnings collected during the run, surfaced in the final summary.</summary>
-    public List<string> Warnings { get; } = new();
+    public List<string> Warnings { get; } = [];
 
     public PerFileLogger(string logPath, string videoId, StageReporter? reporter, int fileSlot)
     {

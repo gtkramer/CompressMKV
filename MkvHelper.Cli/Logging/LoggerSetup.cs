@@ -47,8 +47,8 @@ public static class LoggerSetup
     public static Logger BuildGlobalLogger(string outputFolder)
     {
         Directory.CreateDirectory(outputFolder);
-        var jsonlPath = Path.Combine(outputFolder, "events.jsonl");
-        var textPath  = Path.Combine(outputFolder, "events.log");
+        string jsonlPath = Path.Combine(outputFolder, "events.jsonl");
+        string textPath  = Path.Combine(outputFolder, "events.log");
 
         return new LoggerConfiguration()
             .MinimumLevel.Information()

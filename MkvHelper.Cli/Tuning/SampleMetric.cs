@@ -14,5 +14,5 @@ public sealed class SampleMetric
     /// Per-frame VMAF scores for this sample. Used for robust
     /// percentile computation across all samples at a given CQ level.
     /// </summary>
-    public List<double> FrameVmafScores { get; set; } = new();
+    public List<double> FrameVmafScores { get; set; } = [];
 }

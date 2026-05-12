@@ -1,3 +1,4 @@
+using System.Threading;
 using Spectre.Console;
 
 namespace MkvHelper;
@@ -39,7 +40,7 @@ public static class VideoFileDiscovery
         Config cfg, string inputFolder, CancellationToken ct)
     {
         // Cheap pre-filter: enumerate all files, drop hidden + tiny ones.
-        var candidates = Directory.EnumerateFiles(inputFolder, "*", SearchOption.AllDirectories)
+        List<string> candidates = Directory.EnumerateFiles(inputFolder, "*", SearchOption.AllDirectories)
             .Where(f => !Path.GetFileName(f).StartsWith('.'))
             .Where(f =>
             {
@@ -49,10 +50,10 @@ public static class VideoFileDiscovery
             .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        if (candidates.Count == 0) return new List<DiscoveredVideo>();
+        if (candidates.Count == 0) return [];
 
-        var results = new List<DiscoveredVideo>(candidates.Count);
-        var resultsLock = new object();
+        List<DiscoveredVideo> results = new(candidates.Count);
+        Lock resultsLock = new();
 
         await AnsiConsole.Progress()
             .AutoClear(true)
@@ -63,18 +64,18 @@ public static class VideoFileDiscovery
                 new RemainingTimeColumn())
             .StartAsync(async progressCtx =>
             {
-                var task = progressCtx.AddTask(
+                ProgressTask task = progressCtx.AddTask(
                     $"[green]Probing {candidates.Count} candidate file(s)[/]",
                     maxValue: candidates.Count);
 
-                using var sem = new SemaphoreSlim(ProbeParallelism, ProbeParallelism);
+                using SemaphoreSlim sem = new(ProbeParallelism, ProbeParallelism);
 
-                var probeTasks = candidates.Select(async path =>
+                IEnumerable<Task> probeTasks = candidates.Select(async path =>
                 {
                     await sem.WaitAsync(ct);
                     try
                     {
-                        var probe = await ProbeQuietlyAsync(cfg, path, ct);
+                        FfprobeRoot? probe = await ProbeQuietlyAsync(cfg, path, ct);
                         if (probe is not null && probe.HasUsableVideoContent())
                         {
                             lock (resultsLock)

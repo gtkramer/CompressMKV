@@ -1,13 +1,3 @@
-highest profile nvenc
 var C# readability
 modern C# across all code
 consistent coding style across the entire project
-For operations that can be done on both the CPU and GPU, when the next part of the process for compressing a file comes up and it has this Option, it should dynamically choose where to run based on the resources available at the time.  This prevents, for example, at start when all files slam the CPU and the CPU utilization is near 100% the entire time, but the GPU is idle.  Basically, when a new task comes into the resource queue, if the task has the option to be scheduled in multiple places, the resource manager should pick where work gets done for that task based on what's available.
-
-
-
-The strict-FIFO behaviour is biting us. As long as VMAFs (CUDA=1) sit at the head and CUDA is saturated, the pool refuses to scan past them — even though NVENC is idle and the queued sample encodes need NVENC, not CUDA. Result: NVENC at 0%, CPU at ~50–70%, run throughput bottlenecked entirely on the 2 CUDA lanes serving VMAFs.
-
-The FIFO fairness guarantee we built protects against starvation of a single large op behind a stream of small ops. But here it's causing the inverse problem: a continuous stream of same-shape ops (queued VMAFs) starves different-shape ops (queued NVENC encodes) that could otherwise run on independent resources.
-
-With that observation about different shaped resources being starved, in addition to addressing the strict FIFO behavior biting us, another thing may help with this.  In the pipeline for compressing a MKV file, a single given task may be able to be done on both the CPU and GPU.  When this tasks needs to be scheduled, the resource scheduler should pick where the task executes based on what resources are available, in addition to managing the overall pool of resources.  This dynamic fungability of where work goes prevents cases like what happens with the current implementation where at the start, the CPU is pegged nearly 100% (not oversubscribed though) for a long time while the GPU is idle.  This is when the full file scan for the idet is being done.  The singular task of decoding the file can be done on the GPU or the CPUJ, and the resource manager should pick based on what resources are available.  The ffmpeg commands to use should be adjusted accordingly.  This should help to further maximize resource utilization and prevent resources from idling.  Please make sure that for each phase in the pioeline that we have both the software and hardware filters available for ffmpeg and that we have the most performant versions available for both CPU and CUDA hardware.

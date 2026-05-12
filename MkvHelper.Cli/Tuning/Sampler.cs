@@ -64,7 +64,7 @@ public sealed class Sampler
         int actualCount = Math.Min(count, maxNonOverlapping);
 
         double segLen = durationSeconds / actualCount;
-        var windows = new List<SampleWindow>(actualCount);
+        List<SampleWindow> windows = new(actualCount);
 
         for (int i = 0; i < actualCount; i++)
         {

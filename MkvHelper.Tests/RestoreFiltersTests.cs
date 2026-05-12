@@ -11,7 +11,7 @@ public class RestoreFiltersTests
     [Test]
     public void IvtcChain_TffPropagatesThroughFieldmatchAndBwdif()
     {
-        var chain = RestoreFilters.IvtcChain(FieldParity.Tff);
+        string chain = RestoreFilters.IvtcChain(FieldParity.Tff);
 
         Assert.That(chain, Does.Contain("fieldmatch=order=tff"));
         Assert.That(chain, Does.Contain("bwdif=mode=send_frame:parity=tff:deint=interlaced"));
@@ -21,7 +21,7 @@ public class RestoreFiltersTests
     [Test]
     public void IvtcChain_BffPropagatesThroughFieldmatchAndBwdif()
     {
-        var chain = RestoreFilters.IvtcChain(FieldParity.Bff);
+        string chain = RestoreFilters.IvtcChain(FieldParity.Bff);
 
         Assert.That(chain, Does.Contain("fieldmatch=order=bff"));
         Assert.That(chain, Does.Contain("bwdif=mode=send_frame:parity=bff:deint=interlaced"));
@@ -31,7 +31,7 @@ public class RestoreFiltersTests
     [Test]
     public void IvtcChain_AutoParityRendersAuto()
     {
-        var chain = RestoreFilters.IvtcChain(FieldParity.Auto);
+        string chain = RestoreFilters.IvtcChain(FieldParity.Auto);
 
         Assert.That(chain, Does.Contain("fieldmatch=order=auto"));
         Assert.That(chain, Does.Contain("parity=auto"));
@@ -40,7 +40,7 @@ public class RestoreFiltersTests
     [Test]
     public void IvtcChain_FilterOrderIsFieldmatchThenBwdifThenDecimate()
     {
-        var chain = RestoreFilters.IvtcChain(FieldParity.Tff);
+        string chain = RestoreFilters.IvtcChain(FieldParity.Tff);
         int posFm = chain.IndexOf("fieldmatch", StringComparison.Ordinal);
         int posBw = chain.IndexOf("bwdif",      StringComparison.Ordinal);
         int posDc = chain.IndexOf("decimate",   StringComparison.Ordinal);
@@ -55,14 +55,14 @@ public class RestoreFiltersTests
     {
         // combmatch=full is what makes fieldmatch verify every frame for residual
         // combing, not just at scene changes.  This is critical for accurate IVTC.
-        var chain = RestoreFilters.IvtcChain(FieldParity.Tff);
+        string chain = RestoreFilters.IvtcChain(FieldParity.Tff);
         Assert.That(chain, Does.Contain("combmatch=full"));
     }
 
     [Test]
     public void DeinterlaceChain_UsesBwdifAtNativeRate()
     {
-        var chain = RestoreFilters.DeinterlaceChain(FieldParity.Tff);
+        string chain = RestoreFilters.DeinterlaceChain(FieldParity.Tff);
         Assert.That(chain, Does.StartWith("bwdif=mode=send_frame:parity=tff"));
         Assert.That(chain, Does.Not.Contain("decimate"));
         Assert.That(chain, Does.Not.Contain("fieldmatch"));
@@ -74,7 +74,7 @@ public class RestoreFiltersTests
         // mode=send_frame: one output frame per input frame (preserves rate).
         // mode=send_field: one output frame per FIELD (doubles rate to 60p) —
         // explicitly NOT what we want for the §7.2.3.3 deinterlace path.
-        var chain = RestoreFilters.DeinterlaceChain(FieldParity.Tff);
+        string chain = RestoreFilters.DeinterlaceChain(FieldParity.Tff);
         Assert.That(chain, Does.Contain("mode=send_frame"));
         Assert.That(chain, Does.Not.Contain("mode=send_field"));
     }
@@ -91,7 +91,7 @@ public class RestoreFiltersTests
     [Test]
     public void For_RestoreModeIvtc_ReturnsIvtcChainAndOutputFps()
     {
-        var (filter, fps) = RestoreFilters.For(RestoreMode.Ivtc, FieldParity.Tff);
+        (string filter, Fps? fps) = RestoreFilters.For(RestoreMode.Ivtc, FieldParity.Tff);
         Assert.That(filter, Does.Contain("fieldmatch"));
         Assert.That(filter, Does.Contain("decimate"));
         Assert.That(fps, Is.EqualTo(Fps.Ntsc24));
@@ -100,7 +100,7 @@ public class RestoreFiltersTests
     [Test]
     public void For_RestoreModeDeinterlace_ReturnsBwdifAndNullFps()
     {
-        var (filter, fps) = RestoreFilters.For(RestoreMode.Deinterlace, FieldParity.Tff);
+        (string filter, Fps? fps) = RestoreFilters.For(RestoreMode.Deinterlace, FieldParity.Tff);
         Assert.That(filter, Does.Contain("bwdif"));
         Assert.That(filter, Does.Not.Contain("decimate"));
         Assert.That(fps, Is.Null);
@@ -109,7 +109,7 @@ public class RestoreFiltersTests
     [Test]
     public void For_RestoreModeNone_ReturnsEmptyAndNullFps()
     {
-        var (filter, fps) = RestoreFilters.For(RestoreMode.None, FieldParity.Tff);
+        (string filter, Fps? fps) = RestoreFilters.For(RestoreMode.None, FieldParity.Tff);
         Assert.That(filter, Is.Empty);
         Assert.That(fps, Is.Null);
     }

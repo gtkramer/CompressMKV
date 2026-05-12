@@ -120,7 +120,7 @@ public static class TestVideoFixture
 
     private static async Task Run(string exe, params string[] args)
     {
-        var (code, _, err) = await Proc.RunAsync(exe, args, CancellationToken.None);
+        (int code, string _, string err) = await Proc.RunAsync(exe, args, CancellationToken.None);
         if (code != 0)
             throw new InvalidOperationException(
                 $"{exe} exited with code {code}.\nArgs: {string.Join(" ", args)}\nStderr: {err}");

@@ -28,7 +28,7 @@ public class ContentDetectorIntegrationTests
     [Test]
     public async Task DetectAsync_OnProgressiveClip_ClassifiesAsProgressive()
     {
-        var detection = await Detect(TestVideoFixture.ProgressiveClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.ProgressiveClip);
 
         Assert.That(detection.ContentType, Is.EqualTo(ContentType.Progressive),
             $"Expected Progressive, got {detection.ContentType}. {detection.Reason}");
@@ -40,7 +40,7 @@ public class ContentDetectorIntegrationTests
     [Test]
     public async Task DetectAsync_OnTelecinedClip_ClassifiesAsNonProgressive()
     {
-        var detection = await Detect(TestVideoFixture.TelecinedClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.TelecinedClip);
 
         Assert.That(detection.ContentType, Is.Not.EqualTo(ContentType.Progressive),
             $"Synthesized telecine source should not classify as Progressive. " +
@@ -54,7 +54,7 @@ public class ContentDetectorIntegrationTests
     [Test]
     public async Task DetectAsync_OnInterlacedClip_ClassifiesAsInterlacedFamily()
     {
-        var detection = await Detect(TestVideoFixture.InterlacedClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.InterlacedClip);
 
         // tinterlace produces nearly-pure interlaced; accept Interlaced or
         // MixedProgressiveInterlaced (both lead to bwdif at native rate).
@@ -72,7 +72,7 @@ public class ContentDetectorIntegrationTests
     public async Task DetectAsync_AlwaysProducesSomeFrameCount()
     {
         // Smoke check: idet output parsing produces a non-zero count for any clip.
-        var detection = await Detect(TestVideoFixture.ProgressiveClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.ProgressiveClip);
         Assert.That(detection.TotalFramesAnalyzed, Is.GreaterThan(0),
             "idet stdout parser produced zero frames — regex or stream wiring is broken.");
     }
@@ -82,7 +82,7 @@ public class ContentDetectorIntegrationTests
     {
         // Cross-check (B): our streamed per-frame counts must match idet's own
         // end-of-stream aggregate within a one-frame tolerance.
-        var detection = await Detect(TestVideoFixture.ProgressiveClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.ProgressiveClip);
 
         Assert.That(detection.IdetAggregateProgressive, Is.Not.Null,
             "idet aggregate stderr line was not parsed — regex or stderr capture is broken.");
@@ -95,7 +95,7 @@ public class ContentDetectorIntegrationTests
     [Test]
     public async Task DetectAsync_PicksUpProgressiveSourceFps()
     {
-        var detection = await Detect(TestVideoFixture.ProgressiveClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.ProgressiveClip);
 
         Assert.That(detection.SourceFps, Is.Not.Null,
             "Source fps not parsed from ffprobe.");
@@ -106,7 +106,7 @@ public class ContentDetectorIntegrationTests
     [Test]
     public async Task DetectAsync_PicksUpTelecinedSourceFps()
     {
-        var detection = await Detect(TestVideoFixture.TelecinedClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.TelecinedClip);
 
         Assert.That(detection.SourceFps, Is.Not.Null);
         Assert.That(detection.SourceFps!.Value.IsApproximately(Fps.Ntsc30), Is.True,
@@ -116,7 +116,7 @@ public class ContentDetectorIntegrationTests
     [Test]
     public async Task DetectAsync_PicksUpInterlacedSourceFps()
     {
-        var detection = await Detect(TestVideoFixture.InterlacedClip);
+        ContentDetectionResult detection = await Detect(TestVideoFixture.InterlacedClip);
 
         Assert.That(detection.SourceFps, Is.Not.Null);
         Assert.That(detection.SourceFps!.Value.IsApproximately(Fps.Ntsc30), Is.True,
@@ -125,9 +125,9 @@ public class ContentDetectorIntegrationTests
 
     private static async Task<ContentDetectionResult> Detect(string clipPath)
     {
-        var cfg = TestVideoFixture.CreateTestConfig();
-        var probe = await Ffprobe.RunAsync(cfg, clipPath, CancellationToken.None);
-        var vstream = probe.Streams!.First(s => s.CodecType == "video");
+        Config cfg = TestVideoFixture.CreateTestConfig();
+        FfprobeRoot probe = await Ffprobe.RunAsync(cfg, clipPath, CancellationToken.None);
+        FfprobeStream vstream = probe.Streams!.First(s => s.CodecType == "video");
         return await ContentDetector.DetectAsync(cfg, clipPath, vstream, useHwaccel: false, CancellationToken.None);
     }
 }

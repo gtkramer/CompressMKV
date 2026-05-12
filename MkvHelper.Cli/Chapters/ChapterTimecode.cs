@@ -17,7 +17,7 @@ public static class ChapterTimecode
     /// </summary>
     public static double ToSeconds(string timecode)
     {
-        if (TimeSpan.TryParse(timecode, out var ts))
+        if (TimeSpan.TryParse(timecode, out TimeSpan ts))
             return ts.TotalSeconds;
         throw new FormatException($"Not a valid chapter timecode: '{timecode}'");
     }

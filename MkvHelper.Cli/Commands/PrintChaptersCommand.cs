@@ -38,8 +38,7 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
     protected override async Task<int> ExecuteAsync(
         CommandContext context, PrintChaptersSettings settings, CancellationToken token)
     {
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        using CancellationTokenSource cts = ConsoleCancellation.LinkToConsole(token);
 
         // Ensure the dependency container is ready and mount the directory
         // holding the input file.  mkvextract runs inside the container.
@@ -66,14 +65,14 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
             return 1;
         }
 
-        var atoms = chapters.EditionEntry.ChapterAtoms;
+        List<ChapterAtom> atoms = chapters.EditionEntry.ChapterAtoms;
         if (atoms.Count == 0)
         {
             AnsiConsole.MarkupLine($"[yellow]No chapters in {Markup.Escape(settings.InputFile!)}.[/]");
             return 0;
         }
 
-        var table = new Table()
+        Table table = new Table()
             .Border(TableBorder.Rounded)
             .Title($"[bold]{Markup.Escape(Path.GetFileName(settings.InputFile!))}[/]  " +
                    $"({atoms.Count} chapters, threshold {settings.EpisodeChapterThreshold:F0}s)")
@@ -87,7 +86,7 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
         int mainCount = 0;
         for (int i = 0; i < atoms.Count; i++)
         {
-            var a = atoms[i];
+            ChapterAtom a = atoms[i];
             double dur = a.GetDurationSeconds();
             bool isMain = dur >= settings.EpisodeChapterThreshold;
             if (isMain) mainCount++;
@@ -114,7 +113,7 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
 
     private static string FormatDuration(double seconds)
     {
-        var ts = TimeSpan.FromSeconds(seconds);
+        TimeSpan ts = TimeSpan.FromSeconds(seconds);
         return ts.TotalHours >= 1
             ? $"{(int)ts.TotalHours}:{ts.Minutes:D2}:{ts.Seconds:D2}"
             : $"{ts.Minutes:D2}:{ts.Seconds:D2}";

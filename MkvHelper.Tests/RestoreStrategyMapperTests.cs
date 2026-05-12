@@ -12,8 +12,8 @@ public class RestoreStrategyMapperTests
     [Test]
     public void Progressive_AnySource_NoFilter()
     {
-        var d = MakeDetection(ContentType.Progressive, sourceFps: Fps.Ntsc30);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        ContentDetectionResult d = MakeDetection(ContentType.Progressive, sourceFps: Fps.Ntsc30);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode,        Is.EqualTo(RestoreMode.None));
         Assert.That(r.FilterGraph, Is.Empty);
@@ -25,9 +25,9 @@ public class RestoreStrategyMapperTests
     [Test]
     public void Interlaced_AnySource_DeinterlaceAtNativeRate()
     {
-        var d = MakeDetection(ContentType.Interlaced, sourceFps: Fps.Ntsc30,
+        ContentDetectionResult d = MakeDetection(ContentType.Interlaced, sourceFps: Fps.Ntsc30,
                               parity: FieldParity.Tff);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.Deinterlace));
         Assert.That(r.FilterGraph, Does.Contain("bwdif"));
@@ -38,9 +38,9 @@ public class RestoreStrategyMapperTests
     public void Interlaced_PalSource_StillDeinterlacesAtNativeRate()
     {
         // §7.2.3.3 doesn't require NTSC — bwdif at native rate works for PAL too.
-        var d = MakeDetection(ContentType.Interlaced, sourceFps: Fps.Pal25,
+        ContentDetectionResult d = MakeDetection(ContentType.Interlaced, sourceFps: Fps.Pal25,
                               parity: FieldParity.Tff);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.Deinterlace));
         Assert.That(r.OutputFps, Is.Null);
@@ -51,8 +51,8 @@ public class RestoreStrategyMapperTests
     [Test]
     public void Telecined_NtscThirtyCfrSource_AppliesIvtc()
     {
-        var d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Ntsc30, isCfr: true);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        ContentDetectionResult d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Ntsc30, isCfr: true);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.Ivtc));
         Assert.That(r.OutputFps, Is.EqualTo(Fps.Ntsc24));
@@ -65,8 +65,8 @@ public class RestoreStrategyMapperTests
     {
         // The damaging case: cadence detected but source is true 30p — IVTC's
         // -r 24000/1001 would drop frames.  Mapper must skip IVTC.
-        var d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Flat30, isCfr: true);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        ContentDetectionResult d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Flat30, isCfr: true);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.None));
         Assert.That(r.FilterGraph, Is.Empty);
@@ -76,8 +76,8 @@ public class RestoreStrategyMapperTests
     [Test]
     public void Telecined_VfrSource_PassesThrough()
     {
-        var d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Ntsc30, isCfr: false);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        ContentDetectionResult d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Ntsc30, isCfr: false);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.None));
         Assert.That(r.Notes, Does.Contain("variable frame rate"));
@@ -86,8 +86,8 @@ public class RestoreStrategyMapperTests
     [Test]
     public void Telecined_PalSource_PassesThrough()
     {
-        var d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Pal25, isCfr: true);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        ContentDetectionResult d = MakeDetection(ContentType.Telecined, sourceFps: Fps.Pal25, isCfr: true);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.None));
     }
@@ -97,9 +97,9 @@ public class RestoreStrategyMapperTests
     [Test]
     public void MixedProgressiveTelecine_NtscThirtyCfr_AppliesIvtc()
     {
-        var d = MakeDetection(ContentType.MixedProgressiveTelecine,
+        ContentDetectionResult d = MakeDetection(ContentType.MixedProgressiveTelecine,
                               sourceFps: Fps.Ntsc30, isCfr: true);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.Ivtc));
         Assert.That(r.OutputFps, Is.EqualTo(Fps.Ntsc24));
@@ -108,9 +108,9 @@ public class RestoreStrategyMapperTests
     [Test]
     public void MixedProgressiveTelecine_NonNtscSource_PassesThrough()
     {
-        var d = MakeDetection(ContentType.MixedProgressiveTelecine,
+        ContentDetectionResult d = MakeDetection(ContentType.MixedProgressiveTelecine,
                               sourceFps: Fps.Film24, isCfr: true);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.None));
     }
@@ -121,9 +121,9 @@ public class RestoreStrategyMapperTests
     public void MixedProgInt_HighProgFracOnNtscThirty_FavorsIvtc()
     {
         // Per guide §7.2.3.5: ≥90% prog → favor progressive (IVTC chain).
-        var d = MakeDetection(ContentType.MixedProgressiveInterlaced,
+        ContentDetectionResult d = MakeDetection(ContentType.MixedProgressiveInterlaced,
                               sourceFps: Fps.Ntsc30, isCfr: true, progFrac: 0.95);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.Ivtc));
         Assert.That(r.OutputFps, Is.EqualTo(Fps.Ntsc24));
@@ -133,9 +133,9 @@ public class RestoreStrategyMapperTests
     public void MixedProgInt_LowProgFracOnNtscThirty_DeinterlacesAll()
     {
         // <90% prog → deinterlace all (compromise option of §7.2.3.5).
-        var d = MakeDetection(ContentType.MixedProgressiveInterlaced,
+        ContentDetectionResult d = MakeDetection(ContentType.MixedProgressiveInterlaced,
                               sourceFps: Fps.Ntsc30, isCfr: true, progFrac: 0.50);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.Deinterlace));
         Assert.That(r.OutputFps, Is.Null);
@@ -146,9 +146,9 @@ public class RestoreStrategyMapperTests
     {
         // High progFrac with sparse idet noise on a non-NTSC source: pass through
         // rather than damage the rate via IVTC.
-        var d = MakeDetection(ContentType.MixedProgressiveInterlaced,
+        ContentDetectionResult d = MakeDetection(ContentType.MixedProgressiveInterlaced,
                               sourceFps: Fps.Flat30, isCfr: true, progFrac: 0.95);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.None));
         Assert.That(r.Notes, Does.Contain("Mostly progressive"));
@@ -159,9 +159,9 @@ public class RestoreStrategyMapperTests
     public void MixedProgInt_LowProgFracOnTrueThirty_DeinterlacesAtNativeRate()
     {
         // Real interlaced content at true 30p: deinterlace at native rate is safe.
-        var d = MakeDetection(ContentType.MixedProgressiveInterlaced,
+        ContentDetectionResult d = MakeDetection(ContentType.MixedProgressiveInterlaced,
                               sourceFps: Fps.Flat30, isCfr: true, progFrac: 0.50);
-        var r = RestoreStrategyMapper.MapToRestore(d);
+        RestoreDecision r = RestoreStrategyMapper.MapToRestore(d);
 
         Assert.That(r.Mode, Is.EqualTo(RestoreMode.Deinterlace));
         Assert.That(r.OutputFps, Is.Null);

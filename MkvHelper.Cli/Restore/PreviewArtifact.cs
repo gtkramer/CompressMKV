@@ -1,8 +1,8 @@
 namespace MkvHelper;
 
-public sealed class PreviewArtifact
+public sealed record PreviewArtifact
 {
-    public double TimestampSeconds { get; set; }
-    public string IvtcPath { get; set; } = "";
-    public string DeintPath { get; set; } = "";
+    public double TimestampSeconds { get; init; }
+    public string IvtcPath { get; init; } = "";
+    public string DeintPath { get; init; } = "";
 }

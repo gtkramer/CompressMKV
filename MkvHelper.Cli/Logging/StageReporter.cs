@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 
@@ -33,7 +34,7 @@ namespace MkvHelper;
 /// </summary>
 public sealed class StageReporter
 {
-    private readonly object _lock = new();
+    private readonly Lock _lock = new();
     private readonly int _totalFiles;
     private int _completedFiles;
     private int _skippedFiles;
@@ -69,7 +70,7 @@ public sealed class StageReporter
     {
         lock (_lock)
         {
-            if (_active.TryGetValue(fileSlot, out var slot))
+            if (_active.TryGetValue(fileSlot, out ActiveSlot? slot))
             {
                 slot.Stage = stage;
                 slot.Detail = detail ?? "";
@@ -83,7 +84,7 @@ public sealed class StageReporter
     {
         lock (_lock)
         {
-            if (_active.TryGetValue(fileSlot, out var slot))
+            if (_active.TryGetValue(fileSlot, out ActiveSlot? slot))
             {
                 _recent.Enqueue(new RecentEntry(
                     slot.Idx, slot.FileName, status, level, slot.Watch.Elapsed));
@@ -117,7 +118,7 @@ public sealed class StageReporter
     {
         lock (_lock)
         {
-            var grid = new Grid();
+            Grid grid = new();
             grid.AddColumn();
 
             // Overall progress bar.
@@ -140,7 +141,7 @@ public sealed class StageReporter
             grid.AddRow(new Markup(""));
             if (_active.Count > 0)
             {
-                var activeTable = new Table()
+                Table activeTable = new Table()
                     .Border(TableBorder.Minimal)
                     .BorderColor(Color.Grey)
                     .Title("[bold]Active[/]")
@@ -150,7 +151,7 @@ public sealed class StageReporter
                     .AddColumn("[grey]Detail[/]")
                     .AddColumn("[grey]Elapsed[/]");
 
-                foreach (var slot in _active.Values.OrderBy(s => s.Idx))
+                foreach (ActiveSlot slot in _active.Values.OrderBy(s => s.Idx))
                 {
                     activeTable.AddRow(
                         new Markup($"[dim]{slot.Idx}/{_totalFiles}[/]"),
@@ -166,7 +167,7 @@ public sealed class StageReporter
             if (_recent.Count > 0)
             {
                 grid.AddRow(new Markup(""));
-                var recentTable = new Table()
+                Table recentTable = new Table()
                     .Border(TableBorder.Minimal)
                     .BorderColor(Color.Grey)
                     .Title("[bold]Recent[/]")
@@ -175,7 +176,7 @@ public sealed class StageReporter
                     .AddColumn("[grey]Result[/]")
                     .AddColumn("[grey]Time[/]");
 
-                foreach (var entry in _recent)
+                foreach (RecentEntry entry in _recent)
                 {
                     string colour = entry.Level switch
                     {

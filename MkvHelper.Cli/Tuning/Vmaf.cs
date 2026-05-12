@@ -13,18 +13,18 @@ public static class Vmaf
     /// </summary>
     public static async Task<VmafResult> ParseAsync(string path, CancellationToken ct)
     {
-        await using var fs = File.OpenRead(path);
-        var doc = await JsonDocument.ParseAsync(fs, cancellationToken: ct);
+        await using FileStream fs = File.OpenRead(path);
+        JsonDocument doc = await JsonDocument.ParseAsync(fs, cancellationToken: ct);
 
         // --- Per-frame scores (the frames[] array) ---
-        var frameScores = new List<double>();
-        if (doc.RootElement.TryGetProperty("frames", out var frames))
+        List<double> frameScores = [];
+        if (doc.RootElement.TryGetProperty("frames", out JsonElement frames))
         {
-            foreach (var frame in frames.EnumerateArray())
+            foreach (JsonElement frame in frames.EnumerateArray())
             {
-                if (frame.TryGetProperty("metrics", out var metrics) &&
-                    metrics.TryGetProperty("vmaf", out var vmafEl) &&
-                    vmafEl.TryGetDouble(out var score))
+                if (frame.TryGetProperty("metrics", out JsonElement metrics) &&
+                    metrics.TryGetProperty("vmaf", out JsonElement vmafEl) &&
+                    vmafEl.TryGetDouble(out double score))
                 {
                     frameScores.Add(score);
                 }
@@ -33,14 +33,14 @@ public static class Vmaf
 
         // --- Pooled metrics ---
         double mean = 0, harmonicMean = 0, min = 0;
-        if (doc.RootElement.TryGetProperty("pooled_metrics", out var pooled) &&
-            pooled.TryGetProperty("vmaf", out var vmaf))
+        if (doc.RootElement.TryGetProperty("pooled_metrics", out JsonElement pooled) &&
+            pooled.TryGetProperty("vmaf", out JsonElement vmaf))
         {
-            if (vmaf.TryGetProperty("mean", out var meanEl))
+            if (vmaf.TryGetProperty("mean", out JsonElement meanEl))
                 meanEl.TryGetDouble(out mean);
-            if (vmaf.TryGetProperty("harmonic_mean", out var hmEl))
+            if (vmaf.TryGetProperty("harmonic_mean", out JsonElement hmEl))
                 hmEl.TryGetDouble(out harmonicMean);
-            if (vmaf.TryGetProperty("min", out var minEl))
+            if (vmaf.TryGetProperty("min", out JsonElement minEl))
                 minEl.TryGetDouble(out min);
         }
 

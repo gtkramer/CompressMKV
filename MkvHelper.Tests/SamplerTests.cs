@@ -12,8 +12,8 @@ public class SamplerTests
     [Test]
     public void LongVideo_GetsRequestedSampleCount()
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(durationSeconds: 7200, TargetCount, WindowSec);
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(durationSeconds: 7200, TargetCount, WindowSec);
 
         Assert.That(windows, Has.Count.EqualTo(TargetCount));
     }
@@ -21,8 +21,8 @@ public class SamplerTests
     [Test]
     public void LongVideo_AllWindowsAreFullLength()
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec);
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec);
 
         Assert.That(windows.All(w => w.LengthSeconds == WindowSec), Is.True);
     }
@@ -30,8 +30,8 @@ public class SamplerTests
     [Test]
     public void LongVideo_NoWindowsOverlap()
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec)
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec)
                        .OrderBy(w => w.StartSeconds).ToList();
 
         for (int i = 1; i < windows.Count; i++)
@@ -46,8 +46,8 @@ public class SamplerTests
     [Test]
     public void LongVideo_AllWindowsFitInsideSource()
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec);
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec);
 
         Assert.That(windows.All(w => w.StartSeconds >= 0 && w.StartSeconds + w.LengthSeconds <= 7200), Is.True);
     }
@@ -62,8 +62,8 @@ public class SamplerTests
     [TestCase( 24,  2)]   // 2 windows back-to-back
     public void MediumVideo_ScalesCountToFit(double duration, int expectedCount)
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(duration, TargetCount, WindowSec);
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(duration, TargetCount, WindowSec);
 
         Assert.That(windows, Has.Count.EqualTo(expectedCount));
         Assert.That(windows.All(w => w.LengthSeconds == WindowSec), Is.True,
@@ -73,8 +73,8 @@ public class SamplerTests
     [Test]
     public void MediumVideo_NoWindowsOverlap()
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(60, TargetCount, WindowSec)
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(60, TargetCount, WindowSec)
                        .OrderBy(w => w.StartSeconds).ToList();
 
         for (int i = 1; i < windows.Count; i++)
@@ -92,8 +92,8 @@ public class SamplerTests
     [TestCase( 1)]
     public void ShortVideo_ReturnsOneFullContentWindow(double duration)
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(duration, TargetCount, WindowSec);
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(duration, TargetCount, WindowSec);
 
         Assert.That(windows, Has.Count.EqualTo(1));
         Assert.That(windows[0].StartSeconds, Is.EqualTo(0));
@@ -106,11 +106,11 @@ public class SamplerTests
     [Test]
     public void SameSeed_ProducesSameWindows()
     {
-        var s1 = new Sampler(TestSeed);
-        var s2 = new Sampler(TestSeed);
+        Sampler s1 = new(TestSeed);
+        Sampler s2 = new(TestSeed);
 
-        var w1 = s1.StratifiedRandomWindows(7200, TargetCount, WindowSec);
-        var w2 = s2.StratifiedRandomWindows(7200, TargetCount, WindowSec);
+        List<SampleWindow> w1 = s1.StratifiedRandomWindows(7200, TargetCount, WindowSec);
+        List<SampleWindow> w2 = s2.StratifiedRandomWindows(7200, TargetCount, WindowSec);
 
         Assert.That(w1.Count, Is.EqualTo(w2.Count));
         for (int i = 0; i < w1.Count; i++)
@@ -123,11 +123,11 @@ public class SamplerTests
     [Test]
     public void DifferentSeeds_ProduceDifferentWindows()
     {
-        var s1 = new Sampler(seed: 1);
-        var s2 = new Sampler(seed: 2);
+        Sampler s1 = new(seed: 1);
+        Sampler s2 = new(seed: 2);
 
-        var w1 = s1.StratifiedRandomWindows(7200, TargetCount, WindowSec);
-        var w2 = s2.StratifiedRandomWindows(7200, TargetCount, WindowSec);
+        List<SampleWindow> w1 = s1.StratifiedRandomWindows(7200, TargetCount, WindowSec);
+        List<SampleWindow> w2 = s2.StratifiedRandomWindows(7200, TargetCount, WindowSec);
 
         // At least one window should differ in start time.
         bool anyDiffer = w1.Zip(w2, (a, b) => a.StartSeconds != b.StartSeconds).Any(x => x);
@@ -139,8 +139,8 @@ public class SamplerTests
     [Test]
     public void LongVideo_OneWindowPerSegment()
     {
-        var s = new Sampler(TestSeed);
-        var windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec);
+        Sampler s = new(TestSeed);
+        List<SampleWindow> windows = s.StratifiedRandomWindows(7200, TargetCount, WindowSec);
 
         double segLen = 7200.0 / TargetCount;
         for (int i = 0; i < TargetCount; i++)
@@ -158,7 +158,7 @@ public class SamplerTests
     [Test]
     public void ZeroDuration_Throws()
     {
-        var s = new Sampler(TestSeed);
+        Sampler s = new(TestSeed);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             s.StratifiedRandomWindows(0, TargetCount, WindowSec));
     }
@@ -166,7 +166,7 @@ public class SamplerTests
     [Test]
     public void ZeroCount_Throws()
     {
-        var s = new Sampler(TestSeed);
+        Sampler s = new(TestSeed);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             s.StratifiedRandomWindows(7200, 0, WindowSec));
     }
@@ -174,7 +174,7 @@ public class SamplerTests
     [Test]
     public void ZeroWindowSeconds_Throws()
     {
-        var s = new Sampler(TestSeed);
+        Sampler s = new(TestSeed);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             s.StratifiedRandomWindows(7200, TargetCount, 0));
     }

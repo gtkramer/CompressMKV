@@ -53,7 +53,7 @@ public static class OutputVerifier
         CancellationToken ct, IPipelineLogger? logger = null)
     {
         logger ??= NullLogger.Instance;
-        var result = new OutputVerificationResult
+        OutputVerificationResult result = new()
         {
             OutputPath = outputPath,
             RestoreModeApplied = restore.Mode,
@@ -84,7 +84,7 @@ public static class OutputVerifier
             return result;
         }
 
-        var vstream = probe.Streams?.FirstOrDefault(s => s.CodecType == "video");
+        FfprobeStream? vstream = probe.Streams?.FirstOrDefault(s => s.CodecType == "video");
         if (vstream is null)
         {
             result.Passed = false;
@@ -135,8 +135,8 @@ public static class OutputVerifier
         // Output rate check.
         if (restore.OutputFps.HasValue && result.OutputFps.HasValue)
         {
-            var expected = restore.OutputFps.Value;
-            var actual = result.OutputFps.Value;
+            Fps expected = restore.OutputFps.Value;
+            Fps actual = result.OutputFps.Value;
             if (!actual.IsApproximately(expected))
             {
                 result.Warnings.Add(
@@ -155,7 +155,7 @@ public static class OutputVerifier
             logger.LogInfo(result.Notes);
         else
             logger.LogWarning(result.Notes);
-        foreach (var w in result.Warnings)
+        foreach (string w in result.Warnings)
             logger.LogWarning(w);
 
         return result;
@@ -172,7 +172,7 @@ public sealed class OutputVerificationResult
     public bool Skipped { get; set; }
     public bool Passed { get; set; }
     public string Notes { get; set; } = "";
-    public List<string> Warnings { get; set; } = new();
+    public List<string> Warnings { get; set; } = [];
 
     /// <summary>idet detection result on the output file.  Null when verification
     /// was skipped (pass-through mode) or failed before detection ran.</summary>

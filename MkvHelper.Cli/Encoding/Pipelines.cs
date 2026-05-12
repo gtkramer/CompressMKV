@@ -50,18 +50,18 @@ public static class Pipelines
             encodeThreads = Math.Max(1, cpuBudget - decodeThreads);
         }
 
-        var args = new List<string>
-        {
+        List<string> args =
+        [
             "-y", "-hide_banner", "-loglevel", "error",
             "-threads", decodeThreads.ToString(CultureInfo.InvariantCulture),
-        };
+        ];
 
         if (useHwaccel)
         {
             // NVDEC decode → auto-download in source's native bit depth.
             // CPU filters (IVTC/Deint when present) and the FFV1 encoder
             // run in system memory; the GPU just handles decode.
-            var format = PipelineFormat.FromStream(vstream);
+            PipelineFormat format = PipelineFormat.FromStream(vstream);
             args.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", format.HwaccelOutputFormat]);
         }
 
@@ -87,7 +87,7 @@ public static class Pipelines
             output
         ]);
 
-        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"reference clip extraction failed: {err}");
     }
 
@@ -102,8 +102,8 @@ public static class Pipelines
     {
         if (File.Exists(output)) File.Delete(output);
 
-        var args = new List<string>
-        {
+        List<string> args =
+        [
             "-y", "-hide_banner", "-loglevel", "error",
             "-threads", cfg.SampleEncodeThreads.ToString(CultureInfo.InvariantCulture),
             "-i", refInput,
@@ -120,9 +120,9 @@ public static class Pipelines
             "-pix_fmt", format.EncodePixFmt,
             "-fps_mode", "cfr",
             output
-        };
+        ];
 
-        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"sample encode failed: {err}");
     }
 
@@ -209,8 +209,8 @@ public static class Pipelines
         // filtergraph engine running zscale/tonemap/format/hwupload.  Total
         // CPU = 2 × VmafFfmpegThreads + VmafFilterThreads = cfg.VmafThreads,
         // matching what the ResourcePool reserved.
-        var args = new[]
-        {
+        string[] args =
+        [
             "-hide_banner", "-loglevel", "error",
             "-threads", cfg.VmafFfmpegThreads.ToString(CultureInfo.InvariantCulture),
             "-filter_threads", cfg.VmafFilterThreads.ToString(CultureInfo.InvariantCulture),
@@ -218,9 +218,9 @@ public static class Pipelines
             "-i", encInput,
             "-lavfi", filter,
             "-f", "null", "-"
-        };
+        ];
 
-        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args, ct);
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args, ct);
         if (code != 0) throw new InvalidOperationException($"vmaf failed: {err}");
     }
 
@@ -261,13 +261,13 @@ public static class Pipelines
         //     the larger FinalEncodeFilteredThreads budget to cover the filter.
 
         string hwOutFormat = hasCpuFilter ? format.HwaccelOutputFormat : "cuda";
-        var args = new List<string>
-        {
+        List<string> args =
+        [
             "-y", "-hide_banner", "-loglevel", loglevel,
             "-threads", cpuBudget.ToString(CultureInfo.InvariantCulture),
             "-hwaccel", "cuda", "-hwaccel_output_format", hwOutFormat,
             "-i", input,
-        };
+        ];
 
         if (hasCpuFilter)
             args.AddRange(["-vf", restore.FilterGraph]);
@@ -302,7 +302,7 @@ public static class Pipelines
             output
         ]);
 
-        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"final encode failed: {err}");
 
         if (isIvtc) SurfaceFieldmatchWarnings(err, logger);
@@ -320,9 +320,9 @@ public static class Pipelines
         if (string.IsNullOrEmpty(stderr)) return;
 
         int count = 0;
-        foreach (var raw in stderr.Split('\n'))
+        foreach (string raw in stderr.Split('\n'))
         {
-            var line = raw.Trim();
+            string line = raw.Trim();
             if (line.Length == 0) continue;
             if (line.Contains("fieldmatch", StringComparison.OrdinalIgnoreCase))
             {

@@ -25,5 +25,5 @@ public sealed class Selection
     /// Human-readable list of which metrics were marginal and by how much.
     /// Empty when <see cref="IsMarginal"/> is false.
     /// </summary>
-    public List<string> MarginalReasons { get; set; } = new();
+    public List<string> MarginalReasons { get; set; } = [];
 }

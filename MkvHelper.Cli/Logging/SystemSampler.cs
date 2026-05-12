@@ -70,9 +70,9 @@ public sealed class SystemSampler : IAsyncDisposable
 
     private async Task EmitOneAsync(CancellationToken ct)
     {
-        var pool = _pool.Snapshot();
-        var (cpuPct, load1m) = ReadCpuUsage();
-        var gpu = await ReadGpuStatsAsync(ct);
+        PoolSnapshot pool = _pool.Snapshot();
+        (double cpuPct, double load1m) = ReadCpuUsage();
+        GpuStats gpu = await ReadGpuStatsAsync(ct);
 
         Log.Logger.Information(
             "System util sample: pool {@Pool}; cpu {CpuPct:F1}% (load1m {Load1m:F2}); " +
@@ -91,8 +91,8 @@ public sealed class SystemSampler : IAsyncDisposable
         double cpuPct = 0;
         try
         {
-            var line = File.ReadAllLines("/proc/stat")[0];
-            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            string line = File.ReadAllLines("/proc/stat")[0];
+            string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             // parts[0] is "cpu"; counters follow.
             ulong user    = ulong.Parse(parts[1], CultureInfo.InvariantCulture);
             ulong nice    = ulong.Parse(parts[2], CultureInfo.InvariantCulture);
@@ -120,8 +120,8 @@ public sealed class SystemSampler : IAsyncDisposable
         double load1m = 0;
         try
         {
-            var loadLine = File.ReadAllText("/proc/loadavg").Trim();
-            var first = loadLine.Split(' ', 2)[0];
+            string loadLine = File.ReadAllText("/proc/loadavg").Trim();
+            string first = loadLine.Split(' ', 2)[0];
             load1m = double.Parse(first, CultureInfo.InvariantCulture);
         }
         catch { /* /proc/loadavg unavailable */ }
@@ -145,13 +145,12 @@ public sealed class SystemSampler : IAsyncDisposable
     {
         try
         {
-            var (code, stdout, _) = await Proc.RunAsync(
+            (int code, string stdout, string _) = await Proc.RunAsync(
                 "nvidia-smi",
-                new[]
-                {
+                [
                     "--query-gpu=utilization.gpu,utilization.memory,memory.used,encoder.stats.sessionCount",
                     "--format=csv,noheader,nounits",
-                },
+                ],
                 ct);
 
             if (code != 0)
@@ -164,12 +163,12 @@ public sealed class SystemSampler : IAsyncDisposable
                 return GpuStats.Empty;
             }
 
-            var line = stdout.Split('\n').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim();
+            string? line = stdout.Split('\n').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim();
             if (string.IsNullOrEmpty(line)) return GpuStats.Empty;
 
             // Fields are comma-separated; some drivers emit "[N/A]" when a
             // metric isn't supported — treat those as null.
-            var fields = line.Split(',').Select(s => s.Trim()).ToArray();
+            string[] fields = line.Split(',').Select(s => s.Trim()).ToArray();
             int? gpuPct       = TryParseInt(fields, 0);
             int? memPct       = TryParseInt(fields, 1);
             int? vramMb       = TryParseInt(fields, 2);
@@ -192,9 +191,9 @@ public sealed class SystemSampler : IAsyncDisposable
     private static int? TryParseInt(string[] fields, int idx)
     {
         if (idx >= fields.Length) return null;
-        var s = fields[idx];
+        string s = fields[idx];
         if (string.IsNullOrEmpty(s) || s.Contains("N/A", StringComparison.OrdinalIgnoreCase)) return null;
-        return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : null;
+        return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) ? v : null;
     }
 
     public async ValueTask DisposeAsync()

@@ -20,7 +20,7 @@ public static class Program
 {
     public static Task<int> Main(string[] args)
     {
-        var app = new CommandApp();
+        CommandApp app = new();
         app.Configure(c =>
         {
             c.SetApplicationName("mkvhelper");

@@ -70,7 +70,7 @@ public static class ContainerBuilder
 
         onProgress($"Build succeeded.  Image: {ImageTag}");
 
-        var state = new BuildState
+        BuildState state = new()
         {
             ImageTag = ImageTag,
             ContainerfileSha256 = Sha256(containerfileContent),
@@ -97,7 +97,7 @@ public static class ContainerBuilder
                 "podman is not available on PATH.  Install podman + the NVIDIA " +
                 "Container Toolkit; see the README's first-run setup section.");
 
-        var state = await BuildState.LoadAsync(ct);
+        BuildState? state = await BuildState.LoadAsync(ct);
         string currentHash = Sha256(LoadContainerfile());
 
         // Decide whether to rebuild.  Three triggers, all surfaced to the
@@ -194,7 +194,7 @@ public static class ContainerBuilder
     public static async Task<ContainerStatus> GetStatusAsync(CancellationToken ct)
     {
         string currentSha = Sha256(LoadContainerfile());
-        var state = await BuildState.LoadAsync(ct);
+        BuildState? state = await BuildState.LoadAsync(ct);
 
         bool imageExists = false;
         if (await Podman.IsAvailableAsync(ct))
@@ -261,18 +261,18 @@ public static class ContainerBuilder
     /// </summary>
     private static string LoadContainerfile()
     {
-        var asm = typeof(ContainerBuilder).Assembly;
-        using var stream = asm.GetManifestResourceStream(ContainerfileResource)
+        Assembly asm = typeof(ContainerBuilder).Assembly;
+        using Stream stream = asm.GetManifestResourceStream(ContainerfileResource)
             ?? throw new InvalidOperationException(
                 $"Embedded Containerfile resource `{ContainerfileResource}` was not found.  " +
                 "Check the <EmbeddedResource> entry in MkvHelper.Cli.csproj.");
-        using var reader = new StreamReader(stream);
+        using StreamReader reader = new(stream);
         return reader.ReadToEnd();
     }
 
     private static string Sha256(string content)
     {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(content));
+        byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(content));
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 }

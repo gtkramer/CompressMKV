@@ -12,7 +12,7 @@ public static class Podman
     {
         try
         {
-            var (code, _, _) = await Proc.RunAsync(Exe, new[] { "--version" }, ct);
+            (int code, string _, string _) = await Proc.RunAsync(Exe, ["--version"], ct);
             return code == 0;
         }
         catch { return false; }
@@ -29,14 +29,14 @@ public static class Podman
 
     public static async Task<bool> ImageExistsAsync(string imageTag, CancellationToken ct)
     {
-        var (code, _, _) = await Proc.RunAsync(Exe, new[] { "image", "exists", imageTag }, ct);
+        (int code, string _, string _) = await Proc.RunAsync(Exe, ["image", "exists", imageTag], ct);
         return code == 0;
     }
 
     public static async Task RemoveImageAsync(string imageTag, CancellationToken ct)
     {
         // -f: force-remove even if there are stopped containers referencing it.
-        await Proc.RunAsync(Exe, new[] { "rmi", "-f", imageTag }, ct);
+        await Proc.RunAsync(Exe, ["rmi", "-f", imageTag], ct);
     }
 
     /// <summary>
@@ -55,14 +55,14 @@ public static class Podman
         IReadOnlyDictionary<string, string>? buildArgs = null,
         bool noCache = false)
     {
-        await using var logFile = new StreamWriter(buildLogPath, append: false);
+        await using StreamWriter logFile = new(buildLogPath, append: false);
 
-        var args = new List<string> { "build", "-f", containerfile, "-t", imageTag };
+        List<string> args = ["build", "-f", containerfile, "-t", imageTag];
         if (noCache)
             args.Add("--no-cache");
         if (buildArgs is not null)
         {
-            foreach (var (k, v) in buildArgs)
+            foreach ((string k, string v) in buildArgs)
             {
                 args.Add("--build-arg");
                 args.Add($"{k}={v}");
@@ -70,7 +70,7 @@ public static class Podman
         }
         args.Add(contextDir);
 
-        var (code, stderr) = await Proc.RunStreamingAsync(Exe, args.ToArray(), line =>
+        (int code, string stderr) = await Proc.RunStreamingAsync(Exe, args.ToArray(), line =>
         {
             logFile.WriteLine(line);
             onLine(line);

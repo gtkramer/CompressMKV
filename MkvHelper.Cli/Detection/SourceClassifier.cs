@@ -25,50 +25,50 @@ public static class SourceClassifier
     public static async Task<HdrMetadata?> ExtractHdrMetadataAsync(
         Config cfg, string input, CancellationToken ct)
     {
-        var args = new[]
-        {
+        string[] args =
+        [
             "-v", "error",
             "-select_streams", "v:0",
             "-read_intervals", "%+#1",
             "-show_frames",
             "-print_format", "json",
             input
-        };
+        ];
 
-        var (code, stdout, _) = await ContainerTools.RunFfprobeAsync(args, ct);
+        (int code, string stdout, string _) = await ContainerTools.RunFfprobeAsync(args, ct);
         if (code != 0 || string.IsNullOrEmpty(stdout)) return null;
 
         try
         {
-            using var doc = JsonDocument.Parse(stdout);
-            if (!doc.RootElement.TryGetProperty("frames", out var frames) ||
+            using JsonDocument doc = JsonDocument.Parse(stdout);
+            if (!doc.RootElement.TryGetProperty("frames", out JsonElement frames) ||
                 frames.GetArrayLength() == 0)
                 return null;
 
-            var hdr = new HdrMetadata();
+            HdrMetadata hdr = new();
             bool any = false;
 
-            foreach (var frame in frames.EnumerateArray())
+            foreach (JsonElement frame in frames.EnumerateArray())
             {
-                if (!frame.TryGetProperty("side_data_list", out var list)) continue;
+                if (!frame.TryGetProperty("side_data_list", out JsonElement list)) continue;
 
-                foreach (var sd in list.EnumerateArray())
+                foreach (JsonElement sd in list.EnumerateArray())
                 {
-                    if (!sd.TryGetProperty("side_data_type", out var typeEl)) continue;
-                    var sdType = typeEl.GetString();
+                    if (!sd.TryGetProperty("side_data_type", out JsonElement typeEl)) continue;
+                    string? sdType = typeEl.GetString();
 
                     if (sdType == "Content light level metadata")
                     {
-                        if (TryGetInt(sd, "max_content", out var mc))   { hdr.MaxCll  = mc;  any = true; }
-                        if (TryGetInt(sd, "max_average", out var ma))   { hdr.MaxFall = ma;  any = true; }
+                        if (TryGetInt(sd, "max_content", out int mc))   { hdr.MaxCll  = mc;  any = true; }
+                        if (TryGetInt(sd, "max_average", out int ma))   { hdr.MaxFall = ma;  any = true; }
                     }
                     else if (sdType == "Mastering display metadata")
                     {
                         // max_luminance in ffprobe is typically a rational like
                         // "10000000/10000" (= 1000 nits) — handle both rational
                         // strings and bare numerics.
-                        if (sd.TryGetProperty("max_luminance", out var ml) &&
-                            TryParseLuminance(ml, out var lumNits))
+                        if (sd.TryGetProperty("max_luminance", out JsonElement ml) &&
+                            TryParseLuminance(ml, out double lumNits))
                         {
                             hdr.MasteringDisplayMaxLuminance = (int)Math.Round(lumNits);
                             any = true;
@@ -88,7 +88,7 @@ public static class SourceClassifier
     private static bool TryGetInt(JsonElement parent, string name, out int value)
     {
         value = 0;
-        if (!parent.TryGetProperty(name, out var el)) return false;
+        if (!parent.TryGetProperty(name, out JsonElement el)) return false;
         if (el.ValueKind == JsonValueKind.Number) return el.TryGetInt32(out value);
         if (el.ValueKind == JsonValueKind.String)
             return int.TryParse(el.GetString(), NumberStyles.Integer,
@@ -105,14 +105,14 @@ public static class SourceClassifier
 
         if (el.ValueKind == JsonValueKind.String)
         {
-            var s = el.GetString();
+            string? s = el.GetString();
             if (string.IsNullOrEmpty(s)) return false;
 
             // Rational form "num/den" — common for mastering display fields.
-            var parts = s.Split('/');
+            string[] parts = s.Split('/');
             if (parts.Length == 2 &&
-                double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var n) &&
-                double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var d) &&
+                double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out double n) &&
+                double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double d) &&
                 d != 0)
             {
                 nits = n / d;

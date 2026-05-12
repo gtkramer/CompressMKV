@@ -12,10 +12,10 @@ public static class PreviewGenerator
     {
         if (File.Exists(output)) File.Delete(output);
 
-        var (restoreFilter, outFps) = RestoreFilters.For(mode, parity);
+        (string restoreFilter, Fps? outFps) = RestoreFilters.For(mode, parity);
 
-        var args = new List<string>
-        {
+        List<string> args =
+        [
             "-y","-hide_banner","-loglevel","error",
             "-threads", cfg.PreviewThreads.ToString(CultureInfo.InvariantCulture),
             "-ss", startSeconds.ToString("F3", CultureInfo.InvariantCulture),
@@ -23,24 +23,23 @@ public static class PreviewGenerator
             "-t", cfg.PreviewDurationSeconds.ToString("F3", CultureInfo.InvariantCulture),
             "-map","0:v:0",
             "-an",
-        };
+        ];
 
         if (!string.IsNullOrWhiteSpace(restoreFilter))
-            args.AddRange(new[] { "-vf", restoreFilter });
+            args.AddRange(["-vf", restoreFilter]);
 
         if (outFps.HasValue)
-            args.AddRange(new[] { "-r", outFps.Value.ToString() });
+            args.AddRange(["-r", outFps.Value.ToString()]);
 
-        args.AddRange(new[]
-        {
+        args.AddRange([
             "-c:v","libx264",
             "-preset","ultrafast",
             "-crf","0",
             "-x264-params","keyint=1",
             output
-        });
+        ]);
 
-        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"preview encode failed: {err}");
     }
 }

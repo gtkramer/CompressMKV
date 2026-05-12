@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading;
 using Serilog;
 
 namespace MkvHelper;
@@ -52,7 +53,7 @@ public sealed class ResourcePool
     private readonly int _cpuMax, _nvencMax, _nvdecMax, _cudaMax;
     private int _cpu, _nvenc, _nvdec, _cuda;
     private readonly LinkedList<Waiter> _waiters = new();
-    private readonly object _lock = new();
+    private readonly Lock _lock = new();
 
     public ResourcePool(int cpu, int nvenc, int nvdec, int cuda)
     {
@@ -90,7 +91,7 @@ public sealed class ResourcePool
         ResourceRequest req, CancellationToken ct,
         string? file = null, string? op = null)
     {
-        var result = await AcquireAnyAsync(new[] { req }, ct, file, op).ConfigureAwait(false);
+        AcquireResult result = await AcquireAnyAsync([req], ct, file, op).ConfigureAwait(false);
         return result.Lease;
     }
 
@@ -120,7 +121,7 @@ public sealed class ResourcePool
 
         for (int i = 0; i < alternatives.Count; i++)
         {
-            var alt = alternatives[i];
+            ResourceRequest alt = alternatives[i];
             if (alt.Cpu < 0 || alt.Nvenc < 0 || alt.Nvdec < 0 || alt.Cuda < 0)
                 throw new ArgumentException(
                     $"Negative resource request at index {i}: {alt}", nameof(alternatives));
@@ -141,11 +142,11 @@ public sealed class ResourcePool
             // them), so a fitting new arrival doesn't displace any of them.
             for (int i = 0; i < alternatives.Count; i++)
             {
-                var alt = alternatives[i];
+                ResourceRequest alt = alternatives[i];
                 if (CanSatisfy(alt))
                 {
                     Take(alt);
-                    var snapshot = new PoolSnapshot(_cpu, _nvenc, _nvdec, _cuda);
+                    PoolSnapshot snapshot = new(_cpu, _nvenc, _nvdec, _cuda);
                     EmitAcquired(file, op, alternatives, alt, i, waitMs: 0, fastPath: true, snapshot);
                     return Task.FromResult(new AcquireResult(
                         new Releaser(this, alt, file, op), alt, i, WaitMs: 0, snapshot, op));
@@ -154,14 +155,14 @@ public sealed class ResourcePool
 
             // Slow path: enqueue with all alternatives; any of them becoming
             // satisfiable will wake the waiter.
-            var tcs = new TaskCompletionSource<AcquireResult>(
+            TaskCompletionSource<AcquireResult> tcs = new(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            var waiter = new Waiter(alternatives, tcs, file, op, Stopwatch.StartNew());
-            var node = _waiters.AddLast(waiter);
+            Waiter waiter = new(alternatives, tcs, file, op, Stopwatch.StartNew());
+            LinkedListNode<Waiter> node = _waiters.AddLast(waiter);
 
             ct.Register(static state =>
             {
-                var (pool, w, n) = ((ResourcePool, Waiter, LinkedListNode<Waiter>))state!;
+                (ResourcePool pool, Waiter w, LinkedListNode<Waiter> n) = ((ResourcePool, Waiter, LinkedListNode<Waiter>))state!;
                 lock (pool._lock)
                 {
                     // Resolve the cancel-vs-grant race: if the pool already
@@ -221,22 +222,22 @@ public sealed class ResourcePool
             // priority within each scan, so anti-starvation holds: as soon
             // as the resource the head needs frees, the next release grants
             // it before considering later waiters.
-            var node = _waiters.First;
+            LinkedListNode<Waiter>? node = _waiters.First;
             while (node != null)
             {
-                var next = node.Next;
-                var w = node.Value;
+                LinkedListNode<Waiter>? next = node.Next;
+                Waiter w = node.Value;
                 for (int i = 0; i < w.Alternatives.Count; i++)
                 {
-                    var alt = w.Alternatives[i];
+                    ResourceRequest alt = w.Alternatives[i];
                     if (CanSatisfy(alt))
                     {
                         _waiters.Remove(node);
                         Take(alt);
                         w.Granted = true;
-                        var snap = new PoolSnapshot(_cpu, _nvenc, _nvdec, _cuda);
+                        PoolSnapshot snap = new(_cpu, _nvenc, _nvdec, _cuda);
                         int waitMs = (int)w.QueueTimer.ElapsedMilliseconds;
-                        grantedInScan ??= new();
+                        grantedInScan ??= [];
                         grantedInScan.Add((w.File, w.Op, w.Alternatives, alt, i, waitMs, snap));
                         w.Tcs.TrySetResult(new AcquireResult(
                             new Releaser(this, alt, w.File, w.Op), alt, i, waitMs, snap, w.Op));
@@ -255,7 +256,8 @@ public sealed class ResourcePool
         EmitReleased(file, op, r, postRelease, wokenCount);
         if (grantedInScan != null)
         {
-            foreach (var g in grantedInScan)
+            foreach ((string? File, string? Op, IReadOnlyList<ResourceRequest> Requested,
+                      ResourceRequest Granted, int AltIndex, int WaitMs, PoolSnapshot Snapshot) g in grantedInScan)
                 EmitAcquired(g.File, g.Op, g.Requested, g.Granted, g.AltIndex,
                     g.WaitMs, fastPath: false, g.Snapshot);
         }

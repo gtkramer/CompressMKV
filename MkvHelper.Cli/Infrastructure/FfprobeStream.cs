@@ -47,8 +47,8 @@ public sealed class FfprobeStream
     /// </summary>
     public Fps? ResolveFps()
     {
-        if (Fps.TryParse(RFrameRate, out var r)) return r;
-        if (Fps.TryParse(AvgFrameRate, out var a)) return a;
+        if (Fps.TryParse(RFrameRate, out Fps r)) return r;
+        if (Fps.TryParse(AvgFrameRate, out Fps a)) return a;
         return null;
     }
 
@@ -88,8 +88,8 @@ public sealed class FfprobeStream
     /// </summary>
     public bool IsLikelyCfr()
     {
-        if (!Fps.TryParse(RFrameRate, out var r)) return true;
-        if (!Fps.TryParse(AvgFrameRate, out var a)) return true;
+        if (!Fps.TryParse(RFrameRate, out Fps r)) return true;
+        if (!Fps.TryParse(AvgFrameRate, out Fps a)) return true;
         if (a.AsDouble <= 0) return true;
         return r.AsDouble / a.AsDouble < VfrDetectionRatio;
     }

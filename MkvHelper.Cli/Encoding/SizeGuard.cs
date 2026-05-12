@@ -154,15 +154,15 @@ public static class SizeGuard
         Config cfg, string input, string output, CancellationToken ct)
     {
         if (File.Exists(output)) File.Delete(output);
-        var args = new[]
-        {
+        string[] args =
+        [
             "-y", "-hide_banner", "-loglevel", "error",
             "-i", input,
             "-map", "0",
             "-c", "copy",
             output
-        };
-        var (code, _, err) = await ContainerTools.RunFfmpegAsync(args, ct);
+        ];
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args, ct);
         if (code != 0)
             throw new InvalidOperationException(err);
     }

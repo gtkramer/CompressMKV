@@ -13,21 +13,19 @@ public sealed class ChapterAtom
     [XmlElement("ChapterUID")]
     public long ChapterUID { get; set; }
 
-    private string _chapterTimeStart = "";
     [XmlElement("ChapterTimeStart")]
     public string ChapterTimeStart
     {
-        get => _chapterTimeStart;
-        set => _chapterTimeStart = ChapterTimecode.Normalize(value);
-    }
+        get;
+        set => field = ChapterTimecode.Normalize(value);
+    } = "";
 
-    private string _chapterTimeEnd = "";
     [XmlElement("ChapterTimeEnd")]
     public string ChapterTimeEnd
     {
-        get => _chapterTimeEnd;
-        set => _chapterTimeEnd = ChapterTimecode.Normalize(value);
-    }
+        get;
+        set => field = ChapterTimecode.Normalize(value);
+    } = "";
 
     [XmlElement("ChapterDisplay")]
     public ChapterDisplay ChapterDisplay { get; set; } = new();

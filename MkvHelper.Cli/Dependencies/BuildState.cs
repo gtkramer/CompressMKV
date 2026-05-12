@@ -12,14 +12,14 @@ namespace MkvHelper;
 public sealed class BuildState
 {
     /// <summary>Podman image tag (always <see cref="ContainerBuilder.ImageTag"/>).</summary>
-    public string ImageTag { get; set; } = "";
+    public required string ImageTag { get; init; }
 
     /// <summary>SHA-256 of the embedded Containerfile content at build time.
     /// Used by <see cref="ContainerBuilder.EnsureReadyAsync"/> to detect when
     /// the source has changed and the cached image needs a rebuild.</summary>
-    public string ContainerfileSha256 { get; set; } = "";
+    public required string ContainerfileSha256 { get; init; }
 
-    public DateTime BuiltUtc { get; set; }
+    public required DateTime BuiltUtc { get; init; }
 
     private static readonly JsonSerializerOptions s_jsonOpts = new()
     {
@@ -32,7 +32,7 @@ public sealed class BuildState
         if (!File.Exists(ArtifactPaths.StateFile)) return null;
         try
         {
-            await using var fs = File.OpenRead(ArtifactPaths.StateFile);
+            await using FileStream fs = File.OpenRead(ArtifactPaths.StateFile);
             return await JsonSerializer.DeserializeAsync<BuildState>(fs, s_jsonOpts, ct);
         }
         catch
@@ -44,7 +44,7 @@ public sealed class BuildState
     public async Task SaveAsync(CancellationToken ct)
     {
         ArtifactPaths.EnsureDirectories();
-        await using var fs = File.Create(ArtifactPaths.StateFile);
+        await using FileStream fs = File.Create(ArtifactPaths.StateFile);
         await JsonSerializer.SerializeAsync(fs, this, s_jsonOpts, ct);
     }
 

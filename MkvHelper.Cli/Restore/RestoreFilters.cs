@@ -35,7 +35,7 @@ public static class RestoreFilters
     /// </summary>
     public static string IvtcChain(FieldParity parity)
     {
-        var p = ParityStr(parity);
+        string p = ParityStr(parity);
         return $"fieldmatch=order={p}:combmatch=full," +
                $"bwdif=mode=send_frame:parity={p}:deint=interlaced," +
                "decimate";

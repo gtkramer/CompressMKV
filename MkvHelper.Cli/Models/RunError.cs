@@ -1,7 +1,7 @@
 namespace MkvHelper;
 
-public sealed class RunError
+public sealed record RunError
 {
-    public string File { get; set; } = "";
-    public string Error { get; set; } = "";
+    public string File { get; init; } = "";
+    public string Error { get; init; } = "";
 }

@@ -21,8 +21,8 @@ public static class FinalEncoder
         logger.SetStage("Final encode", $"CQ={cq} ({format})");
         logger.LogInfo($"Final encode: CQ={cq}, {format}.");
 
-        var request = cfg.FinalEncodeRequestFor(restore);
-        var lease = await pool.AcquireAsync(request, ct, file: logger.VideoId, op: "final-encode");
+        ResourceRequest request = cfg.FinalEncodeRequestFor(restore);
+        IDisposable lease = await pool.AcquireAsync(request, ct, file: logger.VideoId, op: "final-encode");
         using (lease)
         {
             logger.LogInfo(

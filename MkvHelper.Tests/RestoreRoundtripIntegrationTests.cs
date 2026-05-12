@@ -19,7 +19,7 @@ public class RestoreRoundtripIntegrationTests
     [Test]
     public async Task IvtcChain_OnTelecinedSource_ProducesCleanProgressiveAt24p()
     {
-        var output = Path.Combine(TestVideoFixture.TempDir, "ivtc_output.mkv");
+        string output = Path.Combine(TestVideoFixture.TempDir, "ivtc_output.mkv");
 
         await ApplyFilterChain(
             TestVideoFixture.TelecinedClip,
@@ -29,7 +29,7 @@ public class RestoreRoundtripIntegrationTests
 
         // After IVTC, idet on the output should see almost-pure progressive frames
         // with no remaining 3:2 cadence pattern.
-        var detection = await DetectOnFile(output);
+        ContentDetectionResult detection = await DetectOnFile(output);
 
         Assert.That(detection.GlobalProgressiveFraction, Is.GreaterThanOrEqualTo(0.99),
             $"IVTC output should be ≥99% progressive; got {detection.GlobalProgressiveFraction:P2}.");
@@ -42,7 +42,7 @@ public class RestoreRoundtripIntegrationTests
     [Test]
     public async Task DeinterlaceChain_OnInterlacedSource_ProducesCleanProgressiveAtNativeRate()
     {
-        var output = Path.Combine(TestVideoFixture.TempDir, "deint_output.mkv");
+        string output = Path.Combine(TestVideoFixture.TempDir, "deint_output.mkv");
 
         await ApplyFilterChain(
             TestVideoFixture.InterlacedClip,
@@ -50,7 +50,7 @@ public class RestoreRoundtripIntegrationTests
             filterGraph: RestoreFilters.DeinterlaceChain(FieldParity.Tff),
             outputFps: null);
 
-        var detection = await DetectOnFile(output);
+        ContentDetectionResult detection = await DetectOnFile(output);
 
         Assert.That(detection.GlobalProgressiveFraction, Is.GreaterThanOrEqualTo(0.99),
             $"bwdif output should be ≥99% progressive; got {detection.GlobalProgressiveFraction:P2}.");
@@ -62,21 +62,21 @@ public class RestoreRoundtripIntegrationTests
     [Test]
     public async Task OutputVerifier_OnSuccessfulIvtc_Passes()
     {
-        var output = Path.Combine(TestVideoFixture.TempDir, "ivtc_for_verify.mkv");
+        string output = Path.Combine(TestVideoFixture.TempDir, "ivtc_for_verify.mkv");
         await ApplyFilterChain(
             TestVideoFixture.TelecinedClip,
             output,
             filterGraph: RestoreFilters.IvtcChain(FieldParity.Tff),
             outputFps: RestoreFilters.IvtcOutputFps);
 
-        var restore = new RestoreDecision
+        RestoreDecision restore = new()
         {
             Mode = RestoreMode.Ivtc,
             FilterGraph = RestoreFilters.IvtcChain(FieldParity.Tff),
             OutputFps = RestoreFilters.IvtcOutputFps,
         };
 
-        var result = await OutputVerifier.VerifyAsync(
+        OutputVerificationResult result = await OutputVerifier.VerifyAsync(
             TestVideoFixture.CreateTestConfig(), output, restore, useHwaccel: false, CancellationToken.None);
 
         Assert.That(result.Passed, Is.True,
@@ -88,21 +88,21 @@ public class RestoreRoundtripIntegrationTests
     [Test]
     public async Task OutputVerifier_OnSuccessfulDeinterlace_Passes()
     {
-        var output = Path.Combine(TestVideoFixture.TempDir, "deint_for_verify.mkv");
+        string output = Path.Combine(TestVideoFixture.TempDir, "deint_for_verify.mkv");
         await ApplyFilterChain(
             TestVideoFixture.InterlacedClip,
             output,
             filterGraph: RestoreFilters.DeinterlaceChain(FieldParity.Tff),
             outputFps: null);
 
-        var restore = new RestoreDecision
+        RestoreDecision restore = new()
         {
             Mode = RestoreMode.Deinterlace,
             FilterGraph = RestoreFilters.DeinterlaceChain(FieldParity.Tff),
             OutputFps = null,
         };
 
-        var result = await OutputVerifier.VerifyAsync(
+        OutputVerificationResult result = await OutputVerifier.VerifyAsync(
             TestVideoFixture.CreateTestConfig(), output, restore, useHwaccel: false, CancellationToken.None);
 
         Assert.That(result.Passed, Is.True,
@@ -115,14 +115,14 @@ public class RestoreRoundtripIntegrationTests
     {
         // Negative case: if we pretend the unrestored interlaced clip is an IVTC
         // output, verification must catch the residual interlacing.
-        var restore = new RestoreDecision
+        RestoreDecision restore = new()
         {
             Mode = RestoreMode.Ivtc,
             FilterGraph = RestoreFilters.IvtcChain(FieldParity.Tff),
             OutputFps = RestoreFilters.IvtcOutputFps,
         };
 
-        var result = await OutputVerifier.VerifyAsync(
+        OutputVerificationResult result = await OutputVerifier.VerifyAsync(
             TestVideoFixture.CreateTestConfig(),
             TestVideoFixture.InterlacedClip,
             restore,
@@ -137,14 +137,14 @@ public class RestoreRoundtripIntegrationTests
     [Test]
     public async Task OutputVerifier_OnPassThroughMode_SkipsAndPasses()
     {
-        var restore = new RestoreDecision
+        RestoreDecision restore = new()
         {
             Mode = RestoreMode.None,
             FilterGraph = "",
             OutputFps = null,
         };
 
-        var result = await OutputVerifier.VerifyAsync(
+        OutputVerificationResult result = await OutputVerifier.VerifyAsync(
             TestVideoFixture.CreateTestConfig(),
             TestVideoFixture.ProgressiveClip,
             restore,
@@ -167,12 +167,12 @@ public class RestoreRoundtripIntegrationTests
     {
         if (File.Exists(output)) File.Delete(output);
 
-        var args = new List<string>
-        {
+        List<string> args =
+        [
             "-y", "-hide_banner", "-loglevel", "error",
             "-i", input,
             "-map", "0:v:0", "-an", "-sn", "-dn",
-        };
+        ];
 
         if (!string.IsNullOrWhiteSpace(filterGraph))
             args.AddRange(["-vf", filterGraph]);
@@ -186,7 +186,7 @@ public class RestoreRoundtripIntegrationTests
             output
         ]);
 
-        var (code, _, err) = await Proc.RunAsync("ffmpeg", args.ToArray(), CancellationToken.None);
+        (int code, string _, string err) = await Proc.RunAsync("ffmpeg", args.ToArray(), CancellationToken.None);
         if (code != 0)
             throw new InvalidOperationException(
                 $"Filter-chain apply failed.\nFilter: {filterGraph}\nStderr: {err}");
@@ -194,9 +194,9 @@ public class RestoreRoundtripIntegrationTests
 
     private static async Task<ContentDetectionResult> DetectOnFile(string path)
     {
-        var cfg = TestVideoFixture.CreateTestConfig();
-        var probe = await Ffprobe.RunAsync(cfg, path, CancellationToken.None);
-        var vstream = probe.Streams!.First(s => s.CodecType == "video");
+        Config cfg = TestVideoFixture.CreateTestConfig();
+        FfprobeRoot probe = await Ffprobe.RunAsync(cfg, path, CancellationToken.None);
+        FfprobeStream vstream = probe.Streams!.First(s => s.CodecType == "video");
         return await ContentDetector.DetectAsync(cfg, path, vstream, useHwaccel: false, CancellationToken.None);
     }
 }

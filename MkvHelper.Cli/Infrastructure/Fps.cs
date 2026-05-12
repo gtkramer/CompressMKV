@@ -129,10 +129,10 @@ public readonly struct Fps : IEquatable<Fps>
         fps = default;
         if (string.IsNullOrWhiteSpace(s)) return false;
 
-        var parts = s.Split('/');
+        string[] parts = s.Split('/');
         if (parts.Length == 2 &&
-            int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) &&
-            int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var d) &&
+            int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) &&
+            int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int d) &&
             n > 0 && d > 0)
         {
             fps = new Fps(n, d);
@@ -140,7 +140,7 @@ public readonly struct Fps : IEquatable<Fps>
         }
 
         if (parts.Length == 1 &&
-            double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) &&
+            double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out double v) &&
             v > 0)
         {
             fps = FromDouble(v);

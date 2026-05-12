@@ -37,7 +37,7 @@ public static class Selector
 
     public static Selection Select(Config cfg, List<CqAggregate> results)
     {
-        var pass = results
+        CqAggregate? pass = results
             .Where(r => r.MeanVmaf >= cfg.TargetMeanVmaf
                      && r.P05Vmaf  >= cfg.TargetP05Vmaf
                      && r.P01Vmaf  >= cfg.TargetP01Vmaf)
@@ -46,15 +46,15 @@ public static class Selector
 
         if (pass != null)
         {
-            var sel = BuildSelection(pass,
+            Selection sel = BuildSelection(pass,
                 $"Meets thresholds mean≥{cfg.TargetMeanVmaf:F1}, p05≥{cfg.TargetP05Vmaf:F1}, " +
                 $"p01≥{cfg.TargetP01Vmaf:F1}; chose highest passing CQ.");
             ApplyMarginalCheck(sel, pass, cfg);
             return sel;
         }
 
-        var best = results.OrderByDescending(r => r.MeanVmaf).First();
-        var fallback = BuildSelection(best,
+        CqAggregate best = results.OrderByDescending(r => r.MeanVmaf).First();
+        Selection fallback = BuildSelection(best,
             "No CQ met all thresholds; chose CQ with best mean VMAF.");
         // Fallback selections are inherently below threshold — flag as marginal.
         fallback.IsMarginal = true;

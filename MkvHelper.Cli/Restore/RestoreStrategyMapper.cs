@@ -46,8 +46,8 @@ public static class RestoreStrategyMapper
 
     public static RestoreDecision MapToRestore(ContentDetectionResult detection)
     {
-        var parity = detection.DetectedParity;
-        var contentType = detection.ContentType;
+        FieldParity parity = detection.DetectedParity;
+        ContentType contentType = detection.ContentType;
 
         // Guard: the IVTC chain only applies to a 30000/1001 CFR source.  Both
         // conditions must hold — a true-30p source (30/1) at any cadence rate
@@ -59,7 +59,7 @@ public static class RestoreStrategyMapper
         bool favorProgressive =
             detection.GlobalProgressiveFraction >= FavorProgressiveProgFracMin;
 
-        var (mode, filter, fps, notes) = contentType switch
+        (RestoreMode mode, string filter, Fps? fps, string notes) = contentType switch
         {
             // -----------------------------------------------------------
             // §7.2.3.1 Progressive (verified — intCount == 0).
@@ -178,7 +178,7 @@ public static class RestoreStrategyMapper
     /// </summary>
     private static string IvtcGuardsState(ContentDetectionResult detection)
     {
-        var fpsStr = detection.SourceFps?.ToString() ?? "?";
+        string fpsStr = detection.SourceFps?.ToString() ?? "?";
         bool ntsc = detection.SourceFps?.IsNtscThirty() ?? false;
         return $"fps={fpsStr} {(ntsc ? "NTSC-thirty" : "non-NTSC-thirty")}, " +
                $"{(detection.SourceIsLikelyCfr ? "CFR" : "VFR")}";
@@ -191,8 +191,8 @@ public static class RestoreStrategyMapper
     /// </summary>
     private static string IvtcSkipReason(string trigger, ContentDetectionResult detection)
     {
-        var fpsStr = detection.SourceFps?.ToString() ?? "?";
-        var reasons = new List<string>();
+        string fpsStr = detection.SourceFps?.ToString() ?? "?";
+        List<string> reasons = [];
         if (!(detection.SourceFps?.IsNtscThirty() ?? false))
             reasons.Add($"source is {fpsStr} fps (not 30000/1001)");
         if (!detection.SourceIsLikelyCfr)

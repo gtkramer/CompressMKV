@@ -14,7 +14,7 @@ public class FpsTests
     [TestCase("60/2",        30,    1)]   // canonical reduction (60/2 → 30/1)
     public void TryParse_AcceptsCanonicalFractions(string input, int expectedNum, int expectedDen)
     {
-        Assert.That(Fps.TryParse(input, out var fps), Is.True);
+        Assert.That(Fps.TryParse(input, out Fps fps), Is.True);
         Assert.Multiple(() =>
         {
             Assert.That(fps.Numerator, Is.EqualTo(expectedNum));
@@ -27,7 +27,7 @@ public class FpsTests
     [TestCase("59.94")]
     public void TryParse_AcceptsBareFloats(string input)
     {
-        Assert.That(Fps.TryParse(input, out var fps), Is.True);
+        Assert.That(Fps.TryParse(input, out Fps fps), Is.True);
         Assert.That(fps.AsDouble, Is.GreaterThan(0));
     }
 
@@ -66,7 +66,7 @@ public class FpsTests
     {
         // ffprobe sometimes reports "29.97" instead of "30000/1001".
         // 29.97 rounds to 2997/100 internally; AsDouble = 29.970 vs 29.97003 (NTSC).
-        Assert.That(Fps.TryParse("29.97", out var rounded), Is.True);
+        Assert.That(Fps.TryParse("29.97", out Fps rounded), Is.True);
         Assert.That(rounded.IsApproximately(Fps.Ntsc30), Is.True);
     }
 
@@ -103,7 +103,7 @@ public class FpsTests
     public void IsNtscThirty_AcceptsExactNtscFractionAndRoundedFloat()
     {
         Assert.That(Fps.Ntsc30.IsNtscThirty(), Is.True);
-        Assert.That(Fps.TryParse("29.97", out var rounded), Is.True);
+        Assert.That(Fps.TryParse("29.97", out Fps rounded), Is.True);
         Assert.That(rounded.IsNtscThirty(), Is.True);
     }
 

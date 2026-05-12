@@ -14,7 +14,7 @@ public static class ChapterSerializer
 
     public static Chapters DeserializeXmlToChapters(string xml)
     {
-        using var reader = new StringReader(xml);
+        using StringReader reader = new(xml);
         return s_serializer.Deserialize(reader) as Chapters
             ?? throw new InvalidOperationException("Chapters XML deserialised to null.");
     }
@@ -23,16 +23,16 @@ public static class ChapterSerializer
     {
         // Strip the default xsi/xsd namespaces — mkvmerge accepts them, but
         // round-tripping XML that didn't have them shouldn't introduce them.
-        var namespaces = new XmlSerializerNamespaces();
+        XmlSerializerNamespaces namespaces = new();
         namespaces.Add(string.Empty, string.Empty);
 
         // Write through a MemoryStream so the XML declaration uses UTF-8
         // (the encoding StreamWriter writes the bytes in).  Writing to a
         // StringWriter would emit utf-16 in the declaration, which mkvmerge
         // tolerates but is wrong for the bytes we'll actually save.
-        using var memory = new MemoryStream();
-        using (var streamWriter = new StreamWriter(memory, leaveOpen: true))
-        using (var xmlWriter = new XmlTextWriter(streamWriter) { Formatting = Formatting.Indented })
+        using MemoryStream memory = new();
+        using (StreamWriter streamWriter = new(memory, leaveOpen: true))
+        using (XmlTextWriter xmlWriter = new(streamWriter) { Formatting = Formatting.Indented })
         {
             xmlWriter.WriteStartDocument();
             xmlWriter.WriteDocType("Chapters", null, "matroskachapters.dtd", null);
@@ -40,7 +40,7 @@ public static class ChapterSerializer
         }
 
         memory.Position = 0;
-        using var reader = new StreamReader(memory);
+        using StreamReader reader = new(memory);
         return reader.ReadToEnd();
     }
 }
