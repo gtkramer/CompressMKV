@@ -15,21 +15,45 @@ public static class Pipelines
     //
     //  Decode side can run on CPU or NVDEC; FFV1 encode is always CPU
     //  (no NVENC FFV1 encoder exists).  ResourcePool picks the path
-    //  based on which resources are free — see Config.RefExtractAlternatives.
+    //  based on which resources are free — see Config.RefExtractAlternativesFor.
+    //
+    //  Thread pinning: ffmpeg's -threads is per-stream, so a single -threads
+    //  value before -i applies to the decoder and a separate -threads before
+    //  the output applies to the FFV1 encoder; the two pools run concurrently.
+    //  We therefore split the granted CPU budget into decode + encode halves
+    //  so the combined peak matches what the pool reserved.  On the NVDEC
+    //  path decode is hardware and its -threads is meaningless, so the bulk
+    //  of the budget goes to the FFV1 encoder.
     // ----------------------------------------------------------------
     public static async Task ExtractReferenceClipAsync(
         Config cfg, string input, string output, SampleWindow w,
-        RestoreDecision restore, FfprobeStream vstream, bool useHwaccel,
+        RestoreDecision restore, FfprobeStream vstream, bool useHwaccel, int cpuBudget,
         CancellationToken ct)
     {
         if (File.Exists(output)) File.Delete(output);
 
-        int threadCount = useHwaccel ? cfg.RefExtractGpuThreads : cfg.RefExtractCpuThreads;
-        string threads = threadCount.ToString(CultureInfo.InvariantCulture);
+        int decodeThreads, encodeThreads;
+        if (useHwaccel)
+        {
+            // NVDEC handles decode in hardware; decode-side -threads only
+            // governs the parser/bsf and barely consumes CPU.  Give the
+            // rest of the budget to the FFV1 encoder.
+            decodeThreads = 1;
+            encodeThreads = Math.Max(1, cpuBudget - 1);
+        }
+        else
+        {
+            // Split roughly evenly between sw decode and FFV1 encode.  Encode
+            // gets the larger half on odd budgets (FFV1 slice parallelism
+            // scales better than HEVC decode threading past ~2 cores).
+            decodeThreads = Math.Max(1, cpuBudget / 2);
+            encodeThreads = Math.Max(1, cpuBudget - decodeThreads);
+        }
+
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", "error",
-            "-threads", threads,
+            "-threads", decodeThreads.ToString(CultureInfo.InvariantCulture),
         };
 
         if (useHwaccel)
@@ -59,7 +83,7 @@ public static class Pipelines
             "-c:v", "ffv1",
             "-level", "3",
             "-slicecrc", "1",
-            "-threads", threads,
+            "-threads", encodeThreads.ToString(CultureInfo.InvariantCulture),
             output
         ]);
 
@@ -116,7 +140,12 @@ public static class Pipelines
     //  with libvmaf_cuda in this version of FFmpeg — see the Containerfile
     //  header.  Only libvmaf itself moves to GPU on HDR runs; the colour-
     //  space conversion cost stays on CPU and is accounted for via
-    //  cfg.VmafThreads (filter_threads is pinned to match).
+    //  cfg.VmafFilterThreads.
+    //
+    //  CPU accounting: -threads applies per-input decoder (2 inputs × this
+    //  value), and -filter_threads sizes the filtergraph pool.  Total CPU
+    //  consumption = 2 × VmafFfmpegThreads + VmafFilterThreads, which equals
+    //  cfg.VmafThreads (what the ResourcePool reserved).
     //
     //  Bit depth: for SDR, compare at matching bit depth (yuv420p for
     //  8-bit, yuv420p10le for 10-bit) so an 8-bit reference's zero-padded
@@ -175,10 +204,11 @@ public static class Pipelines
             refChain, encChain,
             $"[enc_cuda][ref_cuda]libvmaf_cuda={vmafOpts}");
 
-        // -threads sizes the decoder thread pool (FFV1 + AV1); -filter_threads
-        // sizes the filtergraph engine running zscale/tonemap/format/hwupload.
-        // Total CPU consumption stays inside cfg.VmafThreads, which is what
-        // the ResourcePool reserved.
+        // -threads sets the per-input decoder thread count (applied to both
+        // FFV1 ref and AV1 encode inputs).  -filter_threads sizes the
+        // filtergraph engine running zscale/tonemap/format/hwupload.  Total
+        // CPU = 2 × VmafFfmpegThreads + VmafFilterThreads = cfg.VmafThreads,
+        // matching what the ResourcePool reserved.
         var args = new[]
         {
             "-hide_banner", "-loglevel", "error",
@@ -206,7 +236,7 @@ public static class Pipelines
     // ----------------------------------------------------------------
     public static async Task EncodeFullNvencAsync(
         Config cfg, string input, string output, RestoreDecision restore,
-        int cq, PipelineFormat format, CancellationToken ct,
+        int cq, PipelineFormat format, int cpuBudget, CancellationToken ct,
         IPipelineLogger? logger = null)
     {
         logger ??= NullLogger.Instance;
@@ -222,16 +252,19 @@ public static class Pipelines
         //     cuda hwframes directly and matches the decoder's bit depth
         //     automatically — so we MUST NOT also request -pix_fmt nv12 here,
         //     which would otherwise force an unsupported cuda→nv12 auto-scale.
+        //     CPU work is orchestration only; the caller passes the smaller
+        //     FinalEncodeProgressiveThreads budget for the pin.
         //
         //   CPU filter (IVTC / Deinterlace) — download immediately at the
         //     matched bit depth.  The CPU filter operates in system memory,
-        //     and NVENC re-uploads at the requested -pix_fmt.
+        //     and NVENC re-uploads at the requested -pix_fmt.  Caller passes
+        //     the larger FinalEncodeFilteredThreads budget to cover the filter.
 
         string hwOutFormat = hasCpuFilter ? format.HwaccelOutputFormat : "cuda";
         var args = new List<string>
         {
             "-y", "-hide_banner", "-loglevel", loglevel,
-            "-threads", cfg.FinalEncodeThreads.ToString(CultureInfo.InvariantCulture),
+            "-threads", cpuBudget.ToString(CultureInfo.InvariantCulture),
             "-hwaccel", "cuda", "-hwaccel_output_format", hwOutFormat,
             "-i", input,
         };

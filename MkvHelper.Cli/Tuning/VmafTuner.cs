@@ -82,15 +82,16 @@ public static class VmafTuner
         var refClips = new string[windows.Count];
 
         int extractedCount = 0;
+        var refExtractAlternatives = cfg.RefExtractAlternativesFor(restore);
         var refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
-            var admit = await pool.AcquireAnyAsync(cfg.RefExtractAlternatives, ct);
+            var admit = await pool.AcquireAnyAsync(refExtractAlternatives, ct);
             using (admit.Lease)
             {
                 bool useHwaccel = admit.Granted.Nvdec > 0;
                 await Pipelines.ExtractReferenceClipAsync(
-                    cfg, input, refPath, w, restore, vstream, useHwaccel, ct);
+                    cfg, input, refPath, w, restore, vstream, useHwaccel, admit.Granted.Cpu, ct);
             }
             refClips[i] = refPath;
             int done = Interlocked.Increment(ref extractedCount);

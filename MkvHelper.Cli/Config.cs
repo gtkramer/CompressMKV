@@ -56,28 +56,42 @@ public sealed class Config
     // costs (one per path) and a corresponding *Alternatives list that the
     // ResourcePool picks from at admission time.  This lets work flow to
     // whichever resource is currently free instead of pinning to one.
+    //
+    // Phases whose CPU cost depends on whether a CPU filter sits in the
+    // pipeline (RefExtract, FinalEncode) declare two variants — progressive
+    // (no filter) and filtered (IVTC / Deinterlace) — and a *RequestFor /
+    // *AlternativesFor helper that picks by restore.FilterGraph presence.
 
     /// <summary>Threads for the full-file idet pass (Detection + Verification)
     /// when the source is decoded on CPU.  Splits decode + idet across cores.</summary>
     public int DetectionCpuThreads { get; set; } = 4;
 
     /// <summary>Threads for the full-file idet pass when decode is offloaded
-    /// to NVDEC.  Lower than the CPU variant — only orchestration + the
-    /// CPU-side idet filter remain on the CPU (decode happens on the
-    /// dedicated NVDEC engine).</summary>
-    public int DetectionGpuThreads { get; set; } = 2;
+    /// to NVDEC.  idet is single-threaded and memory-bound — 1 CPU thread
+    /// for the filter is all that's needed; NVDEC handles the decode.</summary>
+    public int DetectionGpuThreads { get; set; } = 1;
 
     /// <summary>Threads for one lossless x264 preview encode.</summary>
     public int PreviewThreads { get; set; } = 4;
 
-    /// <summary>Threads for one FFV1 reference-clip extraction (Phase 1)
-    /// when source decode runs on CPU.  FFV1 encode is slice-parallel.</summary>
-    public int RefExtractCpuThreads { get; set; } = 4;
+    /// <summary>Total CPU budget for one progressive (no-filter) ref extract on
+    /// the sw-decode path.  Split between decode and FFV1 encode in
+    /// <see cref="Pipelines.ExtractReferenceClipAsync"/>.</summary>
+    public int RefExtractCpuProgressiveThreads { get; set; } = 3;
 
-    /// <summary>Threads for one FFV1 reference-clip extraction when source
-    /// decode is offloaded to NVDEC.  Encode is still on CPU but the decode
-    /// half no longer fights for cores.</summary>
-    public int RefExtractGpuThreads { get; set; } = 2;
+    /// <summary>Total CPU budget for one filtered (IVTC/Deint) ref extract on
+    /// the sw-decode path.  Adds a CPU filter to the decode→FFV1 chain.</summary>
+    public int RefExtractCpuFilteredThreads { get; set; } = 4;
+
+    /// <summary>Total CPU budget for one progressive (no-filter) ref extract on
+    /// the NVDEC path.  Only the FFV1 encode side consumes CPU; NVDEC handles
+    /// decode entirely on the dedicated engine.</summary>
+    public int RefExtractGpuProgressiveThreads { get; set; } = 2;
+
+    /// <summary>Total CPU budget for one filtered (IVTC/Deint) ref extract on
+    /// the NVDEC path.  CPU filter + FFV1 encode still run on cores even though
+    /// the decode side is offloaded.</summary>
+    public int RefExtractGpuFilteredThreads { get; set; } = 4;
 
     /// <summary>Threads for one Phase 2 sample encode from FFV1.  NVENC does
     /// the encode; CPU handles FFV1 decode + I/O.  Low: 2 is enough.</summary>
@@ -87,28 +101,32 @@ public sealed class Config
     /// CPU threads for one Phase 2 VMAF measurement.  The process runs two
     /// CPU decoders (FFV1 ref + AV1 sample) plus the filtergraph (zscale /
     /// tonemap on HDR, format conversion, hwupload_cuda); libvmaf_cuda itself
-    /// is GPU-bound and consumes no CPU.  6 covers all of those without
-    /// oversubscribing.
+    /// is GPU-bound and consumes no CPU.  4 = 1 thread per input decoder
+    /// (×2 inputs) + 2 filter threads, matching the pins below.
     /// </summary>
-    public int VmafThreads { get; set; } = 6;
+    public int VmafThreads { get; set; } = 4;
 
     /// <summary>
-    /// `-threads` value passed to ffmpeg for VMAF ops.  Sized so a single
-    /// VMAF process's two decoders plus filtergraph fit inside
-    /// <see cref="VmafThreads"/> total.  Decoders use this directly; filter
-    /// threads come from <see cref="VmafFilterThreads"/>.
+    /// `-threads` value passed to ffmpeg for VMAF ops, applied as the default
+    /// for each input decoder.  With 2 inputs (ref + encode), total decode
+    /// threads = 2 × this value.  Filter threads come from
+    /// <see cref="VmafFilterThreads"/>.
     /// </summary>
-    public int VmafFfmpegThreads { get; set; } = 2;
+    public int VmafFfmpegThreads { get; set; } = 1;
 
     /// <summary>`-filter_threads` value for VMAF ops.  Bounds the filtergraph's
     /// per-frame parallelism (zscale + tonemap + format + hwupload).</summary>
     public int VmafFilterThreads { get; set; } = 2;
 
-    /// <summary>Threads for the final full-file encode.  Two cases share this
-    /// setting: Progressive (NVDEC→NVENC pure-GPU, minimal CPU) and IVTC/
-    /// Deinterlace (CPU filter in the middle).  Worst-case sizing matches the
-    /// IVTC/Deint case so the pool's reservation is always sufficient.</summary>
-    public int FinalEncodeThreads { get; set; } = 4;
+    /// <summary>CPU budget for a progressive final encode (no CPU filter).
+    /// NVDEC→NVENC runs pure-GPU; the CPU only orchestrates, so reserving more
+    /// than ~1 core would hide headroom from the rest of the pipeline.</summary>
+    public int FinalEncodeProgressiveThreads { get; set; } = 1;
+
+    /// <summary>CPU budget for a filtered final encode (IVTC fieldmatch+decimate
+    /// or bwdif deinterlace).  The CPU filter is real sustained work between
+    /// NVDEC and NVENC, so the budget matches the worst case.</summary>
+    public int FinalEncodeFilteredThreads { get; set; } = 4;
 
     /// <summary>
     /// `n_subsample=N` setting for libvmaf.  N=1 measures every frame (most
@@ -129,25 +147,62 @@ public sealed class Config
     // needs them.  When the CPU pool is saturated (typically at the start
     // of a batch where every file wants Detection at once), the GPU path
     // is granted instead so files don't sit idle waiting for CPU.
+    //
+    // Alternatives lists are cached after first read so AcquireAnyAsync
+    // doesn't re-allocate the 2-element collection on every acquire.
 
+    private IReadOnlyList<ResourceRequest>? _detectionAlternatives;
     public IReadOnlyList<ResourceRequest> DetectionAlternatives =>
-    [
-        new(Cpu: DetectionCpuThreads),
-        new(Cpu: DetectionGpuThreads, Nvdec: 1),
-    ];
+        _detectionAlternatives ??=
+        [
+            new(Cpu: DetectionCpuThreads),
+            new(Cpu: DetectionGpuThreads, Nvdec: 1),
+        ];
 
     public IReadOnlyList<ResourceRequest> VerificationAlternatives => DetectionAlternatives;
 
-    public IReadOnlyList<ResourceRequest> RefExtractAlternatives =>
-    [
-        new(Cpu: RefExtractCpuThreads),
-        new(Cpu: RefExtractGpuThreads, Nvdec: 1),
-    ];
+    private IReadOnlyList<ResourceRequest>? _refExtractProgressiveAlternatives;
+    public IReadOnlyList<ResourceRequest> RefExtractProgressiveAlternatives =>
+        _refExtractProgressiveAlternatives ??=
+        [
+            new(Cpu: RefExtractCpuProgressiveThreads),
+            new(Cpu: RefExtractGpuProgressiveThreads, Nvdec: 1),
+        ];
+
+    private IReadOnlyList<ResourceRequest>? _refExtractFilteredAlternatives;
+    public IReadOnlyList<ResourceRequest> RefExtractFilteredAlternatives =>
+        _refExtractFilteredAlternatives ??=
+        [
+            new(Cpu: RefExtractCpuFilteredThreads),
+            new(Cpu: RefExtractGpuFilteredThreads, Nvdec: 1),
+        ];
+
+    /// <summary>Picks the right ref-extract cost shape for the given restore
+    /// decision.  Progressive sources (no filter) get the smaller budget;
+    /// IVTC / Deinterlace runs pay for the CPU filter that sits in the chain.</summary>
+    public IReadOnlyList<ResourceRequest> RefExtractAlternativesFor(RestoreDecision restore) =>
+        string.IsNullOrWhiteSpace(restore.FilterGraph)
+            ? RefExtractProgressiveAlternatives
+            : RefExtractFilteredAlternatives;
 
     public ResourceRequest PreviewRequest        => new(Cpu: PreviewThreads);
     public ResourceRequest SampleEncodeRequest   => new(Cpu: SampleEncodeThreads, Nvenc: 1);
     public ResourceRequest VmafRequest           => new(Cpu: VmafThreads, Cuda: 1);
-    public ResourceRequest FinalEncodeRequest    => new(Cpu: FinalEncodeThreads, Nvenc: 1, Nvdec: 1);
+
+    public ResourceRequest FinalEncodeProgressiveRequest =>
+        new(Cpu: FinalEncodeProgressiveThreads, Nvenc: 1, Nvdec: 1);
+    public ResourceRequest FinalEncodeFilteredRequest    =>
+        new(Cpu: FinalEncodeFilteredThreads, Nvenc: 1, Nvdec: 1);
+
+    /// <summary>Picks the right final-encode cost shape for the given restore
+    /// decision.  Pure-progressive encodes are NVDEC→NVENC end-to-end with
+    /// near-zero CPU; filtered encodes pay for the CPU filter (fieldmatch+
+    /// decimate or bwdif) that sits between decode and encode.</summary>
+    public ResourceRequest FinalEncodeRequestFor(RestoreDecision restore) =>
+        string.IsNullOrWhiteSpace(restore.FilterGraph)
+            ? FinalEncodeProgressiveRequest
+            : FinalEncodeFilteredRequest;
+
     public ResourceRequest SizeGuardRemuxRequest => new(Cpu: 1);
 
     // -- CQ search range --

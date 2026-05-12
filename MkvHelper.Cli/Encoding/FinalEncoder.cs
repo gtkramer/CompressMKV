@@ -4,8 +4,9 @@ namespace MkvHelper;
 /// Final encode orchestration.  Declares CPU + NVENC + NVDEC needs to the
 /// pool; the encode itself is mostly GPU (NVDEC→NVENC) with light CPU
 /// orchestration in the Progressive case or heavier CPU work when an
-/// IVTC/Deint filter sits in the middle.  One CPU budget covers both
-/// cases — see <see cref="Config.FinalEncodeThreads"/>.
+/// IVTC/Deint filter sits in the middle.  Two cost shapes — progressive
+/// and filtered — are selected by <see cref="Config.FinalEncodeRequestFor"/>
+/// so progressive encodes release their unused CPU cores back to the pool.
 /// </summary>
 public static class FinalEncoder
 {
@@ -20,9 +21,11 @@ public static class FinalEncoder
         logger.SetStage("Final encode", $"CQ={cq} ({format})");
         logger.LogInfo($"Final encode: CQ={cq}, {format}.");
 
-        using (await pool.AcquireAsync(cfg.FinalEncodeRequest, ct))
+        var request = cfg.FinalEncodeRequestFor(restore);
+        using (await pool.AcquireAsync(request, ct))
         {
-            await Pipelines.EncodeFullNvencAsync(cfg, input, output, restore, cq, format, ct, logger);
+            await Pipelines.EncodeFullNvencAsync(
+                cfg, input, output, restore, cq, format, request.Cpu, ct, logger);
         }
     }
 }
