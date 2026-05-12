@@ -1,77 +1,101 @@
-using System.Globalization;
+using Serilog;
+using Serilog.Context;
+using Serilog.Core;
 
 namespace MkvHelper;
 
 /// <summary>
-/// Production logger for a single file's pipeline run.  Two responsibilities:
+/// Per-file pipeline logger.  Each input file gets its own instance for the
+/// lifetime of its processing.  Three responsibilities:
 ///
-///   1. Append every log line to <c>decisions.log</c> in the file's output
-///      directory, with timestamp and level prefix.  This is the durable
-///      chronological record — independent of the structured log.json.
+///   1. Forward every event to that file's <c>decisions.log</c> (plain text)
+///      via a dedicated Serilog instance — same crash-safe non-buffered async
+///      sink as the global logger.
 ///
-///   2. Forward stage updates to the run-wide <see cref="StageReporter"/>,
-///      which is responsible for repainting the live UI.
+///   2. Forward the same event to <see cref="Log.Logger"/> (the global logger)
+///      so it lands in <c>events.jsonl</c> + <c>events.log</c> for cross-file
+///      analysis.  The <c>File</c> property is pushed once via
+///      <see cref="LogContext"/> in the constructor and pops on
+///      <see cref="Dispose"/>, so global-sink lines carry the input identity
+///      without callers having to thread it manually.
 ///
-/// Thread-safe for concurrent writes from a single file's pipeline (the file
-/// log is serialised on a per-instance lock; the StageReporter is itself
-/// thread-safe for cross-file updates).
+///   3. Forward stage updates to the run-wide <see cref="StageReporter"/> for
+///      the live terminal UI.
+///
+/// Thread-safety: Serilog's loggers are thread-safe; the StageReporter is
+/// thread-safe.  LogContext.PushProperty uses AsyncLocal&lt;T&gt;, which flows
+/// across awaits inside the same task so global-logger calls fired from any
+/// continuation in the per-file pipeline still carry the right File property.
 /// </summary>
 public sealed class PerFileLogger : IPipelineLogger, IDisposable
 {
-    private readonly StreamWriter _file;
-    private readonly object _fileLock = new();
+    private readonly Logger _file;
+    private readonly IDisposable _fileScope;
     private readonly StageReporter? _reporter;
     private readonly int _fileSlot;
     private bool _disposed;
 
+    public string VideoId { get; }
+
     /// <summary>Warnings collected during the run, surfaced in the final summary.</summary>
     public List<string> Warnings { get; } = new();
 
-    public PerFileLogger(string logPath, StageReporter? reporter, int fileSlot)
+    public PerFileLogger(string logPath, string videoId, StageReporter? reporter, int fileSlot)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
-        _file = new StreamWriter(logPath, append: true)
-        {
-            AutoFlush = true,    // crash-safe: every line is on disk before the next call returns
-        };
+        _file = LoggerSetup.BuildPerFileLogger(logPath);
+        _fileScope = LogContext.PushProperty("File", videoId);
         _reporter = reporter;
         _fileSlot = fileSlot;
+        VideoId = videoId;
 
-        WriteLine("INFO", $"Run started at {DateTime.UtcNow:O}");
+        _file.Information("Run started at {StartedUtc:O}", DateTime.UtcNow);
+        Log.Logger.Information("Per-file run started at {StartedUtc:O}", DateTime.UtcNow);
     }
 
-    public void LogInfo(string message) => WriteLine("INFO", message);
+    public void LogInfo(string message)
+    {
+        _file.Information("{Message:l}", message);
+        Log.Logger.Information("{Message:l}", message);
+    }
+
     public void LogWarning(string message)
     {
-        WriteLine("WARN", message);
+        _file.Warning("{Message:l}", message);
+        Log.Logger.Warning("{Message:l}", message);
         lock (Warnings) Warnings.Add(message);
     }
-    public void LogError(string message) => WriteLine("ERROR", message);
+
+    public void LogError(string message)
+    {
+        _file.Error("{Message:l}", message);
+        Log.Logger.Error("{Message:l}", message);
+    }
 
     public void SetStage(string stage, string? detail = null)
     {
-        // Mirror to the log so post-hoc readers can see when each stage started.
-        WriteLine("STAGE", detail is null ? stage : $"{stage} — {detail}");
-        _reporter?.SetStage(_fileSlot, stage, detail);
-    }
-
-    private void WriteLine(string level, string message)
-    {
-        var line = $"{DateTime.UtcNow:HH:mm:ss.fff} [{level}] {message}";
-        lock (_fileLock)
+        // Mirror to both the per-file log and the global log so post-hoc readers
+        // can see when each stage started.  Structured Stage/Detail properties
+        // make stage transitions filterable in events.jsonl.
+        if (detail is null)
         {
-            _file.WriteLine(line);
+            _file.Information("STAGE: {Stage}", stage);
+            Log.Logger.Information("Stage: {Stage}", stage);
         }
+        else
+        {
+            _file.Information("STAGE: {Stage} — {Detail}", stage, detail);
+            Log.Logger.Information("Stage: {Stage} — {Detail}", stage, detail);
+        }
+        _reporter?.SetStage(_fileSlot, stage, detail);
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        lock (_fileLock)
-        {
-            _file.WriteLine($"{DateTime.UtcNow:HH:mm:ss.fff} [INFO] Run finished at {DateTime.UtcNow:O}");
-            _file.Dispose();
-        }
+        _file.Information("Run finished at {FinishedUtc:O}", DateTime.UtcNow);
+        Log.Logger.Information("Per-file run finished at {FinishedUtc:O}", DateTime.UtcNow);
+        _fileScope.Dispose();
+        _file.Dispose();    // flushes the async file sink
     }
 }

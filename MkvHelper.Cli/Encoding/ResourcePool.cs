@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using Serilog;
+
 namespace MkvHelper;
 
 /// <summary>
@@ -37,6 +40,12 @@ namespace MkvHelper;
 /// resources (and disposes them via the returned <see cref="IDisposable"/>)
 /// or sees the cancellation — the pool's <c>Granted</c> flag, set under
 /// the pool lock, settles the race so resources never leak.
+///
+/// Event emission: every acquire (fast-path or after-queue) and release
+/// fires a structured Serilog event with file/op labels, granted shape,
+/// queue wait, and a post-state pool snapshot.  This lets after-the-fact
+/// analysis answer "how long did file 5 wait for a CUDA lane?" without
+/// instrumenting every call site.
 /// </summary>
 public sealed class ResourcePool
 {
@@ -64,21 +73,24 @@ public sealed class ResourcePool
     public int CudaTotal  => _cudaMax;
 
     /// <summary>
-    /// Snapshot of currently-available capacity.  Useful for diagnostics; the
-    /// values can change before any subsequent <see cref="AcquireAsync"/> call.
+    /// Snapshot of currently-available capacity.  Useful for diagnostics and
+    /// for the system-utilization sampler; the values can change before any
+    /// subsequent <see cref="AcquireAsync"/> call.
     /// </summary>
-    public (int Cpu, int Nvenc, int Nvdec, int Cuda) Snapshot()
+    public PoolSnapshot Snapshot()
     {
-        lock (_lock) return (_cpu, _nvenc, _nvdec, _cuda);
+        lock (_lock) return new PoolSnapshot(_cpu, _nvenc, _nvdec, _cuda);
     }
 
     /// <summary>
     /// Acquire a single resource shape.  Convenience wrapper around
     /// <see cref="AcquireAnyAsync"/> with a one-element alternatives list.
     /// </summary>
-    public async Task<IDisposable> AcquireAsync(ResourceRequest req, CancellationToken ct)
+    public async Task<IDisposable> AcquireAsync(
+        ResourceRequest req, CancellationToken ct,
+        string? file = null, string? op = null)
     {
-        var result = await AcquireAnyAsync(new[] { req }, ct).ConfigureAwait(false);
+        var result = await AcquireAnyAsync(new[] { req }, ct, file, op).ConfigureAwait(false);
         return result.Lease;
     }
 
@@ -93,9 +105,15 @@ public sealed class ResourcePool
     /// to release the resources) and the index of the alternative that was
     /// granted, so the caller can adapt its work (e.g. choose a CPU or
     /// NVDEC ffmpeg invocation to match the granted slot).
+    ///
+    /// <paramref name="file"/> and <paramref name="op"/> identify the
+    /// caller for structured logging — they end up on every acquire and
+    /// release event for this operation and are echoed in the
+    /// <see cref="AcquireResult"/> so per-file loggers can mirror them.
     /// </summary>
     public Task<AcquireResult> AcquireAnyAsync(
-        IReadOnlyList<ResourceRequest> alternatives, CancellationToken ct)
+        IReadOnlyList<ResourceRequest> alternatives, CancellationToken ct,
+        string? file = null, string? op = null)
     {
         if (alternatives == null || alternatives.Count == 0)
             throw new ArgumentException("At least one alternative required.", nameof(alternatives));
@@ -127,8 +145,10 @@ public sealed class ResourcePool
                 if (CanSatisfy(alt))
                 {
                     Take(alt);
+                    var snapshot = new PoolSnapshot(_cpu, _nvenc, _nvdec, _cuda);
+                    EmitAcquired(file, op, alternatives, alt, i, waitMs: 0, fastPath: true, snapshot);
                     return Task.FromResult(new AcquireResult(
-                        new Releaser(this, alt), alt, i));
+                        new Releaser(this, alt, file, op), alt, i, WaitMs: 0, snapshot, op));
                 }
             }
 
@@ -136,7 +156,7 @@ public sealed class ResourcePool
             // satisfiable will wake the waiter.
             var tcs = new TaskCompletionSource<AcquireResult>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            var waiter = new Waiter(alternatives, tcs);
+            var waiter = new Waiter(alternatives, tcs, file, op, Stopwatch.StartNew());
             var node = _waiters.AddLast(waiter);
 
             ct.Register(static state =>
@@ -177,8 +197,17 @@ public sealed class ResourcePool
         _cuda  += r.Cuda;
     }
 
-    private void Release(in ResourceRequest r)
+    private void Release(in ResourceRequest r, string? file, string? op)
     {
+        int wokenCount = 0;
+        PoolSnapshot postRelease;
+        // Queued waiters that this release ended up granting.  Their acquire
+        // events are emitted AFTER the lock is dropped — Serilog's async sink
+        // doesn't block but we still want minimum lock time.
+        List<(string? File, string? Op, IReadOnlyList<ResourceRequest> Requested,
+              ResourceRequest Granted, int AltIndex, int WaitMs, PoolSnapshot Snapshot)>?
+            grantedInScan = null;
+
         lock (_lock)
         {
             Return(r);
@@ -205,36 +234,87 @@ public sealed class ResourcePool
                         _waiters.Remove(node);
                         Take(alt);
                         w.Granted = true;
+                        var snap = new PoolSnapshot(_cpu, _nvenc, _nvdec, _cuda);
+                        int waitMs = (int)w.QueueTimer.ElapsedMilliseconds;
+                        grantedInScan ??= new();
+                        grantedInScan.Add((w.File, w.Op, w.Alternatives, alt, i, waitMs, snap));
                         w.Tcs.TrySetResult(new AcquireResult(
-                            new Releaser(this, alt), alt, i));
+                            new Releaser(this, alt, w.File, w.Op), alt, i, waitMs, snap, w.Op));
+                        wokenCount++;
                         break;
                     }
                 }
                 node = next;
             }
+            postRelease = new PoolSnapshot(_cpu, _nvenc, _nvdec, _cuda);
         }
+
+        // Outside the lock: emit events.  Order is release first, then any
+        // acquire events for waiters granted in the same scan, so a reader
+        // can see the cause/effect chain.
+        EmitReleased(file, op, r, postRelease, wokenCount);
+        if (grantedInScan != null)
+        {
+            foreach (var g in grantedInScan)
+                EmitAcquired(g.File, g.Op, g.Requested, g.Granted, g.AltIndex,
+                    g.WaitMs, fastPath: false, g.Snapshot);
+        }
+    }
+
+    private static void EmitAcquired(
+        string? file, string? op,
+        IReadOnlyList<ResourceRequest> requested,
+        ResourceRequest granted, int altIndex,
+        int waitMs, bool fastPath, PoolSnapshot poolAfter)
+    {
+        Log.Logger.Information(
+            "Pool acquired {Op} for {File}: granted {@Granted}, alt {AltIndex}, " +
+            "waited {WaitMs}ms ({Path}); pool now {@PoolAfter}",
+            op ?? "—", file ?? "—", granted, altIndex, waitMs,
+            fastPath ? "fast" : "queued", poolAfter);
+    }
+
+    private static void EmitReleased(
+        string? file, string? op,
+        ResourceRequest released, PoolSnapshot poolAfter, int waitersGrantedInScan)
+    {
+        Log.Logger.Information(
+            "Pool released {Op} for {File}: released {@Released}; pool now {@PoolAfter}; " +
+            "granted {WaitersGrantedInScan} waiter(s) in same scan",
+            op ?? "—", file ?? "—", released, poolAfter, waitersGrantedInScan);
     }
 
     private sealed class Waiter(
         IReadOnlyList<ResourceRequest> alternatives,
-        TaskCompletionSource<AcquireResult> tcs)
+        TaskCompletionSource<AcquireResult> tcs,
+        string? file, string? op, Stopwatch queueTimer)
     {
         public IReadOnlyList<ResourceRequest> Alternatives { get; } = alternatives;
         public TaskCompletionSource<AcquireResult> Tcs { get; } = tcs;
+        public string? File { get; } = file;
+        public string? Op { get; } = op;
+        public Stopwatch QueueTimer { get; } = queueTimer;
         public bool Granted { get; set; }
     }
 
-    private sealed class Releaser(ResourcePool pool, ResourceRequest req) : IDisposable
+    private sealed class Releaser(ResourcePool pool, ResourceRequest req, string? file, string? op) : IDisposable
     {
         private bool _done;
         public void Dispose()
         {
             if (_done) return;
             _done = true;
-            pool.Release(req);
+            pool.Release(req, file, op);
         }
     }
 }
+
+/// <summary>
+/// Snapshot of pool capacity at a point in time.  Used both diagnostically
+/// (via <see cref="ResourcePool.Snapshot"/>) and inside acquire/release event
+/// payloads so a reader can reconstruct pool state at any logged event.
+/// </summary>
+public readonly record struct PoolSnapshot(int Cpu, int Nvenc, int Nvdec, int Cuda);
 
 /// <summary>
 /// Outcome of <see cref="ResourcePool.AcquireAnyAsync"/>.  <see cref="Lease"/>
@@ -243,8 +323,15 @@ public sealed class ResourcePool
 /// <see cref="AlternativeIndex"/> is its position in the alternatives list
 /// passed in — the caller uses one or the other to branch on which
 /// implementation to invoke (e.g. CPU vs GPU ffmpeg args).
+/// <see cref="WaitMs"/> is how long the request sat in the queue before being
+/// granted (0 on the fast path), and <see cref="PoolAfter"/> is the pool
+/// state immediately after the grant — both useful for per-file logging at
+/// the call site without re-querying the pool.
 /// </summary>
 public sealed record class AcquireResult(
     IDisposable Lease,
     ResourceRequest Granted,
-    int AlternativeIndex);
+    int AlternativeIndex,
+    int WaitMs,
+    PoolSnapshot PoolAfter,
+    string? Op);

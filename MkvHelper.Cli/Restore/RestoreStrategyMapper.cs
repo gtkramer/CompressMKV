@@ -66,7 +66,8 @@ public static class RestoreStrategyMapper
             // "Progressive video requires no special filtering to encode."
             // -----------------------------------------------------------
             ContentType.Progressive =>
-                NoFilter("Progressive (§7.2.3.1): verified pure progressive — no filter."),
+                NoFilter("Progressive (§7.2.3.1): verified pure progressive — no filter " +
+                    $"(interlaced frame count = 0; {IvtcGuardsState(detection)})."),
 
             // -----------------------------------------------------------
             // §7.2.3.3 Interlaced.  Always safe at native rate, regardless of source fps.
@@ -75,7 +76,9 @@ public static class RestoreStrategyMapper
             ContentType.Interlaced =>
                 Deinterlace(parity,
                     "Interlaced (§7.2.3.3): bwdif (motion-adaptive deinterlacer) " +
-                    "at native frame rate."),
+                    "at native frame rate " +
+                    $"(progFrac={detection.GlobalProgressiveFraction:P1} ≤ 5.0%; " +
+                    $"{IvtcGuardsState(detection)})."),
 
             // -----------------------------------------------------------
             // §7.2.3.2 Telecined — only valid on a 30000/1001 CFR source.
@@ -83,7 +86,9 @@ public static class RestoreStrategyMapper
             ContentType.Telecined when canApplyIvtc =>
                 Ivtc(parity,
                     "Telecined (§7.2.3.2): IVTC via fieldmatch + bwdif(interlaced) + " +
-                    "decimate to recover 24000/1001."),
+                    "decimate to recover 24000/1001 " +
+                    $"(cadence={detection.TelecineCadenceMatchRate:P1} ≥ 80.0%; " +
+                    $"{IvtcGuardsState(detection)})."),
 
             // Cadence detected but the source rate or CFR guard fails: anomaly.
             // Pass through rather than damage the rate.
@@ -99,7 +104,9 @@ public static class RestoreStrategyMapper
                 Ivtc(parity,
                     "Mixed prog+telecine (§7.2.3.4): fieldmatch leaves progressive " +
                     "data alone and inverse-telecines the telecined sections; " +
-                    "decimate restores 24000/1001."),
+                    "decimate restores 24000/1001 " +
+                    $"(i_in_cadence={detection.InterlacedFramesInCadenceRatio:P1} ≥ 60.0%; " +
+                    $"{IvtcGuardsState(detection)})."),
 
             ContentType.MixedProgressiveTelecine =>
                 NoFilter(IvtcSkipReason("Cadence-pattern I frames detected", detection)),
@@ -118,9 +125,10 @@ public static class RestoreStrategyMapper
             // -----------------------------------------------------------
             ContentType.MixedProgressiveInterlaced when favorProgressive && canApplyIvtc =>
                 Ivtc(parity,
-                    $"Mixed prog+interlaced ({detection.GlobalProgressiveFraction:P1} " +
-                    "progressive, NTSC-thirty CFR source): IVTC chain per guide §7.2.3.5 " +
-                    "favor-progressive + footnote [3] safe pullup default."),
+                    $"Mixed prog+interlaced ({detection.GlobalProgressiveFraction:P1} ≥ 90.0% " +
+                    "progressive): IVTC chain per guide §7.2.3.5 favor-progressive + " +
+                    "footnote [3] safe pullup default " +
+                    $"({IvtcGuardsState(detection)})."),
 
             ContentType.MixedProgressiveInterlaced when favorProgressive =>
                 NoFilter(IvtcSkipReason(
@@ -128,10 +136,10 @@ public static class RestoreStrategyMapper
 
             ContentType.MixedProgressiveInterlaced =>
                 Deinterlace(parity,
-                    $"Mixed prog+interlaced ({detection.GlobalProgressiveFraction:P1} " +
+                    $"Mixed prog+interlaced ({detection.GlobalProgressiveFraction:P1} < 90.0% " +
                     "progressive): deinterlace all per guide §7.2.3.5 — " +
                     "\"if it is only half progressive, you probably want to encode it " +
-                    "as if it is all interlaced.\""),
+                    $"as if it is all interlaced.\" ({IvtcGuardsState(detection)})."),
 
             _ => NoFilter("Unknown content type."),
         };
@@ -160,6 +168,21 @@ public static class RestoreStrategyMapper
         (RestoreMode.Deinterlace, RestoreFilters.DeinterlaceChain(parity), null, notes);
 
     // ---- Diagnostics ----
+
+    /// <summary>
+    /// Renders the source-rate / CFR guard state in a uniform parenthetical
+    /// form so every branch's notes can echo what the guards actually saw.
+    /// Symmetric to <see cref="IvtcSkipReason"/>'s explanation of failure —
+    /// every pass-path note includes the same data so cross-branch comparison
+    /// is grep-able.
+    /// </summary>
+    private static string IvtcGuardsState(ContentDetectionResult detection)
+    {
+        var fpsStr = detection.SourceFps?.ToString() ?? "?";
+        bool ntsc = detection.SourceFps?.IsNtscThirty() ?? false;
+        return $"fps={fpsStr} {(ntsc ? "NTSC-thirty" : "non-NTSC-thirty")}, " +
+               $"{(detection.SourceIsLikelyCfr ? "CFR" : "VFR")}";
+    }
 
     /// <summary>
     /// Builds the explanation string for an IVTC-skip pass-through, naming the

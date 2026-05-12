@@ -22,8 +22,12 @@ public static class FinalEncoder
         logger.LogInfo($"Final encode: CQ={cq}, {format}.");
 
         var request = cfg.FinalEncodeRequestFor(restore);
-        using (await pool.AcquireAsync(request, ct))
+        var lease = await pool.AcquireAsync(request, ct, file: logger.VideoId, op: "final-encode");
+        using (lease)
         {
+            logger.LogInfo(
+                $"Final encode acquired: requested CPU:{request.Cpu} NVENC:{request.Nvenc} " +
+                $"NVDEC:{request.Nvdec}, pool now {CompressCommand.FormatPool(pool.Snapshot(), pool)}.");
             await Pipelines.EncodeFullNvencAsync(
                 cfg, input, output, restore, cq, format, request.Cpu, ct, logger);
         }

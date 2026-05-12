@@ -10,6 +10,8 @@ public sealed class NullLogger : IPipelineLogger
     public static readonly NullLogger Instance = new();
     private NullLogger() { }
 
+    public string VideoId => "";
+
     public void LogInfo(string message) { }
     public void LogWarning(string message) { }
     public void LogError(string message) { }

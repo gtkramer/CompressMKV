@@ -36,7 +36,7 @@ public class ResourcePoolTests
             Assert.That(snap.Cuda, Is.EqualTo(1));
         }
 
-        Assert.That(pool.Snapshot(), Is.EqualTo((8, 2, 2, 2)));
+        Assert.That(pool.Snapshot(), Is.EqualTo(new PoolSnapshot(8, 2, 2, 2)));
     }
 
     [Test]
@@ -377,6 +377,6 @@ public class ResourcePoolTests
         await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(30));
 
         // After all ops complete, the pool must be fully restored.
-        Assert.That(pool.Snapshot(), Is.EqualTo((16, 2, 2, 2)));
+        Assert.That(pool.Snapshot(), Is.EqualTo(new PoolSnapshot(16, 2, 2, 2)));
     }
 }

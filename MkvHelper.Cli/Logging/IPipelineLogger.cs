@@ -19,6 +19,15 @@ namespace MkvHelper;
 /// </summary>
 public interface IPipelineLogger
 {
+    /// <summary>
+    /// Stable identifier for the input file this logger belongs to (the same
+    /// <c>SafeId</c>-d basename used for the output sub-directory).  Used to
+    /// tag <see cref="ResourcePool"/> acquire events with the originating
+    /// file so cross-file analysis can attribute wait times.  Empty string
+    /// on loggers that aren't file-scoped (e.g. <see cref="NullLogger"/>).
+    /// </summary>
+    string VideoId { get; }
+
     /// <summary>Append an informational line to the per-file decisions.log.</summary>
     void LogInfo(string message);
 

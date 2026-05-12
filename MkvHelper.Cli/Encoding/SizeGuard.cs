@@ -92,7 +92,8 @@ public static class SizeGuard
         {
             // Pool gate only here: file-size comparison above is instant,
             // but the remux (-c copy) holds a CPU slice while ffmpeg runs.
-            using (await pool.AcquireAsync(cfg.SizeGuardRemuxRequest, ct))
+            using (await pool.AcquireAsync(
+                cfg.SizeGuardRemuxRequest, ct, file: logger.VideoId, op: "size-guard-remux"))
                 await RemuxPassthroughAsync(cfg, input, passthroughOut, ct);
         }
         catch (Exception ex)

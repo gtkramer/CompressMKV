@@ -45,6 +45,13 @@ public sealed class Config
     /// </summary>
     public int CudaSlots { get; set; } = 2;
 
+    /// <summary>
+    /// Cadence (seconds) at which <see cref="SystemSampler"/> writes real
+    /// system + GPU utilization alongside the pool's own snapshot.  Set to 0
+    /// to disable.  Default 5s ≈ 2 % overhead from the nvidia-smi subprocess.
+    /// </summary>
+    public int SystemSamplerIntervalSeconds { get; set; } = 5;
+
     // --- Per-operation CPU thread counts ---
     //
     // Each operation declares how many CPU threads it consumes; the same

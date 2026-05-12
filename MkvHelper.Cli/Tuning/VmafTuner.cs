@@ -78,15 +78,27 @@ public static class VmafTuner
         // =======================================================
         logger.SetStage("Phase 1", $"extracting {windows.Count} reference clips");
         logger.LogInfo($"Phase 1: extracting {windows.Count} FFV1 reference clips (cadence-restored).");
+        // Echo the chosen sample windows once so the decisions.log records
+        // what the run actually measured — useful for reproducibility analysis
+        // and to verify the seeded RNG produced the expected distribution.
+        logger.LogInfo("Sample windows: " + string.Join(", ",
+            windows.Select(w => $"{w.StartSeconds:F1}s+{w.LengthSeconds:F1}s")));
         var phase1Sw = Stopwatch.StartNew();
         var refClips = new string[windows.Count];
 
         int extractedCount = 0;
         var refExtractAlternatives = cfg.RefExtractAlternativesFor(restore);
+        // Phase 1 fires 16+ acquires per file in tight parallelism.  Per-acquire
+        // logging would flood the per-file decisions.log, so we accumulate
+        // wait stats here and emit one summary at phase end.  The structured
+        // events.jsonl still has every individual acquire/release.
+        var refWaitMs = new int[windows.Count];
         var refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
-            var admit = await pool.AcquireAnyAsync(refExtractAlternatives, ct);
+            var admit = await pool.AcquireAnyAsync(
+                refExtractAlternatives, ct, file: logger.VideoId, op: "phase1.ref-extract");
+            refWaitMs[i] = admit.WaitMs;
             using (admit.Lease)
             {
                 bool useHwaccel = admit.Granted.Nvdec > 0;
@@ -100,7 +112,11 @@ public static class VmafTuner
 
         await Task.WhenAll(refTasks);
         phase1Sw.Stop();
-        logger.LogInfo($"Phase 1 complete in {phase1Sw.Elapsed.TotalSeconds:F1}s.");
+        int p1MaxWait = refWaitMs.Length > 0 ? refWaitMs.Max() : 0;
+        double p1AvgWait = refWaitMs.Length > 0 ? refWaitMs.Average() : 0;
+        logger.LogInfo(
+            $"Phase 1 complete in {phase1Sw.Elapsed.TotalSeconds:F1}s " +
+            $"({refWaitMs.Length} acquires; pool wait avg {p1AvgWait:F0}ms, max {p1MaxWait}ms).");
 
         // =======================================================
         //  Phase 2: Binary search the [MinCq, MaxCq] integer range
@@ -122,6 +138,10 @@ public static class VmafTuner
         int probeCount = 0;
         int expectedProbes = (int)Math.Ceiling(Math.Log2(cfg.MaxCq - cfg.MinCq + 2));
         var cqResults = new List<CqAggregate>();
+        // Probe order trajectory — CQ tried at each step and its pass/fail
+        // verdict.  Logged at Phase 2 end so the decisions.log shows the
+        // path the binary search actually walked, not just the final result.
+        var trajectory = new List<(int Cq, bool Pass)>();
 
         logger.LogInfo(
             $"Phase 2: binary search CQ in [{cfg.MinCq}..{cfg.MaxCq}] " +
@@ -147,6 +167,8 @@ public static class VmafTuner
                          && agg.P05Vmaf  >= cfg.TargetP05Vmaf
                          && agg.P01Vmaf  >= cfg.TargetP01Vmaf;
 
+                trajectory.Add((cq, pass));
+
                 logger.LogInfo(
                     $"  CQ={cq}: mean={agg.MeanVmaf:F2} harmonic={agg.HarmonicMeanVmaf:F2} " +
                     $"p05={agg.P05Vmaf:F2} p01={agg.P01Vmaf:F2} min={agg.MinVmaf:F2} " +
@@ -163,6 +185,13 @@ public static class VmafTuner
         // Sort the probe list by CQ (not probe order) so the selector sees a
         // canonical view.
         var selection = Selector.Select(cfg, cqResults.OrderBy(r => r.Cq).ToList());
+
+        // One-line search-trajectory recap before the phase-end summary, so a
+        // reader can see exactly which CQs were probed and in what order.
+        logger.LogInfo("Search trajectory: " + string.Join(" → ",
+            trajectory.Select(t => $"CQ={t.Cq} {(t.Pass ? "PASS" : "FAIL")}"))
+            + $"; selected CQ={selection.SelectedCq}.");
+
         logger.LogInfo(
             $"Phase 2 complete in {phase2Sw.Elapsed.TotalSeconds:F1}s " +
             $"({probeCount} probe(s); " +
@@ -195,6 +224,12 @@ public static class VmafTuner
         int cq, IPipelineLogger logger, CancellationToken ct)
     {
         int doneSamples = 0;
+        // Per-probe pool wait accumulation (per window).  Aggregated into a
+        // probe summary at the bottom — individual acquires still emit their
+        // own structured events into events.jsonl.
+        var sampleWaitMs = new int[windows.Count];
+        var vmafWaitMs   = new int[windows.Count];
+
         var sampleTasks = Enumerable.Range(0, windows.Count).Select(async i =>
         {
             string refClip = refClips[i];
@@ -204,13 +239,21 @@ public static class VmafTuner
 
             // 1. Sample encode — declares CPU (for FFV1 decode + orchestration)
             //    and one NVENC slot.
-            using (await pool.AcquireAsync(cfg.SampleEncodeRequest, ct))
+            var sampleAdmit = await pool.AcquireAnyAsync(
+                new[] { cfg.SampleEncodeRequest }, ct,
+                file: logger.VideoId, op: $"phase2.sample-encode.cq{cq}");
+            sampleWaitMs[i] = sampleAdmit.WaitMs;
+            using (sampleAdmit.Lease)
                 await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
 
             // 2. VMAF — declares CPU (for FFV1+AV1 decode + zscale/tonemap on
             //    HDR + format conversion) and one CUDA lane.  See
             //    Pipelines.RunVmafDirectAsync for the HDR tonemap chain.
-            using (await pool.AcquireAsync(cfg.VmafRequest, ct))
+            var vmafAdmit = await pool.AcquireAnyAsync(
+                new[] { cfg.VmafRequest }, ct,
+                file: logger.VideoId, op: $"phase2.vmaf.cq{cq}");
+            vmafWaitMs[i] = vmafAdmit.WaitMs;
+            using (vmafAdmit.Lease)
                 await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
 
             var vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
@@ -230,6 +273,9 @@ public static class VmafTuner
         }).ToArray();
 
         var metrics = (await Task.WhenAll(sampleTasks)).ToList();
+        logger.LogInfo(
+            $"  CQ={cq} pool waits: sample-encode avg {sampleWaitMs.Average():F0}ms / " +
+            $"max {sampleWaitMs.Max()}ms; vmaf avg {vmafWaitMs.Average():F0}ms / max {vmafWaitMs.Max()}ms.");
         return CqAggregate.From(cq, metrics);
     }
 

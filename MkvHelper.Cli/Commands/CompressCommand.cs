@@ -87,9 +87,26 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             AnsiConsole.MarkupLine("[yellow]--force-redo:[/] existing log.json files will be ignored and files re-processed.");
         AnsiConsole.WriteLine();
 
+        // Initialize Serilog as the run-wide logger.  Two file sinks open
+        // events.jsonl (machine-readable, canonical for post-hoc analysis)
+        // and events.log (human-readable mirror).  Per-file loggers come up
+        // independently inside the work loop and forward events here too.
+        Serilog.Log.Logger = LoggerSetup.BuildGlobalLogger(cfg.OutputFolder);
+        Serilog.Log.Logger.Information(
+            "Run start: input={Input}, output={Output}, pool=CPU:{Cpu} NVENC:{Nvenc} " +
+            "NVDEC:{Nvdec} CUDA:{Cuda}, files={FileCount}, forceRedo={ForceRedo}",
+            cfg.InputFolder, cfg.OutputFolder, cfg.CpuPool, cfg.NvencSlots,
+            cfg.NvdecSlots, cfg.CudaSlots, discovered.Count, settings.ForceRedo);
+
         var pool = new ResourcePool(cfg.CpuPool, cfg.NvencSlots, cfg.NvdecSlots, cfg.CudaSlots);
         var overall = new OverallSummary { StartedUtc = DateTime.UtcNow, Config = cfg };
         var reporter = new StageReporter(discovered.Count);
+
+        // Background sampler: real CPU + GPU + pool snapshot every N seconds.
+        // Disabled when SystemSamplerIntervalSeconds is 0.
+        SystemSampler? sampler = cfg.SystemSamplerIntervalSeconds > 0
+            ? new SystemSampler(pool, TimeSpan.FromSeconds(cfg.SystemSamplerIntervalSeconds), cts.Token)
+            : null;
 
         var workTask = ProcessAllFilesAsync(
             cfg, pool, discovered, settings.ForceRedo,
@@ -112,9 +129,17 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         try { await workTask; }
         catch (OperationCanceledException) { /* user-initiated */ }
 
+        if (sampler is not null) await sampler.DisposeAsync();
+
         overall.FinishedUtc = DateTime.UtcNow;
         var overallPath = Path.Combine(cfg.OutputFolder, $"overall_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
         await JsonIO.WriteAsync(overallPath, overall, cts.Token);
+
+        Serilog.Log.Logger.Information(
+            "Run end: completed={Completed}, errors={Errors}, duration={DurationS:F1}s",
+            overall.Videos.Count - overall.Errors.Count, overall.Errors.Count,
+            (overall.FinishedUtc!.Value - overall.StartedUtc).TotalSeconds);
+        await Serilog.Log.CloseAndFlushAsync();
 
         AnsiConsole.WriteLine();
         var rule = new Rule("[bold]Run summary[/]") { Justification = Justify.Left };
@@ -187,7 +212,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 reporter.BeginFile(slot, idx, fileName);
 
                 using var logger = new PerFileLogger(
-                    Path.Combine(outDir, "decisions.log"), reporter, slot);
+                    Path.Combine(outDir, "decisions.log"), id, reporter, slot);
 
                 try
                 {
@@ -306,11 +331,15 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         var sw = Stopwatch.StartNew();
         ContentDetectionResult detection;
-        var detectAdmit = await pool.AcquireAnyAsync(cfg.DetectionAlternatives, ct);
+        var detectAdmit = await pool.AcquireAnyAsync(
+            cfg.DetectionAlternatives, ct, file: id, op: "detection");
         using (detectAdmit.Lease)
         {
             bool useHwaccel = detectAdmit.Granted.Nvdec > 0;
-            logger.LogInfo($"Detection: decoder = {(useHwaccel ? "NVDEC" : "CPU")}");
+            logger.LogInfo(
+                $"Detection acquired: decoder={(useHwaccel ? "NVDEC" : "CPU")} " +
+                $"(alt {detectAdmit.AlternativeIndex}, waited {detectAdmit.WaitMs}ms); " +
+                $"pool now {FormatPool(detectAdmit.PoolAfter, pool)}");
             detection = await ContentDetector.DetectAsync(cfg, input, vstream, useHwaccel, ct, logger);
         }
         timings.Detection = sw.Elapsed;
@@ -344,7 +373,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             // fire both concurrently and let the pool gate admission.
             async Task RunPreview(string outPath, RestoreMode mode, double t)
             {
-                using (await pool.AcquireAsync(cfg.PreviewRequest, ct))
+                using (await pool.AcquireAsync(cfg.PreviewRequest, ct, file: id, op: "preview"))
                     await PreviewGenerator.MakeLosslessPreviewAsync(
                         cfg, input, outPath, mode, detection.DetectedParity, t, ct);
             }
@@ -396,11 +425,15 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         sw.Restart();
         OutputVerificationResult verification;
-        var verifyAdmit = await pool.AcquireAnyAsync(cfg.VerificationAlternatives, ct);
+        var verifyAdmit = await pool.AcquireAnyAsync(
+            cfg.VerificationAlternatives, ct, file: id, op: "verification");
         using (verifyAdmit.Lease)
         {
             bool useHwaccel = verifyAdmit.Granted.Nvdec > 0;
-            logger.LogInfo($"Verification: decoder = {(useHwaccel ? "NVDEC" : "CPU")}");
+            logger.LogInfo(
+                $"Verification acquired: decoder={(useHwaccel ? "NVDEC" : "CPU")} " +
+                $"(alt {verifyAdmit.AlternativeIndex}, waited {verifyAdmit.WaitMs}ms); " +
+                $"pool now {FormatPool(verifyAdmit.PoolAfter, pool)}");
             verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, useHwaccel, ct, logger);
         }
         timings.Verification = sw.Elapsed;
@@ -456,4 +489,17 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             sb.Append(char.IsLetterOrDigit(ch) || ch is '-' or '_' or '.' ? ch : '_');
         return sb.ToString();
     }
+
+    /// <summary>
+    /// Human-readable rendering of a post-grant pool snapshot for inclusion in
+    /// per-file decisions.log lines.  Format: "CPU 16/20, NVENC 1/2, NVDEC 2/2,
+    /// CUDA 1/2".  The corresponding structured properties are emitted by the
+    /// pool itself into events.jsonl, so this string is purely for the human
+    /// reading the per-file log.
+    /// </summary>
+    internal static string FormatPool(PoolSnapshot s, ResourcePool pool) =>
+        $"CPU {s.Cpu}/{pool.CpuTotal}, " +
+        $"NVENC {s.Nvenc}/{pool.NvencTotal}, " +
+        $"NVDEC {s.Nvdec}/{pool.NvdecTotal}, " +
+        $"CUDA {s.Cuda}/{pool.CudaTotal}";
 }
