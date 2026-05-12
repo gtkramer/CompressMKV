@@ -1,6 +1,6 @@
 using System.Globalization;
 
-namespace MkvHelper.Tests;
+namespace MkvHelper.Tests.Integration;
 
 /// <summary>
 /// End-to-end §7.2.3 verification: apply the chosen restoration filter chain
@@ -186,7 +186,7 @@ public class RestoreRoundtripIntegrationTests
             output
         ]);
 
-        (int code, string _, string err) = await Proc.RunAsync("ffmpeg", args.ToArray(), CancellationToken.None);
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), CancellationToken.None);
         if (code != 0)
             throw new InvalidOperationException(
                 $"Filter-chain apply failed.\nFilter: {filterGraph}\nStderr: {err}");
@@ -196,7 +196,8 @@ public class RestoreRoundtripIntegrationTests
     {
         Config cfg = TestVideoFixture.CreateTestConfig();
         FfprobeRoot probe = await Ffprobe.RunAsync(cfg, path, CancellationToken.None);
-        FfprobeStream vstream = probe.Streams!.First(s => s.CodecType == "video");
+        FfprobeStream vstream = probe.Streams?.FirstOrDefault(s => s.CodecType == "video")
+            ?? throw new InvalidOperationException($"No video stream in {path}");
         return await ContentDetector.DetectAsync(cfg, path, vstream, useHwaccel: false, CancellationToken.None);
     }
 }

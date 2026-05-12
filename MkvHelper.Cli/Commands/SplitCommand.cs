@@ -100,7 +100,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
         Chapters chapters;
         try
         {
-            chapters = await MkvTools.ExtractChaptersAsync(inputFile, cts.Token);
+            chapters = await MkvToolNixChapters.ExtractChaptersAsync(inputFile, cts.Token);
         }
         catch (Exception ex)
         {
@@ -171,8 +171,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
             $"in {Markup.Escape(Path.GetFileName(inputFile))} " +
             $"(threshold: {settings.EpisodeChapterThreshold:F0}s, additional chapters: {settings.AdditionalChapters}).");
 
-        string? inputDir = Path.GetDirectoryName(inputFile);
-        if (string.IsNullOrEmpty(inputDir)) inputDir = ".";
+        string inputDir = Path.GetDirectoryName(inputFile) is { Length: > 0 } d ? d : ".";
 
         int written = 0;
         await AnsiConsole.Status()
@@ -195,7 +194,7 @@ public sealed class SplitCommand : AsyncCommand<SplitSettings>
                     string startTs = chapterAtoms[rangeStart].ChapterTimeStart;
                     string endTs = chapterAtoms[rangeEnd].ChapterTimeEnd;
 
-                    await MkvTools.SplitWithChaptersAsync(
+                    await MkvToolNixChapters.SplitWithChaptersAsync(
                         inputFile, startTs, endTs, renumbered, outputPath, cts.Token);
                     written++;
                 }

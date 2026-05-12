@@ -10,7 +10,7 @@ namespace MkvHelper;
 /// Caller is responsible for calling <see cref="ContainerBuilder.EnsureReadyAsync"/>
 /// (which configures the container mounts) before invoking anything here.
 /// </summary>
-public static class MkvTools
+public static class MkvToolNixChapters
 {
     /// <summary>
     /// Run <c>mkvextract chapters &lt;input&gt;</c> and parse the resulting

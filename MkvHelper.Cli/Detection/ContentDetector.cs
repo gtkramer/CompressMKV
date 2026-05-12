@@ -213,7 +213,7 @@ public static partial class ContentDetector
 
         // ---- Parity ----
         FieldParity ffprobeParity = FieldOrderMapper.MapToParity(
-            vstream.FieldOrder?.Trim().ToLowerInvariant() ?? "");
+            vstream.FieldOrder?.Trim().ToLowerInvariant());
 
         (FieldParity parity, bool parityFromNtsc) = DetectParity(totalTff, totalBff, isNtsc, ffprobeParity);
 
@@ -465,7 +465,7 @@ public static partial class ContentDetector
     // idet aggregate parsing (cross-check).
     // -------------------------------------------------------------------
 
-    internal static (long? Prog, long? Tff, long? Bff, long? Undet) ParseIdetAggregate(string stderr)
+    internal static (long? Prog, long? Tff, long? Bff, long? Undet) ParseIdetAggregate(string? stderr)
     {
         if (string.IsNullOrEmpty(stderr)) return (null, null, null, null);
 

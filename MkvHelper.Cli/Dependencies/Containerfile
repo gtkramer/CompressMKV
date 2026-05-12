@@ -181,6 +181,12 @@ RUN cd /tmp \
         --enable-libass \
         --enable-libwebp \
         --enable-libzimg \
+        # libfreetype/libfribidi enable the `drawtext` filter, used by
+        # the integration test fixture's synthetic-clip builder (a frame
+        # counter overlay is what gives idet the right amount of motion
+        # signal to classify the synthesised source as progressive).
+        --enable-libfreetype \
+        --enable-libfribidi \
         --nvccflags="${NVCC_FLAGS}" \
     && make -j"$(nproc)" \
     && make install \

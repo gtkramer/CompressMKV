@@ -1,4 +1,4 @@
-namespace MkvHelper.Tests;
+namespace MkvHelper.Tests.Integration;
 
 /// <summary>
 /// Integration tests that drive ContentDetector.DetectAsync against real
@@ -127,7 +127,8 @@ public class ContentDetectorIntegrationTests
     {
         Config cfg = TestVideoFixture.CreateTestConfig();
         FfprobeRoot probe = await Ffprobe.RunAsync(cfg, clipPath, CancellationToken.None);
-        FfprobeStream vstream = probe.Streams!.First(s => s.CodecType == "video");
+        FfprobeStream vstream = probe.Streams?.FirstOrDefault(s => s.CodecType == "video")
+            ?? throw new InvalidOperationException($"No video stream in test clip {clipPath}");
         return await ContentDetector.DetectAsync(cfg, clipPath, vstream, useHwaccel: false, CancellationToken.None);
     }
 }

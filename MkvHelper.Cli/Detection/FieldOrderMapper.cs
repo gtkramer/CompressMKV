@@ -12,7 +12,7 @@ namespace MkvHelper;
 /// </summary>
 public static class FieldOrderMapper
 {
-    public static FieldParity MapToParity(string fieldOrderLower)
+    public static FieldParity MapToParity(string? fieldOrderLower)
     {
         if (string.IsNullOrWhiteSpace(fieldOrderLower)) return FieldParity.Auto;
 

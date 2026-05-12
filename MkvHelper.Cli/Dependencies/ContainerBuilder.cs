@@ -115,7 +115,11 @@ public static class ContainerBuilder
         if (rebuildReason is not null)
             state = await AutoBuildAsync(rebuildReason, ct);
 
-        ContainerTools.Configure(state!.ImageTag, mounts);
+        if (state is null)
+            throw new InvalidOperationException(
+                "ContainerBuilder: build state was null after readiness resolution — internal bug.");
+
+        ContainerTools.Configure(state.ImageTag, mounts);
         return state;
     }
 
@@ -148,7 +152,9 @@ public static class ContainerBuilder
                     },
                     ct: ct);
             });
-        return result!;
+        return result
+            ?? throw new InvalidOperationException(
+                "Auto-build completed but produced no BuildState — internal bug.");
     }
 
     /// <summary>

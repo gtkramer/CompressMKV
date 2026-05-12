@@ -40,10 +40,14 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
     {
         using CancellationTokenSource cts = ConsoleCancellation.LinkToConsole(token);
 
+        // Validate() guarantees InputFile is non-null at this point; narrow
+        // once into a local so the rest of the method drops `!` noise.
+        string inputFile = settings.InputFile!;
+
         // Ensure the dependency container is ready and mount the directory
         // holding the input file.  mkvextract runs inside the container.
-        string mountDir = Path.GetDirectoryName(Path.GetFullPath(settings.InputFile!))
-            ?? throw new InvalidOperationException($"Input file has no directory: {settings.InputFile}");
+        string mountDir = Path.GetDirectoryName(Path.GetFullPath(inputFile))
+            ?? throw new InvalidOperationException($"Input file has no directory: {inputFile}");
         try
         {
             await ContainerBuilder.EnsureReadyAsync(mounts: [mountDir], ct: cts.Token);
@@ -57,7 +61,7 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
         Chapters chapters;
         try
         {
-            chapters = await MkvTools.ExtractChaptersAsync(settings.InputFile!, cts.Token);
+            chapters = await MkvToolNixChapters.ExtractChaptersAsync(inputFile, cts.Token);
         }
         catch (Exception ex)
         {
@@ -68,13 +72,13 @@ public sealed class PrintChaptersCommand : AsyncCommand<PrintChaptersSettings>
         List<ChapterAtom> atoms = chapters.EditionEntry.ChapterAtoms;
         if (atoms.Count == 0)
         {
-            AnsiConsole.MarkupLine($"[yellow]No chapters in {Markup.Escape(settings.InputFile!)}.[/]");
+            AnsiConsole.MarkupLine($"[yellow]No chapters in {Markup.Escape(inputFile)}.[/]");
             return 0;
         }
 
         Table table = new Table()
             .Border(TableBorder.Rounded)
-            .Title($"[bold]{Markup.Escape(Path.GetFileName(settings.InputFile!))}[/]  " +
+            .Title($"[bold]{Markup.Escape(Path.GetFileName(inputFile))}[/]  " +
                    $"({atoms.Count} chapters, threshold {settings.EpisodeChapterThreshold:F0}s)")
             .AddColumn("[grey]#[/]", c => c.RightAligned())
             .AddColumn("[grey]Title[/]")

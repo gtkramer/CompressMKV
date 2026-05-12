@@ -34,7 +34,6 @@ public static class ContainerTools
         if (string.IsNullOrWhiteSpace(imageTag))
             throw new ArgumentException("imageTag is required.", nameof(imageTag));
 
-        s_useContainer = true;
         s_imageTag = imageTag;
         s_mounts.Clear();
         foreach (string m in hostMounts)
@@ -45,22 +44,6 @@ public static class ContainerTools
                 s_mounts.Add(abs);
         }
     }
-
-    /// <summary>
-    /// Test-only escape hatch: route Run* calls to the system binary
-    /// instead of <c>podman run</c>.  Lets the integration tests exercise
-    /// detection / restoration / VMAF code paths against a system ffmpeg
-    /// without requiring the container to be built.  Internal because
-    /// production code should always go through <see cref="Configure"/>.
-    /// </summary>
-    internal static void ConfigureForTesting()
-    {
-        s_useContainer = false;
-        s_imageTag = "";
-        s_mounts.Clear();
-    }
-
-    private static bool s_useContainer;
 
     // ---- Tool invocations.  Each one builds the podman command, then
     // delegates to Proc for the actual subprocess work. ----
@@ -102,11 +85,6 @@ public static class ContainerTools
 
     private static (string Exe, string[] Args) BuildPodmanInvocation(string tool, string[] toolArgs)
     {
-        // Test-mode bypass: invoke the system binary directly with no
-        // podman wrapping at all.  See ConfigureForTesting().
-        if (!s_useContainer)
-            return (tool, toolArgs);
-
         if (string.IsNullOrEmpty(s_imageTag))
             throw new InvalidOperationException(
                 "ContainerTools.Configure must be called before any Run* invocation.  " +

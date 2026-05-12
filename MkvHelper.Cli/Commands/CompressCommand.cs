@@ -131,14 +131,15 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         if (sampler is not null) await sampler.DisposeAsync();
 
-        overall.FinishedUtc = DateTime.UtcNow;
-        string overallPath = Path.Combine(cfg.OutputFolder, $"overall_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
+        DateTime finishedUtc = DateTime.UtcNow;
+        overall.FinishedUtc = finishedUtc;
+        string overallPath = Path.Combine(cfg.OutputFolder, $"overall_{finishedUtc:yyyyMMdd_HHmmss}.json");
         await JsonIO.WriteAsync(overallPath, overall, cts.Token);
 
         Serilog.Log.Logger.Information(
             "Run end: completed={Completed}, errors={Errors}, duration={DurationS:F1}s",
             overall.Videos.Count - overall.Errors.Count, overall.Errors.Count,
-            (overall.FinishedUtc!.Value - overall.StartedUtc).TotalSeconds);
+            (finishedUtc - overall.StartedUtc).TotalSeconds);
         await Serilog.Log.CloseAndFlushAsync();
 
         AnsiConsole.WriteLine();

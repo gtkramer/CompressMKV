@@ -252,7 +252,7 @@ public class ContentDetectorUnitTests
         (long? p1, long? t1, long? b1, long? u1) = ContentDetector.ParseIdetAggregate("");
         Assert.That(p1, Is.Null); Assert.That(t1, Is.Null); Assert.That(b1, Is.Null); Assert.That(u1, Is.Null);
 
-        (long? p2, long? t2, long? b2, long? u2) = ContentDetector.ParseIdetAggregate(null!);
+        (long? p2, long? t2, long? b2, long? u2) = ContentDetector.ParseIdetAggregate(null);
         Assert.That(p2, Is.Null); Assert.That(t2, Is.Null); Assert.That(b2, Is.Null); Assert.That(u2, Is.Null);
     }
 

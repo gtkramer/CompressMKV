@@ -74,7 +74,11 @@ public static class LoggerSetup
     /// </summary>
     public static Logger BuildPerFileLogger(string decisionsLogPath)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(decisionsLogPath)!);
+        string dir = Path.GetDirectoryName(decisionsLogPath)
+            ?? throw new ArgumentException(
+                $"decisionsLogPath has no directory component: '{decisionsLogPath}'",
+                nameof(decisionsLogPath));
+        Directory.CreateDirectory(dir);
         return new LoggerConfiguration()
             .MinimumLevel.Information()
             .Enrich.FromLogContext()
