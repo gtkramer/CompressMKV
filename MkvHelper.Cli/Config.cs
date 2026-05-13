@@ -27,23 +27,41 @@ public sealed class Config
     /// to <see cref="Environment.ProcessorCount"/>.</summary>
     public int CpuPool { get; set; } = Environment.ProcessorCount;
 
-    /// <summary>NVENC engine count.  RTX 5080 = 2.  Final encodes hold one for
-    /// the duration of the file; Phase 2 sample encodes hold one for ~5s each.</summary>
-    public int NvencSlots { get; set; } = 2;
-
-    /// <summary>NVDEC engine count.  RTX 5080 = 2.  Used by the final encode
-    /// pipeline; detection and verification sw-decode intentionally.</summary>
-    public int NvdecSlots { get; set; } = 2;
+    /// <summary>
+    /// Maximum concurrent NVENC sessions.  Not a hardware engine count — the
+    /// RTX 5080 has 2 NVENC engines, but the driver multiplexes more sessions
+    /// across them and modern NVIDIA drivers have lifted the per-card session
+    /// cap that used to throttle consumer cards.  4 admits two sample encodes
+    /// and two final encodes (or any equivalent mix) at once; the driver
+    /// queues work across the 2 physical engines.  Holds: final encode for
+    /// the duration of the file, Phase 2 sample encodes for ~5s each.
+    /// </summary>
+    public int NvencSlots { get; set; } = 4;
 
     /// <summary>
-    /// libvmaf_cuda compute lanes.  CUDA-compute is shared between libvmaf_cuda
-    /// (the only generic-CUDA-compute filter we use) and NVENC's AQ helpers.
-    /// Two lanes lets us keep both NVENC engines busy with sample encodes while
-    /// VMAF measures the previous pair — without flooding the GPU with parallel
-    /// libvmaf_cuda processes that would crowd out NVENC's AQ kernels and
-    /// consume too much VRAM.
+    /// Maximum concurrent NVDEC sessions.  Not a hardware engine count — the
+    /// RTX 5080 has 2 NVDEC engines but the driver schedules many concurrent
+    /// decode streams across them.  4 covers the Phase 2 mix (VMAF holds NVDEC
+    /// per probe-sample, Final encode and Detection also use NVDEC); the
+    /// driver multiplexes across the 2 physical engines, no session-count
+    /// limit hits at this level.  Raise only if a real run shows NVDEC as the
+    /// gating constraint (e.g. NVDEC checkout pinned at 4 with CPU/CUDA idle).
     /// </summary>
-    public int CudaSlots { get; set; } = 2;
+    public int NvdecSlots { get; set; } = 4;
+
+    /// <summary>
+    /// Maximum concurrent <c>libvmaf_cuda</c> processes.  Not a count of CUDA
+    /// cores or compute lanes — CUDA general-purpose compute isn't quantized
+    /// that way.  This is a process-concurrency cap sized by VRAM headroom:
+    /// each libvmaf_cuda + AV1 NVDEC bundle holds ~1.3 GiB VRAM at 4K-10bit,
+    /// each NVENC session holds ~2.3 GiB, and the driver baseline is ~1.2 GiB.
+    /// Set to match <see cref="NvdecSlots"/> so the two NVDEC/CUDA gates align
+    /// (VMAF reserves one of each per op).  At the realistic worst-case mix —
+    /// 4 NVENC + 4 VMAF concurrent — VRAM lands at ~15.6 GiB on a 16 GiB
+    /// card, just under the ceiling.  Raise alongside both NVDEC and VRAM if
+    /// the hardware changes; lower if multi-VMAF runs ever blow past 16 GiB.
+    /// </summary>
+    public int CudaSlots { get; set; } = 4;
 
     /// <summary>
     /// Cadence (seconds) at which <see cref="SystemSampler"/> writes real

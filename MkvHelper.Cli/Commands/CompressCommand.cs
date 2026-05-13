@@ -271,9 +271,9 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         // Pool capacities — defaults are the right values for the target
         // machine (20-core CPU + RTX 5080).  See Config docs.
-        NvencSlots = 2,
-        NvdecSlots = 2,
-        CudaSlots = 2,
+        NvencSlots = 4,
+        NvdecSlots = 4,
+        CudaSlots = 4,
 
         // CQ binary search range — full NVENC AV1 range is 0..63; we
         // narrow to the practically-useful window (see Config docs).
