@@ -10,7 +10,6 @@ namespace MkvHelper;
 public sealed class PhaseTimings
 {
     public TimeSpan Detection { get; set; }
-    public TimeSpan Previews { get; set; }
     public TimeSpan TuningPhase1 { get; set; }
     public TimeSpan TuningPhase2 { get; set; }
     public TimeSpan FinalEncode { get; set; }

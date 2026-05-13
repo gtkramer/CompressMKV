@@ -88,29 +88,4 @@ public class RestoreFiltersTests
         Assert.That(RestoreFilters.IvtcOutputFps.ToString(), Is.EqualTo("24000/1001"));
     }
 
-    [Test]
-    public void For_RestoreModeIvtc_ReturnsIvtcChainAndOutputFps()
-    {
-        (string filter, Fps? fps) = RestoreFilters.For(RestoreMode.Ivtc, FieldParity.Tff);
-        Assert.That(filter, Does.Contain("fieldmatch"));
-        Assert.That(filter, Does.Contain("decimate"));
-        Assert.That(fps, Is.EqualTo(Fps.Ntsc24));
-    }
-
-    [Test]
-    public void For_RestoreModeDeinterlace_ReturnsBwdifAndNullFps()
-    {
-        (string filter, Fps? fps) = RestoreFilters.For(RestoreMode.Deinterlace, FieldParity.Tff);
-        Assert.That(filter, Does.Contain("bwdif"));
-        Assert.That(filter, Does.Not.Contain("decimate"));
-        Assert.That(fps, Is.Null);
-    }
-
-    [Test]
-    public void For_RestoreModeNone_ReturnsEmptyAndNullFps()
-    {
-        (string filter, Fps? fps) = RestoreFilters.For(RestoreMode.None, FieldParity.Tff);
-        Assert.That(filter, Is.Empty);
-        Assert.That(fps, Is.Null);
-    }
 }

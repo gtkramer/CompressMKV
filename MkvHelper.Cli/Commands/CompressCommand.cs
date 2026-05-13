@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Globalization;
 using System.Threading;
 using Spectre.Console;
 using Spectre.Console.Cli;
@@ -295,10 +294,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         NvencPreset = "p7",
         RcLookahead = 48,
 
-        PreviewMaxConfidenceToGenerate = 0.60,
-        PreviewCount = 3,
-        PreviewDurationSeconds = 10.0,
-
         OutputExtension = ".mkv",
     };
 
@@ -360,52 +355,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         logger.LogInfo($"Restore decision: {restore.Mode} (filter=\"{restore.FilterGraph}\", fps={restore.OutputFps?.ToString() ?? "native"})");
         logger.LogInfo($"  Reason: {restore.Notes}");
 
-        bool needPreviews =
-            restore.Confidence < cfg.PreviewMaxConfidenceToGenerate ||
-            detection.ParityMismatch;
-
-        if (needPreviews)
-        {
-            sw.Restart();
-            logger.SetStage("Previews", $"generating {cfg.PreviewCount}×IVTC + {cfg.PreviewCount}×Deint");
-            logger.LogInfo($"Generating {cfg.PreviewCount} preview pairs (low confidence or parity mismatch).");
-            string previewDir = Path.Combine(outDir, "previews");
-            Directory.CreateDirectory(previewDir);
-            restore.Previews = [];
-
-            double dur = probe.Format?.DurationSeconds ?? 0;
-            List<double> previewTs = [];
-            if (dur > 0)
-            {
-                double step = dur / (cfg.PreviewCount + 1);
-                for (int pi = 1; pi <= cfg.PreviewCount; pi++) previewTs.Add(pi * step);
-            }
-
-            // IVTC and Deint previews for the same timestamp are independent —
-            // fire both concurrently and let the pool gate admission.
-            async Task RunPreview(string outPath, RestoreMode mode, double t)
-            {
-                using (await pool.AcquireAsync(cfg.PreviewRequest, ct, file: id, op: "preview"))
-                    await PreviewGenerator.MakeLosslessPreviewAsync(
-                        cfg, input, outPath, mode, detection.DetectedParity, t, ct);
-            }
-
-            foreach (double t in previewTs)
-            {
-                ct.ThrowIfCancellationRequested();
-                string baseTag = $"t{t.ToString("F1", CultureInfo.InvariantCulture)}";
-                string ivtcPrev = Path.Combine(previewDir, $"preview_ivtc_{baseTag}.mkv");
-                string deintPrev = Path.Combine(previewDir, $"preview_deint_{baseTag}.mkv");
-
-                await Task.WhenAll(
-                    RunPreview(ivtcPrev, RestoreMode.Ivtc, t),
-                    RunPreview(deintPrev, RestoreMode.Deinterlace, t));
-
-                restore.Previews.Add(new PreviewArtifact { TimestampSeconds = t, IvtcPath = ivtcPrev, DeintPath = deintPrev });
-            }
-            timings.Previews = sw.Elapsed;
-        }
-
         logger.LogInfo(isHdr
             ? "VMAF execution: GPU (libvmaf_cuda); AV1 sample decode on NVDEC; HDR tonemap chain on CPU"
             : "VMAF execution: GPU (libvmaf_cuda); AV1 sample decode on NVDEC");
@@ -454,7 +403,6 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         logger.LogInfo(
             $"Timings (total {timings.Total.TotalSeconds:F1}s): " +
             $"detect={timings.Detection.TotalSeconds:F1}s, " +
-            $"prev={timings.Previews.TotalSeconds:F1}s, " +
             $"tune.p1={timings.TuningPhase1.TotalSeconds:F1}s, " +
             $"tune.p2={timings.TuningPhase2.TotalSeconds:F1}s, " +
             $"final={timings.FinalEncode.TotalSeconds:F1}s, " +
@@ -486,7 +434,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
     private static void CleanIntermediates(string outDir)
     {
-        foreach (string subDir in (string[])["refs", "samples", "vmaf", "previews"])
+        foreach (string subDir in (string[])["refs", "samples", "vmaf"])
         {
             string path = Path.Combine(outDir, subDir);
             if (Directory.Exists(path))

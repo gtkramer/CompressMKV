@@ -49,18 +49,6 @@ public static class RestoreFilters
     public static string DeinterlaceChain(FieldParity parity) =>
         $"bwdif=mode=send_frame:parity={ParityStr(parity)}";
 
-    /// <summary>
-    /// Mode-based overload used by PreviewGenerator for side-by-side comparison
-    /// of the two strategies regardless of detected category.
-    /// </summary>
-    public static (string Filter, Fps? OutputFps) For(RestoreMode mode, FieldParity parity) =>
-        mode switch
-        {
-            RestoreMode.Ivtc => (IvtcChain(parity), IvtcOutputFps),
-            RestoreMode.Deinterlace => (DeinterlaceChain(parity), null),
-            _ => ("", null),
-        };
-
     internal static string ParityStr(FieldParity parity) => parity switch
     {
         FieldParity.Tff => "tff",

@@ -96,9 +96,6 @@ public sealed class Config
     /// for the filter is all that's needed; NVDEC handles the decode.</summary>
     public int DetectionGpuThreads { get; set; } = 1;
 
-    /// <summary>Threads for one lossless x264 preview encode.</summary>
-    public int PreviewThreads { get; set; } = 4;
-
     /// <summary>Total CPU budget for one progressive (no-filter) ref extract on
     /// the sw-decode path.  Split between decode and FFV1 encode in
     /// <see cref="Pipelines.ExtractReferenceClipAsync"/>.</summary>
@@ -220,7 +217,6 @@ public sealed class Config
             ? RefExtractProgressiveAlternatives
             : RefExtractFilteredAlternatives;
 
-    public ResourceRequest PreviewRequest        => new(Cpu: PreviewThreads);
     public ResourceRequest SampleEncodeRequest   => new(Cpu: SampleEncodeThreads, Nvenc: 1);
     public ResourceRequest VmafRequest           => new(Cpu: VmafThreads, Nvdec: 1, Cuda: 1);
 
@@ -358,11 +354,6 @@ public sealed class Config
 
     // Detection thresholds are internal constants in ContentDetector.
     // They are derived from 3:2 pulldown signal physics and are not user-tunable.
-
-    // --- Preview gating ---
-    public double PreviewMaxConfidenceToGenerate { get; set; } = 0.60;
-    public int PreviewCount { get; set; } = 3;
-    public double PreviewDurationSeconds { get; set; } = 10.0;
 
     // --- Output ---
     public string OutputExtension { get; set; } = ".mkv";

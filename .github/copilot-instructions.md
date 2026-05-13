@@ -23,12 +23,12 @@ Detection/   → Content-type analysis via ffmpeg idet filter (ContentDetector, 
 Encoding/    → GPU-gated NVENC AV1 encode pipelines and VMAF measurement (FinalEncoder, GpuGate, Pipelines)
 Infrastructure/ → Process execution, ffprobe, JSON I/O (Proc, Ffprobe, JsonIO)
 Models/      → Top-level result types (OverallSummary, VideoSummary, RunError)
-Restore/     → Map detection → ffmpeg filter chains + lossless previews (RestoreStrategyMapper, RestoreFilters)
+Restore/     → Map detection → ffmpeg filter chains (RestoreStrategyMapper, RestoreFilters)
 Tuning/      → VMAF-guided CQ selection via random sample windows (VmafTuner, Sampler, Selector)
 ```
 
 **Data flow per video** (orchestrated by `Program.ProcessOneAsync`):
-Ffprobe → SourceClassifier → ContentDetector → RestoreStrategyMapper → [PreviewGenerator] → VmafTuner → FinalEncoder → JsonIO
+Ffprobe → SourceClassifier → ContentDetector → RestoreStrategyMapper → VmafTuner → FinalEncoder → JsonIO
 
 ## Build and Test
 

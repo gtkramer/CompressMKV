@@ -10,5 +10,4 @@ public sealed class RestoreDecision
     public string DecisionReason { get; set; } = "";
 
     public ContentDetectionResult? ContentDetection { get; set; }
-    public List<PreviewArtifact>? Previews { get; set; }
 }
