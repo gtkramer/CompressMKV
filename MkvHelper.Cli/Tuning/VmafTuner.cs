@@ -100,12 +100,14 @@ public static class VmafTuner
         // resources" — the missing half of the queue-wait picture.
         int[] refWaitMs = new int[windows.Count];
         int[] refHoldMs = new int[windows.Count];
+        int[] refAltIndex = new int[windows.Count];
         Task[] refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
             AcquireResult admit = await pool.AcquireAnyAsync(
                 refExtractAlternatives, ct, file: logger.VideoId, op: "phase1.ref-extract");
             refWaitMs[i] = admit.WaitMs;
+            refAltIndex[i] = admit.AlternativeIndex;
             Stopwatch holdSw = Stopwatch.StartNew();
             using (admit.Lease)
             {
@@ -114,6 +116,7 @@ public static class VmafTuner
                     cfg, input, refPath, w, restore, vstream, useHwaccel, admit.Granted.Cpu, ct);
             }
             refHoldMs[i] = (int)holdSw.ElapsedMilliseconds;
+            logger.RecordOp("phase1.ref-extract", admit.Granted, admit.WaitMs, refHoldMs[i]);
             refClips[i] = refPath;
             int done = Interlocked.Increment(ref extractedCount);
             logger.SetStage("Phase 1", $"extracted {done}/{windows.Count} refs");
@@ -126,10 +129,26 @@ public static class VmafTuner
         int p1MaxHold = refHoldMs.Length > 0 ? refHoldMs.Max() : 0;
         double p1AvgHold = refHoldMs.Length > 0 ? refHoldMs.Average() : 0;
         long p1SumHold = refHoldMs.Sum();
+        long p1SumWait = refWaitMs.Sum();
+        int fallbacks = refAltIndex.Count(idx => idx > 0);
         logger.LogInfo(
             $"Phase 1 complete in {phase1Sw.Elapsed.TotalSeconds:F1}s " +
             $"({refWaitMs.Length} acquires; pool wait avg {p1AvgWait:F0}ms, max {p1MaxWait}ms; " +
             $"op runtime avg {p1AvgHold / 1000:F1}s, max {p1MaxHold / 1000:F1}s, total {p1SumHold / 1000:F1}s).");
+        if (fallbacks > 0)
+            // CPU-first alternative ordering; non-zero alt index means the
+            // CPU pool was saturated and we fell back to the NVDEC path.
+            // Calling it out makes "Phase 1 was slow" debuggable without
+            // grepping events.jsonl for AlternativeIndex.
+            logger.LogInfo(
+                $"Phase 1: {fallbacks}/{refWaitMs.Length} ref-extracts fell back to the secondary " +
+                "alternative (CPU pool saturated → NVDEC).");
+
+        PhaseTiming phase1Timing = new(
+            Wall: phase1Sw.Elapsed,
+            QueueSum: TimeSpan.FromMilliseconds(p1SumWait),
+            RunSum: TimeSpan.FromMilliseconds(p1SumHold),
+            OpCount: refWaitMs.Length);
 
         // =======================================================
         //  Phase 2: Binary search the [MinCq, MaxCq] integer range
@@ -150,15 +169,22 @@ public static class VmafTuner
         Stopwatch phase2Sw = Stopwatch.StartNew();
         int probeCount = 0;
         int expectedProbes = (int)Math.Ceiling(Math.Log2(maxCq - minCq + 2));
+        int firstProbeCq = (minCq + maxCq + 1) / 2;
         List<CqAggregate> cqResults = [];
-        // Probe order trajectory — CQ tried at each step and its pass/fail
-        // verdict.  Logged at Phase 2 end so the decisions.log shows the
-        // path the binary search actually walked, not just the final result.
-        List<(int Cq, bool Pass)> trajectory = [];
+        // Probe order trajectory — CQ tried at each step, its pass/fail
+        // verdict, and (on fail) which gates failed.  Logged at Phase 2 end
+        // so the decisions.log shows the path the binary search actually
+        // walked, with enough detail to understand why each rejected CQ was
+        // rejected.
+        List<(int Cq, bool Pass, string FailReason)> trajectory = [];
+
+        long phase2QueueSumMs = 0;
+        long phase2RunSumMs = 0;
+        int phase2OpCount = 0;
 
         logger.LogInfo(
-            $"Phase 2: binary search CQ in [{minCq}..{maxCq}] (tier: {cqTier}) " +
-            $"(≤{expectedProbes} probes).");
+            $"Phase 2: binary search CQ in [{minCq}..{maxCq}] (tier: {cqTier}), " +
+            $"first probe will be CQ={firstProbeCq} (≤{expectedProbes} probes total).");
 
         int? bestPassingCq = await CqBinarySearch.FindHighestPassingAsync(
             minCq, maxCq,
@@ -167,29 +193,46 @@ public static class VmafTuner
                 probeCount++;
                 Stopwatch probeSw = Stopwatch.StartNew();
                 logger.SetStage("Phase 2", $"probe {probeCount} CQ={cq}");
-                logger.LogInfo($"Phase 2 probe {probeCount}/~{expectedProbes}: CQ={cq}...");
 
-                CqAggregate agg = await ProbeCqAsync(
+                (CqAggregate agg, long queueMs, long runMs, int opCount) = await ProbeCqAsync(
                     cfg, pool, refClips, windows, samplesDir, vmafDir,
                     isHdr, hdrMetadata, format, vmafModelVersion,
                     cq, logger, ct);
                 probeSw.Stop();
                 cqResults.Add(agg);
+                phase2QueueSumMs += queueMs;
+                phase2RunSumMs   += runMs;
+                phase2OpCount    += opCount;
 
                 bool pass = agg.MeanVmaf >= cfg.TargetMeanVmaf
                          && agg.P05Vmaf  >= cfg.TargetP05Vmaf
                          && agg.P01Vmaf  >= cfg.TargetP01Vmaf;
 
-                trajectory.Add((cq, pass));
+                string failReason = pass ? "" : Selector.FailureReason(agg, cfg);
+                trajectory.Add((cq, pass, failReason));
 
                 logger.LogInfo(
                     $"  CQ={cq}: mean={agg.MeanVmaf:F2} harmonic={agg.HarmonicMeanVmaf:F2} " +
                     $"p05={agg.P05Vmaf:F2} p01={agg.P01Vmaf:F2} min={agg.MinVmaf:F2} " +
                     $"frames={agg.TotalFrameCount} ({probeSw.Elapsed.TotalSeconds:F1}s) — " +
-                    (pass ? "[PASS]" : "[FAIL]"));
+                    (pass ? "[PASS]" : $"[FAIL: {failReason}]"));
+
+                // Per-sample outlier surface: which window dragged things down?
+                // Lowest-3 sample means.  Useful when P05 fails on one bad scene
+                // — without this you can't tell whether the answer is "the
+                // encode is uniformly poor" or "one specific window blew up."
+                LogSampleOutliers(logger, cq, agg);
 
                 return pass;
-            }, ct);
+            }, ct,
+            onStep: (lo, hi, mid) =>
+            {
+                // Binary search step trace — makes the search transparent
+                // when debugging "why did we pick this mid?"
+                logger.LogInfo(
+                    $"Phase 2 probe {probeCount + 1}/~{expectedProbes}: " +
+                    $"search state lo={lo} hi={hi} → mid={mid}.");
+            });
 
         phase2Sw.Stop();
 
@@ -200,9 +243,12 @@ public static class VmafTuner
         Selection selection = Selector.Select(cfg, cqResults.OrderBy(r => r.Cq).ToList());
 
         // One-line search-trajectory recap before the phase-end summary, so a
-        // reader can see exactly which CQs were probed and in what order.
+        // reader can see exactly which CQs were probed, in what order, and
+        // (on failures) which gate(s) failed.
         logger.LogInfo("Search trajectory: " + string.Join(" → ",
-            trajectory.Select(t => $"CQ={t.Cq} {(t.Pass ? "PASS" : "FAIL")}"))
+            trajectory.Select(t => t.Pass
+                ? $"CQ={t.Cq} PASS"
+                : $"CQ={t.Cq} FAIL({t.FailReason})"))
             + $"; selected CQ={selection.SelectedCq}.");
 
         logger.LogInfo(
@@ -212,6 +258,12 @@ public static class VmafTuner
                 ? $"selected CQ={selection.SelectedCq})."
                 : "no CQ met all gates — fell back to best mean)."));
 
+        PhaseTiming phase2Timing = new(
+            Wall: phase2Sw.Elapsed,
+            QueueSum: TimeSpan.FromMilliseconds(phase2QueueSumMs),
+            RunSum: TimeSpan.FromMilliseconds(phase2RunSumMs),
+            OpCount: phase2OpCount);
+
         return new TuningResult
         {
             SampleWindows = windows,
@@ -219,17 +271,33 @@ public static class VmafTuner
             Selection = selection,
             SearchMinCq = minCq,
             SearchMaxCq = maxCq,
-            Phase1Elapsed = phase1Sw.Elapsed,
-            Phase2Elapsed = phase2Sw.Elapsed,
+            Phase1Timing = phase1Timing,
+            Phase2Timing = phase2Timing,
         };
+    }
+
+    /// <summary>
+    /// Surface the lowest-scoring sample windows in a probe.  When P05 fails
+    /// on a single bad scene, this lets the user pinpoint which window blew
+    /// up rather than seeing only the rolled-up percentiles.
+    /// </summary>
+    private static void LogSampleOutliers(IPipelineLogger logger, int cq, CqAggregate agg)
+    {
+        if (agg.Samples.Count == 0) return;
+        IEnumerable<SampleMetric> sorted = agg.Samples
+            .OrderBy(s => s.VmafMean)
+            .Take(Math.Min(3, agg.Samples.Count));
+        string outliers = string.Join(", ", sorted.Select(s => $"s{s.SampleIndex:00}={s.VmafMean:F2}"));
+        logger.LogInfo($"  CQ={cq} lowest sample means: {outliers}.");
     }
 
     /// <summary>
     /// Encode every reference clip at <paramref name="cq"/>, measure VMAF,
     /// aggregate.  Sample tasks fire in parallel and self-throttle via the
-    /// GPU/CPU gates.
+    /// GPU/CPU gates.  Returns the aggregate plus queue/run/op-count totals
+    /// for this probe so the caller can build the Phase 2 PhaseTiming.
     /// </summary>
-    private static async Task<CqAggregate> ProbeCqAsync(
+    private static async Task<(CqAggregate Aggregate, long QueueMs, long RunMs, int OpCount)> ProbeCqAsync(
         Config cfg, ResourcePool pool, string[] refClips,
         IReadOnlyList<SampleWindow> windows, string samplesDir, string vmafDir,
         bool isHdr, HdrMetadata? hdrMetadata, PipelineFormat format,
@@ -265,6 +333,8 @@ public static class VmafTuner
             using (sampleAdmit.Lease)
                 await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
             sampleHoldMs[i] = (int)sampleHoldSw.ElapsedMilliseconds;
+            logger.RecordOp($"phase2.sample-encode.cq{cq}", sampleAdmit.Granted,
+                sampleAdmit.WaitMs, sampleHoldMs[i]);
 
             // 2. VMAF — declares CPU (for FFV1+AV1 decode + zscale/tonemap on
             //    HDR + format conversion) and one CUDA lane.  See
@@ -277,6 +347,8 @@ public static class VmafTuner
             using (vmafAdmit.Lease)
                 await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
             vmafHoldMs[i] = (int)vmafHoldSw.ElapsedMilliseconds;
+            logger.RecordOp($"phase2.vmaf.cq{cq}", vmafAdmit.Granted,
+                vmafAdmit.WaitMs, vmafHoldMs[i]);
 
             VmafResult vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
             int done = Interlocked.Increment(ref doneSamples);
@@ -318,7 +390,12 @@ public static class VmafTuner
             $"+ queue-wait sum {FormatDuration(sampleWaitTotal + vmafWaitTotal)} " +
             $"(encode {FormatDuration(sampleWaitTotal)}, vmaf {FormatDuration(vmafWaitTotal)}); " +
             $"sums exceed walltime when ops overlap across pool slots.");
-        return CqAggregate.From(cq, metrics);
+
+        long queueMs = sampleWaitTotal + vmafWaitTotal;
+        long runMs   = sampleHoldTotal + vmafHoldTotal;
+        int opCount  = windows.Count * 2;  // sample-encode + vmaf per window
+
+        return (CqAggregate.From(cq, metrics), queueMs, runMs, opCount);
     }
 
     /// <summary>

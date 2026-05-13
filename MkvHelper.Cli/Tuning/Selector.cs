@@ -21,6 +21,10 @@ namespace MkvHelper;
 // temporal-aq introduce ±0.1–0.3 score noise across runs, so a borderline
 // CQ may classify differently next time — IsMarginal makes that visible.
 //
+// When a marginal pick exists, we also pull the neighboring CQs (selected ± 1)
+// from the result set, if probed, so the user can see what the alternatives
+// looked like — "we landed on CQ=44 instead of 45 because at 45 p01 was 89.5".
+//
 // Note on harmonic mean: CqAggregate computes HarmonicMeanVmaf for diagnostic
 // reporting only.  It is intentionally NOT used in selection — the P05 and
 // P01 gates already constrain the low-quality tail more directly than
@@ -49,7 +53,7 @@ public static class Selector
             Selection sel = BuildSelection(pass,
                 $"Meets thresholds mean≥{cfg.TargetMeanVmaf:F1}, p05≥{cfg.TargetP05Vmaf:F1}, " +
                 $"p01≥{cfg.TargetP01Vmaf:F1}; chose highest passing CQ.");
-            ApplyMarginalCheck(sel, pass, cfg);
+            ApplyMarginalCheck(sel, pass, cfg, results);
             return sel;
         }
 
@@ -64,6 +68,23 @@ public static class Selector
         return fallback;
     }
 
+    /// <summary>
+    /// Names the gate(s) a CQ failed and by how much.  Used to annotate the
+    /// trajectory line so a reader can see "CQ=45 failed (p01=89.5 < 90)"
+    /// rather than just "CQ=45 FAIL".
+    /// </summary>
+    public static string FailureReason(CqAggregate r, Config cfg)
+    {
+        List<string> reasons = [];
+        if (r.MeanVmaf < cfg.TargetMeanVmaf)
+            reasons.Add($"mean={r.MeanVmaf:F2}<{cfg.TargetMeanVmaf:F1}");
+        if (r.P05Vmaf < cfg.TargetP05Vmaf)
+            reasons.Add($"p05={r.P05Vmaf:F2}<{cfg.TargetP05Vmaf:F1}");
+        if (r.P01Vmaf < cfg.TargetP01Vmaf)
+            reasons.Add($"p01={r.P01Vmaf:F2}<{cfg.TargetP01Vmaf:F1}");
+        return reasons.Count == 0 ? "passed" : string.Join(", ", reasons);
+    }
+
     private static Selection BuildSelection(CqAggregate r, string reason) => new()
     {
         SelectedCq = r.Cq,
@@ -76,7 +97,8 @@ public static class Selector
         Reason = reason,
     };
 
-    private static void ApplyMarginalCheck(Selection sel, CqAggregate pass, Config cfg)
+    private static void ApplyMarginalCheck(
+        Selection sel, CqAggregate pass, Config cfg, List<CqAggregate> results)
     {
         if (Math.Abs(pass.MeanVmaf - cfg.TargetMeanVmaf) < MarginalThresholdPoints)
             sel.MarginalReasons.Add(
@@ -94,5 +116,23 @@ public static class Selector
                 $"above target {cfg.TargetP01Vmaf:F1}");
 
         sel.IsMarginal = sel.MarginalReasons.Count > 0;
+
+        if (!sel.IsMarginal) return;
+
+        // Marginal pass → surface the neighboring probed CQs so a reader can
+        // see what they would have gotten one notch tighter or looser.  The
+        // binary search may or may not have actually probed selectedCq ± 1
+        // (depends on where the search landed); we report whichever neighbors
+        // are in the result set.
+        CqAggregate? above = results.FirstOrDefault(r => r.Cq == pass.Cq + 1);
+        CqAggregate? below = results.FirstOrDefault(r => r.Cq == pass.Cq - 1);
+        if (above is not null)
+            sel.MarginalReasons.Add(
+                $"neighbor CQ={above.Cq}: mean={above.MeanVmaf:F2} p05={above.P05Vmaf:F2} " +
+                $"p01={above.P01Vmaf:F2} — {FailureReason(above, cfg)}");
+        if (below is not null)
+            sel.MarginalReasons.Add(
+                $"neighbor CQ={below.Cq}: mean={below.MeanVmaf:F2} p05={below.P05Vmaf:F2} " +
+                $"p01={below.P01Vmaf:F2} — {FailureReason(below, cfg)}");
     }
 }

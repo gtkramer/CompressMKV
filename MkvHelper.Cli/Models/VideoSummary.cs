@@ -44,4 +44,12 @@ public sealed class VideoSummary
     /// concurrency model produced the expected utilization profile.
     /// </summary>
     public PhaseTimings? Timings { get; set; }
+
+    /// <summary>
+    /// Total resource-time this file consumed across all its pool acquires.
+    /// Cross-file rollup at run end uses this to show which files dominated
+    /// each pool — a "hot file" view useful for spotting outliers in a large
+    /// batch.  Zero on files that were skipped via resume (no acquires fired).
+    /// </summary>
+    public ResourceTimeShare ResourceShare { get; set; }
 }

@@ -17,6 +17,12 @@ public sealed class TuningResult
     public int SearchMinCq { get; set; }
     public int SearchMaxCq { get; set; }
 
-    public TimeSpan Phase1Elapsed { get; set; }
-    public TimeSpan Phase2Elapsed { get; set; }
+    /// <summary>
+    /// Wall/queue/run breakdown for the two tuning phases.  Phase 1 fires N
+    /// parallel ref-extracts; Phase 2 fires N samples × M probes of two ops
+    /// each (sample-encode + vmaf).  Aggregated so CompressCommand can build
+    /// the per-file time card without re-walking the metrics collector.
+    /// </summary>
+    public PhaseTiming Phase1Timing { get; set; } = PhaseTiming.Zero;
+    public PhaseTiming Phase2Timing { get; set; } = PhaseTiming.Zero;
 }

@@ -42,17 +42,29 @@ namespace MkvHelper;
 /// or sees the cancellation — the pool's <c>Granted</c> flag, set under
 /// the pool lock, settles the race so resources never leak.
 ///
-/// Event emission: every acquire (fast-path or after-queue) and release
-/// fires a structured Serilog event with file/op labels, granted shape,
-/// queue wait, and a post-state pool snapshot.  This lets after-the-fact
-/// analysis answer "how long did file 5 wait for a CUDA lane?" without
-/// instrumenting every call site.
+/// Event emission: every acquire and release fires a structured Serilog
+/// event with file/op labels, granted shape, queue wait, and a post-state
+/// pool snapshot.  Fast-path zero-wait acquires AND releases that woke
+/// nobody (and were held for less than <see cref="LongHoldThresholdMs"/>)
+/// are suppressed — they're the majority of events in a healthy run and
+/// drown the contended cases (queued acquires, releases that unblocked
+/// waiters, ops that held resources for minutes) which are what you read
+/// post-mortem.
 /// </summary>
 public sealed class ResourcePool
 {
+    /// <summary>
+    /// A release event is emitted whenever it woke at least one queued
+    /// waiter OR the hold time exceeded this floor.  Sub-floor releases
+    /// of uncontended slots add no diagnostic signal and would otherwise
+    /// flood events.jsonl on Phase 1/Phase 2 parallelism.
+    /// </summary>
+    private const int LongHoldThresholdMs = 30_000;
+
     private readonly int _cpuMax, _nvencMax, _nvdecMax, _cudaMax;
     private int _cpu, _nvenc, _nvdec, _cuda;
     private readonly LinkedList<Waiter> _waiters = new();
+    private readonly LinkedList<HeldOp> _held = new();
     private readonly Lock _lock = new();
 
     public ResourcePool(int cpu, int nvenc, int nvdec, int cuda)
@@ -81,6 +93,24 @@ public sealed class ResourcePool
     public PoolSnapshot Snapshot()
     {
         lock (_lock) return new PoolSnapshot(_cpu, _nvenc, _nvdec, _cuda);
+    }
+
+    /// <summary>
+    /// Snapshot of every op currently holding pool resources.  Used by
+    /// <see cref="SystemSampler"/> to tag per-tick "what was running" so an
+    /// analyst can correlate an idle-GPU moment with the specific ops
+    /// supposedly using CUDA.
+    /// </summary>
+    public IReadOnlyList<HeldOpSnapshot> HeldOps()
+    {
+        lock (_lock)
+        {
+            HeldOpSnapshot[] arr = new HeldOpSnapshot[_held.Count];
+            int i = 0;
+            foreach (HeldOp h in _held)
+                arr[i++] = new HeldOpSnapshot(h.File, h.Op, h.Granted);
+            return arr;
+        }
     }
 
     /// <summary>
@@ -146,18 +176,29 @@ public sealed class ResourcePool
                 if (CanSatisfy(alt))
                 {
                     Take(alt);
+                    LinkedListNode<HeldOp> heldNode = AddHeldLocked(file, op, alt);
                     PoolSnapshot snapshot = new(_cpu, _nvenc, _nvdec, _cuda);
-                    EmitAcquired(file, op, alternatives, alt, i, waitMs: 0, fastPath: true, snapshot);
+                    // Fast-path acquires fire constantly under healthy
+                    // parallelism (16 ref-extracts per file, etc.).  They
+                    // carry no diagnostic signal — wait=0, alt 0, pool
+                    // unsurprising.  Skip the structured event entirely;
+                    // the matching release event will still fire if it
+                    // wakes a waiter or holds long enough to be noteworthy.
                     return Task.FromResult(new AcquireResult(
-                        new Releaser(this, alt, file, op), alt, i, WaitMs: 0, snapshot, op));
+                        new Releaser(this, alt, file, op, heldNode), alt, i, WaitMs: 0, snapshot, op));
                 }
             }
 
             // Slow path: enqueue with all alternatives; any of them becoming
-            // satisfiable will wake the waiter.
+            // satisfiable will wake the waiter.  Capture the queue state at
+            // arrival so the eventual acquire event can attribute the wait
+            // to either "deep queue" or "head blocked on a specific op."
+            int depthAtArrival = _waiters.Count;
+            string? headWaiterOp = _waiters.First?.Value.Op;
             TaskCompletionSource<AcquireResult> tcs = new(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            Waiter waiter = new(alternatives, tcs, file, op, Stopwatch.StartNew());
+            Waiter waiter = new(alternatives, tcs, file, op, Stopwatch.StartNew(),
+                depthAtArrival, headWaiterOp);
             LinkedListNode<Waiter> node = _waiters.AddLast(waiter);
 
             ct.Register(static state =>
@@ -198,7 +239,16 @@ public sealed class ResourcePool
         _cuda  += r.Cuda;
     }
 
-    private void Release(in ResourceRequest r, string? file, string? op)
+    private LinkedListNode<HeldOp> AddHeldLocked(string? file, string? op, ResourceRequest granted)
+        => _held.AddLast(new HeldOp(file, op, granted));
+
+    private void RemoveHeldLocked(LinkedListNode<HeldOp> node)
+    {
+        if (node.List != null) _held.Remove(node);
+    }
+
+    private void Release(in ResourceRequest r, string? file, string? op,
+                         LinkedListNode<HeldOp> heldNode, int holdMs)
     {
         int wokenCount = 0;
         PoolSnapshot postRelease;
@@ -206,12 +256,14 @@ public sealed class ResourcePool
         // events are emitted AFTER the lock is dropped — Serilog's async sink
         // doesn't block but we still want minimum lock time.
         List<(string? File, string? Op, IReadOnlyList<ResourceRequest> Requested,
-              ResourceRequest Granted, int AltIndex, int WaitMs, PoolSnapshot Snapshot)>?
+              ResourceRequest Granted, int AltIndex, int WaitMs, PoolSnapshot Snapshot,
+              int DepthAtArrival, string? HeadOpAtArrival)>?
             grantedInScan = null;
 
         lock (_lock)
         {
             Return(r);
+            RemoveHeldLocked(heldNode);
 
             // Head-skip FIFO grant scan: iterate from head to tail; grant
             // each waiter whose alternatives fit the current state.  Past
@@ -234,13 +286,15 @@ public sealed class ResourcePool
                     {
                         _waiters.Remove(node);
                         Take(alt);
+                        LinkedListNode<HeldOp> granteeHeld = AddHeldLocked(w.File, w.Op, alt);
                         w.Granted = true;
                         PoolSnapshot snap = new(_cpu, _nvenc, _nvdec, _cuda);
                         int waitMs = (int)w.QueueTimer.ElapsedMilliseconds;
                         grantedInScan ??= [];
-                        grantedInScan.Add((w.File, w.Op, w.Alternatives, alt, i, waitMs, snap));
+                        grantedInScan.Add((w.File, w.Op, w.Alternatives, alt, i, waitMs, snap,
+                            w.DepthAtArrival, w.HeadWaiterOpAtArrival));
                         w.Tcs.TrySetResult(new AcquireResult(
-                            new Releaser(this, alt, w.File, w.Op), alt, i, waitMs, snap, w.Op));
+                            new Releaser(this, alt, w.File, w.Op, granteeHeld), alt, i, waitMs, snap, w.Op));
                         wokenCount++;
                         break;
                     }
@@ -252,14 +306,20 @@ public sealed class ResourcePool
 
         // Outside the lock: emit events.  Order is release first, then any
         // acquire events for waiters granted in the same scan, so a reader
-        // can see the cause/effect chain.
-        EmitReleased(file, op, r, postRelease, wokenCount);
+        // can see the cause/effect chain.  Releases that woke nobody AND
+        // were held for less than LongHoldThresholdMs are suppressed —
+        // they're the bulk of pool traffic on healthy parallel phases and
+        // carry no diagnostic value over the matching acquire event.
+        if (wokenCount > 0 || holdMs >= LongHoldThresholdMs)
+            EmitReleased(file, op, r, postRelease, wokenCount, holdMs);
+
         if (grantedInScan != null)
         {
             foreach ((string? File, string? Op, IReadOnlyList<ResourceRequest> Requested,
-                      ResourceRequest Granted, int AltIndex, int WaitMs, PoolSnapshot Snapshot) g in grantedInScan)
+                      ResourceRequest Granted, int AltIndex, int WaitMs, PoolSnapshot Snapshot,
+                      int DepthAtArrival, string? HeadOpAtArrival) g in grantedInScan)
                 EmitAcquired(g.File, g.Op, g.Requested, g.Granted, g.AltIndex,
-                    g.WaitMs, fastPath: false, g.Snapshot);
+                    g.WaitMs, g.Snapshot, g.DepthAtArrival, g.HeadOpAtArrival);
         }
     }
 
@@ -267,46 +327,62 @@ public sealed class ResourcePool
         string? file, string? op,
         IReadOnlyList<ResourceRequest> requested,
         ResourceRequest granted, int altIndex,
-        int waitMs, bool fastPath, PoolSnapshot poolAfter)
+        int waitMs, PoolSnapshot poolAfter,
+        int depthAtArrival, string? headWaiterOp)
     {
         Log.Logger.Information(
             "Pool acquired {Op} for {File}: granted {@Granted}, alt {AltIndex}, " +
-            "waited {WaitMs}ms ({Path}); pool now {@PoolAfter}",
+            "waited {WaitMs}ms (queue depth at arrival {DepthAtArrival}, " +
+            "head was {HeadWaiterOp}); pool now {@PoolAfter}",
             op ?? "—", file ?? "—", granted, altIndex, waitMs,
-            fastPath ? "fast" : "queued", poolAfter);
+            depthAtArrival, headWaiterOp ?? "—", poolAfter);
     }
 
     private static void EmitReleased(
         string? file, string? op,
-        ResourceRequest released, PoolSnapshot poolAfter, int waitersGrantedInScan)
+        ResourceRequest released, PoolSnapshot poolAfter, int waitersGrantedInScan, int holdMs)
     {
         Log.Logger.Information(
-            "Pool released {Op} for {File}: released {@Released}; pool now {@PoolAfter}; " +
-            "granted {WaitersGrantedInScan} waiter(s) in same scan",
-            op ?? "—", file ?? "—", released, poolAfter, waitersGrantedInScan);
+            "Pool released {Op} for {File}: released {@Released}, held {HoldMs}ms; " +
+            "pool now {@PoolAfter}; granted {WaitersGrantedInScan} waiter(s) in same scan",
+            op ?? "—", file ?? "—", released, holdMs, poolAfter, waitersGrantedInScan);
     }
 
     private sealed class Waiter(
         IReadOnlyList<ResourceRequest> alternatives,
         TaskCompletionSource<AcquireResult> tcs,
-        string? file, string? op, Stopwatch queueTimer)
+        string? file, string? op, Stopwatch queueTimer,
+        int depthAtArrival, string? headWaiterOpAtArrival)
     {
         public IReadOnlyList<ResourceRequest> Alternatives { get; } = alternatives;
         public TaskCompletionSource<AcquireResult> Tcs { get; } = tcs;
         public string? File { get; } = file;
         public string? Op { get; } = op;
         public Stopwatch QueueTimer { get; } = queueTimer;
+        public int DepthAtArrival { get; } = depthAtArrival;
+        public string? HeadWaiterOpAtArrival { get; } = headWaiterOpAtArrival;
         public bool Granted { get; set; }
     }
 
-    private sealed class Releaser(ResourcePool pool, ResourceRequest req, string? file, string? op) : IDisposable
+    /// <summary>
+    /// One outstanding pool grant — what work is currently consuming the
+    /// resources.  Kept in <see cref="_held"/> so <see cref="HeldOps"/> can
+    /// snapshot it for the sampler.
+    /// </summary>
+    private sealed record class HeldOp(string? File, string? Op, ResourceRequest Granted);
+
+    private sealed class Releaser(
+        ResourcePool pool, ResourceRequest req, string? file, string? op,
+        LinkedListNode<HeldOp> heldNode) : IDisposable
     {
+        private readonly Stopwatch _heldSw = Stopwatch.StartNew();
         private bool _done;
         public void Dispose()
         {
             if (_done) return;
             _done = true;
-            pool.Release(req, file, op);
+            _heldSw.Stop();
+            pool.Release(req, file, op, heldNode, (int)_heldSw.ElapsedMilliseconds);
         }
     }
 }
@@ -317,6 +393,9 @@ public sealed class ResourcePool
 /// payloads so a reader can reconstruct pool state at any logged event.
 /// </summary>
 public readonly record struct PoolSnapshot(int Cpu, int Nvenc, int Nvdec, int Cuda);
+
+/// <summary>One row of <see cref="ResourcePool.HeldOps"/>.</summary>
+public readonly record struct HeldOpSnapshot(string? File, string? Op, ResourceRequest Granted);
 
 /// <summary>
 /// Outcome of <see cref="ResourcePool.AcquireAnyAsync"/>.  <see cref="Lease"/>

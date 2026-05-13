@@ -44,4 +44,18 @@ public interface IPipelineLogger
     /// "Extracting refs 12/16").
     /// </summary>
     void SetStage(string stage, string? detail = null);
+
+    /// <summary>
+    /// Record one pool transaction (op name + granted shape + queue wait +
+    /// hold time) for the per-file time card and cross-file pool-share
+    /// rollup.  Call after the lease is released so HoldMs is final.
+    /// </summary>
+    void RecordOp(string op, ResourceRequest granted, int waitMs, int holdMs);
+
+    /// <summary>
+    /// Run-wide accumulator for this file's pool ops.  Null on loggers that
+    /// don't track metrics (<see cref="NullLogger"/>).  Read at end-of-file
+    /// to render the time card and contribute to cross-file aggregates.
+    /// </summary>
+    FileMetricsCollector? Metrics { get; }
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using Serilog;
 
@@ -30,11 +31,22 @@ namespace MkvHelper;
 /// </summary>
 public sealed class SystemSampler : IAsyncDisposable
 {
+    /// <summary>
+    /// Cadence for the mid-run pool-vs-hardware checkpoint logged at INFO.
+    /// Tick-frequency events are useful for post-hoc analysis but invisible
+    /// to a user watching a long run.  Five minutes is enough resolution to
+    /// catch a saturation pattern within one Phase 2 round of probes
+    /// without flooding the run logs.
+    /// </summary>
+    private static readonly TimeSpan CheckpointInterval = TimeSpan.FromMinutes(5);
+
     private readonly ResourcePool _pool;
     private readonly TimeSpan _interval;
     private readonly CancellationTokenSource _cts;
     private readonly Task _loop;
+    private readonly Stopwatch _checkpointTimer = Stopwatch.StartNew();
     private bool _gpuQueryWarned;
+    private int? _vramTotalMb;
 
     // Previous /proc/stat first-line counters; null on the first tick.
     private (ulong Total, ulong Idle)? _prevCpu;
@@ -97,15 +109,56 @@ public sealed class SystemSampler : IAsyncDisposable
     private async Task EmitOneAsync(CancellationToken ct)
     {
         PoolSnapshot pool = _pool.Snapshot();
+        IReadOnlyList<HeldOpSnapshot> held = _pool.HeldOps();
         (double cpuPct, double load1m) = ReadCpuUsage();
         GpuStats gpu = await ReadGpuStatsAsync(ct);
 
+        // Read total VRAM once on the first GPU-capable tick and cache it.
+        // Static for the run — the card's physical memory doesn't change.
+        if (_vramTotalMb is null && gpu.GpuUtilPct is not null)
+            _vramTotalMb = await ReadVramTotalAsync(ct);
+
         Accumulate(pool, cpuPct, gpu);
 
+        // Held-op tags make per-tick samples self-explanatory: when GPU is
+        // 3 % but CUDA pool is 91 % busy, the held-ops list names the ops
+        // supposedly using CUDA so an analyst can correlate without joining
+        // the acquire/release stream by timestamp.
         Log.Logger.Information(
             "System util sample: pool {@Pool}; cpu {CpuPct:F1}% (load1m {Load1m:F2}); " +
-            "gpu {@Gpu}",
-            pool, cpuPct, load1m, gpu);
+            "gpu {@Gpu}; held {@Held}",
+            pool, cpuPct, load1m, gpu, held);
+
+        if (_checkpointTimer.Elapsed >= CheckpointInterval)
+        {
+            _checkpointTimer.Restart();
+            SystemSamplerSummary checkpoint = Summarize();
+            Log.Logger.Information(
+                "Pool-vs-hardware checkpoint ({Elapsed}m elapsed since last): " +
+                "{@Checkpoint}",
+                (int)CheckpointInterval.TotalMinutes, checkpoint);
+        }
+    }
+
+    /// <summary>
+    /// One-shot read of total VRAM from nvidia-smi.  Called lazily on the
+    /// first GPU-capable tick so a missing or broken nvidia-smi doesn't
+    /// fail the loop.  Returns null on parse failure.
+    /// </summary>
+    private async Task<int?> ReadVramTotalAsync(CancellationToken ct)
+    {
+        try
+        {
+            (int code, string stdout, string _) = await Proc.RunAsync(
+                "nvidia-smi",
+                ["--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                ct);
+            if (code != 0) return null;
+            string? line = stdout.Split('\n').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim();
+            if (string.IsNullOrEmpty(line)) return null;
+            return int.TryParse(line, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) ? v : null;
+        }
+        catch { return null; }
     }
 
     private void Accumulate(PoolSnapshot pool, double cpuPct, GpuStats gpu)
@@ -202,6 +255,7 @@ public sealed class SystemSampler : IAsyncDisposable
                 MemoryPctAvg: memPctAvg,
                 VramMbAvg: vramMbAvg,
                 VramMbMax: _vramMbCount > 0 ? _vramMbMax : null,
+                VramMbTotal: _vramTotalMb,
                 NvencSessionAvg: nvencSessAvg,
                 NvencSessionMax: _nvencSessCount > 0 ? _nvencSessMax : null);
         }
@@ -366,7 +420,7 @@ public sealed record class SystemSamplerSummary(
     double CpuPctAvg, double CpuPctMax,
     double? GpuPctAvg, int? GpuPctMax,
     double? MemoryPctAvg,
-    double? VramMbAvg, int? VramMbMax,
+    double? VramMbAvg, int? VramMbMax, int? VramMbTotal,
     double? NvencSessionAvg, int? NvencSessionMax)
 {
     public static SystemSamplerSummary Empty { get; } = new(
@@ -377,6 +431,6 @@ public sealed record class SystemSamplerSummary(
         CpuPctAvg: 0, CpuPctMax: 0,
         GpuPctAvg: null, GpuPctMax: null,
         MemoryPctAvg: null,
-        VramMbAvg: null, VramMbMax: null,
+        VramMbAvg: null, VramMbMax: null, VramMbTotal: null,
         NvencSessionAvg: null, NvencSessionMax: null);
 }

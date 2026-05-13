@@ -11,6 +11,14 @@ public sealed class ContentDetectionResult
     public double Confidence { get; set; }
     public string Reason { get; set; } = "";
 
+    /// <summary>
+    /// MPlayer guide branch tag for the §7.2.2 category we landed on
+    /// (e.g. <c>"7.2.2.1"</c>, <c>"7.2.2.4"</c>).  Surfaced as a structured
+    /// Serilog property at detection so events.jsonl can be filtered by
+    /// branch without parsing the Reason string.
+    /// </summary>
+    public string GuideBranch { get; set; } = "";
+
     // ---- Per-frame counts from idet ----
 
     public int TotalFramesAnalyzed { get; set; }

@@ -20,7 +20,10 @@ namespace MkvHelper;
 ///      without callers having to thread it manually.
 ///
 ///   3. Forward stage updates to the run-wide <see cref="StageReporter"/> for
-///      the live terminal UI.
+///      the live terminal UI.  Stage transitions (broad phase changes) are
+///      mirrored to the logs; per-detail updates (e.g. "CQ=47 sample 3/16")
+///      drive the live UI only — they fire dozens of times per file and
+///      would drown out the actual decisions in post-mortem reading.
 ///
 /// Thread-safety: Serilog's loggers are thread-safe; the StageReporter is
 /// thread-safe.  LogContext.PushProperty uses AsyncLocal&lt;T&gt;, which flows
@@ -33,9 +36,12 @@ public sealed class PerFileLogger : IPipelineLogger, IDisposable
     private readonly IDisposable _fileScope;
     private readonly StageReporter? _reporter;
     private readonly int _fileSlot;
+    private readonly Lock _stageLock = new();
+    private string? _lastStage;
     private bool _disposed;
 
     public string VideoId { get; }
+    public FileMetricsCollector? Metrics { get; }
 
     /// <summary>Warnings collected during the run, surfaced in the final summary.</summary>
     public List<string> Warnings { get; } = [];
@@ -47,9 +53,14 @@ public sealed class PerFileLogger : IPipelineLogger, IDisposable
         _reporter = reporter;
         _fileSlot = fileSlot;
         VideoId = videoId;
+        Metrics = new FileMetricsCollector(videoId);
 
+        // Only the per-file log records the start banner.  The global log
+        // sees this file's first real event soon enough (Detection acquires
+        // a pool slot within milliseconds), and the File property tags every
+        // global event for cross-file analysis — no separate "started" event
+        // adds signal there.
         _file.Information("Run started at {StartedUtc:O}", DateTime.UtcNow);
-        Log.Logger.Information("Per-file run started at {StartedUtc:O}", DateTime.UtcNow);
     }
 
     public void LogInfo(string message)
@@ -73,28 +84,39 @@ public sealed class PerFileLogger : IPipelineLogger, IDisposable
 
     public void SetStage(string stage, string? detail = null)
     {
-        // Mirror to both the per-file log and the global log so post-hoc readers
-        // can see when each stage started.  Structured Stage/Detail properties
-        // make stage transitions filterable in events.jsonl.
-        if (detail is null)
+        // Suppress detail-only updates from the log sinks — they're noise
+        // for post-mortem reading.  The live UI still gets every call so
+        // progress within a stage (sample N/M, probe K/L) keeps updating.
+        bool stageChanged;
+        lock (_stageLock)
         {
-            _file.Information("STAGE: {Stage}", stage);
-            Log.Logger.Information("Stage: {Stage}", stage);
+            stageChanged = _lastStage != stage;
+            if (stageChanged) _lastStage = stage;
         }
-        else
+        if (stageChanged)
         {
-            _file.Information("STAGE: {Stage} — {Detail}", stage, detail);
-            Log.Logger.Information("Stage: {Stage} — {Detail}", stage, detail);
+            if (detail is null)
+            {
+                _file.Information("STAGE: {Stage}", stage);
+                Log.Logger.Information("Stage: {Stage}", stage);
+            }
+            else
+            {
+                _file.Information("STAGE: {Stage} — {Detail}", stage, detail);
+                Log.Logger.Information("Stage: {Stage} — {Detail}", stage, detail);
+            }
         }
         _reporter?.SetStage(_fileSlot, stage, detail);
     }
+
+    public void RecordOp(string op, ResourceRequest granted, int waitMs, int holdMs)
+        => Metrics?.Record(op, granted, waitMs, holdMs);
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         _file.Information("Run finished at {FinishedUtc:O}", DateTime.UtcNow);
-        Log.Logger.Information("Per-file run finished at {FinishedUtc:O}", DateTime.UtcNow);
         _fileScope.Dispose();
         _file.Dispose();    // flushes the async file sink
     }

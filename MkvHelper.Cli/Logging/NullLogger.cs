@@ -11,9 +11,11 @@ public sealed class NullLogger : IPipelineLogger
     private NullLogger() { }
 
     public string VideoId => "";
+    public FileMetricsCollector? Metrics => null;
 
     public void LogInfo(string message) { }
     public void LogWarning(string message) { }
     public void LogError(string message) { }
     public void SetStage(string stage, string? detail = null) { }
+    public void RecordOp(string op, ResourceRequest granted, int waitMs, int holdMs) { }
 }

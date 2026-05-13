@@ -310,17 +310,44 @@ public static partial class ContentDetector
             progCount, totalTff, totalBff, undetCount);
 
         // ---- Classify ----
-        (ContentType contentType, double confidence, string reason) = Classify(
+        (ContentType contentType, double confidence, string reason, string guideBranch) = Classify(
             intCount, classified, progFrac, cadenceRate, iInCadence, parityMismatch);
 
-        logger.LogInfo($"Detection complete: {contentType} (confidence={confidence:P0})");
+        // Structured `GuideBranch` property lets events.jsonl be filtered by
+        // §7.2.2.x without parsing the human-readable Reason string.
+        Serilog.Log.Logger.Information(
+            "Detection complete: {ContentType} ({GuideBranch}) (confidence={Confidence:P0})",
+            contentType, guideBranch, confidence);
+        logger.LogInfo($"Detection complete: {contentType} (§{guideBranch}, confidence={confidence:P0})");
+
+        // Echo every discriminator inline with the threshold for the next
+        // category we DIDN'T qualify for — so a reader can tell "78.5 % was
+        // below the 80 % bar for §7.2.2.2" without consulting the source.
+        string cadenceCmp = cadenceRate >= PureTelecineCadenceMin
+            ? $"cadence={cadenceRate:P1} (≥{PureTelecineCadenceMin:P0} §7.2.2.2 threshold)"
+            : $"cadence={cadenceRate:P1} (<{PureTelecineCadenceMin:P0} §7.2.2.2)";
+        string iInCadenceCmp = iInCadence >= TelecineIRatioMin
+            ? $"i_in_cadence={iInCadence:P1} (≥{TelecineIRatioMin:P0} §7.2.2.4 threshold)"
+            : $"i_in_cadence={iInCadence:P1} (<{TelecineIRatioMin:P0} §7.2.2.4)";
         logger.LogInfo(
-            $"  progFrac={progFrac:P1}, cadence={cadenceRate:P1}, " +
-            $"i_in_cadence={iInCadence:P1}, parity={parity}" +
+            $"  progFrac={progFrac:P1}, {cadenceCmp}, " +
+            $"{iInCadenceCmp}, parity={parity}" +
             (parityFromNtsc ? " (NTSC fallback)" : "") +
             $", source={sourceFps?.ToString() ?? "?"}" +
             (isLikelyCfr ? "" : " (VFR)") +
             $", frames={frames.Count:N0} (P={progCount:N0} I={intCount:N0} U={undetCount:N0})");
+
+        // High undet share signals an unusual source (high vertical detail,
+        // mosquito noise, animation ink lines) that idet struggled to classify.
+        // The classifier defaults to ignoring undet frames, so a quiet warning
+        // is enough — but the user should know the prog/int split is computed
+        // from a smaller-than-expected sample.
+        double undetFrac = frames.Count > 0 ? undetCount / (double)frames.Count : 0;
+        if (undetFrac > 0.02)
+            logger.LogWarning(
+                $"High undetermined rate: {undetCount:N0}/{frames.Count:N0} frames ({undetFrac:P1}) " +
+                "— idet had trouble classifying.  Cadence metrics may be noisy.");
+
         if (parityMismatch)
             logger.LogWarning(
                 $"PARITY MISMATCH: idet={parity} vs ffprobe={ffprobeParity} " +
@@ -328,12 +355,20 @@ public static partial class ContentDetector
         if (!aggregateAgrees)
             logger.LogWarning(
                 "idet aggregate disagrees with per-frame stream — likely parser bug.");
+        else if (aggProg is not null)
+            // Positive cross-check evidence — useful when reviewing
+            // decisions.log to know the per-frame parser is healthy on
+            // this file.
+            logger.LogInfo(
+                $"idet aggregate cross-check OK: P={aggProg} I={aggTff + aggBff} " +
+                $"U={aggUndet} match per-frame counts within 1 frame.");
 
         return new ContentDetectionResult
         {
             ContentType = contentType,
             Confidence = confidence,
             Reason = reason,
+            GuideBranch = guideBranch,
 
             TotalFramesAnalyzed = frames.Count,
             ProgressiveFrameCount = progCount,
@@ -479,7 +514,7 @@ public static partial class ContentDetector
     // Decision tree mapping the three metrics onto the five §7.2.2 categories.
     // Order matters: each branch is the strictest qualifier for that category.
     // -------------------------------------------------------------------
-    internal static (ContentType Type, double Confidence, string Reason) Classify(
+    internal static (ContentType Type, double Confidence, string Reason, string GuideBranch) Classify(
         int intCount, int totalClassified, double progFrac, double cadenceRate, double iInCadence,
         bool parityMismatch)
     {
@@ -490,7 +525,8 @@ public static partial class ContentDetector
         if (intCount == 0)
         {
             return (ContentType.Progressive, Penalize(0.99),
-                "Progressive (§7.2.2.1): zero interlaced frames — verified pure progressive.");
+                "Progressive (§7.2.2.1): zero interlaced frames — verified pure progressive.",
+                "7.2.2.1");
         }
 
         // §7.2.2.1 (noise-floor relaxation): the guide's strict wording was
@@ -510,7 +546,8 @@ public static partial class ContentDetector
                 $"Progressive (§7.2.2.1, idet noise floor): {intCount:N0} interlaced frame(s) " +
                 $"in {totalClassified:N0} classified ({1.0 - progFrac:P3}) — within idet's " +
                 $"false-positive floor ({noiseCap:N0}), no cadence (rate={cadenceRate:P2}) " +
-                $"or cluster signal (iInCadence={iInCadence:P1}).");
+                $"or cluster signal (iInCadence={iInCadence:P1}).",
+                "7.2.2.1");
         }
 
         // §7.2.2.3: Interlaced.  "Every single frame is interlaced."
@@ -518,7 +555,8 @@ public static partial class ContentDetector
         {
             double conf = Math.Clamp(0.85 + (PureInterlacedProgFracMax - progFrac) * 3.0, 0.85, 0.99);
             return (ContentType.Interlaced, Penalize(conf),
-                $"Interlaced (§7.2.2.3): {1.0 - progFrac:P2} of classified frames are interlaced.");
+                $"Interlaced (§7.2.2.3): {1.0 - progFrac:P2} of classified frames are interlaced.",
+                "7.2.2.3");
         }
 
         // §7.2.2.2: Telecined.  Uniform 3:2 cadence across the entire file.
@@ -527,7 +565,8 @@ public static partial class ContentDetector
             double conf = Math.Clamp(0.80 + (cadenceRate - PureTelecineCadenceMin) * 2.0, 0.80, 0.99);
             return (ContentType.Telecined, Penalize(conf),
                 $"Telecined (§7.2.2.2): cadence match rate = {cadenceRate:P2} — " +
-                "uniform 3:2 pulldown (PPPII) detected across the file.");
+                "uniform 3:2 pulldown (PPPII) detected across the file.",
+                "7.2.2.2");
         }
 
         // §7.2.2.4: I frames embedded in 3:2 cycles → telecine in the interlaced regions.
@@ -542,7 +581,8 @@ public static partial class ContentDetector
             double conf = Math.Clamp(0.60 + iInCadence * 0.3, 0.55, 0.90);
             return (ContentType.MixedProgressiveTelecine, Penalize(conf),
                 $"Mixed progressive+telecine (§7.2.2.4): {iInCadence:P1} of interlaced frames " +
-                $"sit inside 3:2 windows, cadence rate = {cadenceRate:P2}, progFrac = {progFrac:P2}.");
+                $"sit inside 3:2 windows, cadence rate = {cadenceRate:P2}, progFrac = {progFrac:P2}.",
+                "7.2.2.4");
         }
 
         // §7.2.2.5: I frames are clustered (not in cadence) → genuine interlace mixed in.
@@ -563,7 +603,8 @@ public static partial class ContentDetector
             double conf = Math.Clamp(0.50 + margin * 0.5, 0.45, 0.85);
             return (ContentType.MixedProgressiveInterlaced, Penalize(conf),
                 $"Mixed progressive+interlaced (§7.2.2.5): only {iInCadence:P1} of interlaced " +
-                $"frames are in 3:2 cycles, progFrac = {progFrac:P2}, cadence = {cadenceRate:P2}.");
+                $"frames are in 3:2 cycles, progFrac = {progFrac:P2}, cadence = {cadenceRate:P2}.",
+                "7.2.2.5");
         }
 
         // Trace I-frames past the noise floor but below §7.2.2.5's positive-evidence
@@ -579,7 +620,8 @@ public static partial class ContentDetector
                 $"{intCount:N0} interlaced frame(s) in {totalClassified:N0} classified " +
                 $"({1.0 - progFrac:P3}) — past idet noise floor but below §7.2.2.5 " +
                 $"verification threshold (iInCadence={iInCadence:P1}, cadence={cadenceRate:P2}). " +
-                "Defaulting to pullup per §7.2.3.1.");
+                "Defaulting to pullup per §7.2.3.1.",
+                "7.2.2.4");
         }
     }
 

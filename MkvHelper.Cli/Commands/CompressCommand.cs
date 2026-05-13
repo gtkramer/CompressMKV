@@ -97,6 +97,36 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             cfg.InputFolder, cfg.OutputFolder, cfg.CpuPool, cfg.NvencSlots,
             cfg.NvdecSlots, cfg.CudaSlots, discovered.Count, settings.ForceRedo);
 
+        // Run-wide config snapshot for reproducibility.  Everything that
+        // shapes a run's outcome that isn't otherwise in source control:
+        // CQ search ranges (per resolution tier), sample budget + RNG seed,
+        // VMAF thresholds and model versions, NVENC encoder settings.  One
+        // structured event makes after-the-fact "what settings did this run
+        // use" trivial without reading the Config.cs source.
+        Serilog.Log.Logger.Information(
+            "Run config: cqRangeUhd=[{MinUhd}..{MaxUhd}], cqRangeFhd=[{MinFhd}..{MaxFhd}], " +
+            "cqRangeHd=[{MinHd}..{MaxHd}], cqRangeSd=[{MinSd}..{MaxSd}]; " +
+            "sampleCount={SampleCount}, sampleWindowSec={SampleWindowSec}, rngSeed={Seed}; " +
+            "vmafThresholds(mean/p05/p01)={MeanT}/{P05T}/{P01T}; " +
+            "vmafModels(std/4k)={StdModel}/{Model4k}; " +
+            "nvencPreset={Preset}, rcLookahead={Lookahead}; " +
+            "samplerIntervalSec={SamplerInterval}",
+            cfg.MinCqUhd, cfg.MaxCqUhd, cfg.MinCqFhd, cfg.MaxCqFhd,
+            cfg.MinCqHd, cfg.MaxCqHd, cfg.MinCqSd, cfg.MaxCqSd,
+            cfg.SampleCount, cfg.SampleWindowSeconds, cfg.RandomSeed,
+            cfg.TargetMeanVmaf, cfg.TargetP05Vmaf, cfg.TargetP01Vmaf,
+            cfg.VmafStandardModelVersion, cfg.Vmaf4kModelVersion,
+            cfg.NvencPreset, cfg.RcLookahead,
+            cfg.SystemSamplerIntervalSeconds);
+
+        // Run-once context lines used to scroll past per file — pull them up
+        // here since they don't change between files.
+        Serilog.Log.Logger.Information(
+            "Container image: {ImageTag}", ContainerTools.ImageTag);
+        Serilog.Log.Logger.Information(
+            "VMAF execution mode: GPU (libvmaf_cuda); AV1 sample decode on NVDEC; " +
+            "HDR sources tonemap on CPU before hwupload_cuda.");
+
         ResourcePool pool = new(cfg.CpuPool, cfg.NvencSlots, cfg.NvdecSlots, cfg.CudaSlots);
         OverallSummary overall = new() { StartedUtc = DateTime.UtcNow, Config = cfg };
         StageReporter reporter = new(discovered.Count);
@@ -164,10 +194,65 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             AnsiConsole.MarkupLine($"  [yellow]Passthrough fallback:[/] {passthroughCount} (source already efficiently compressed)");
 
         RenderSamplerSummary(samplerSummary);
+        RenderPoolShareByFile(overall.Videos);
 
         AnsiConsole.MarkupLine($"  [grey]Wrote {overallPath}[/]");
 
         return overall.Errors.Count == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Cross-file rollup of pool ownership.  For each resource, ranks files
+    /// by their share of total slot-ms consumed.  Surfaces "this one file
+    /// held 38% of CUDA across the whole batch" — useful when one outlier
+    /// is the bottleneck on a many-file run.  Top 5 files per resource are
+    /// listed; remainder is rolled up as "others".
+    /// </summary>
+    private static void RenderPoolShareByFile(List<VideoSummary> videos)
+    {
+        ResourceTimeShare totals = new();
+        foreach (VideoSummary v in videos) totals += v.ResourceShare;
+        if (totals.CpuMs == 0 && totals.NvencMs == 0 && totals.NvdecMs == 0 && totals.CudaMs == 0)
+            return;
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("  [bold]Pool share by file[/] [grey](top consumers per resource)[/]");
+
+        RenderOne("CPU",   v => v.ResourceShare.CpuMs,   totals.CpuMs);
+        RenderOne("NVENC", v => v.ResourceShare.NvencMs, totals.NvencMs);
+        RenderOne("NVDEC", v => v.ResourceShare.NvdecMs, totals.NvdecMs);
+        RenderOne("CUDA",  v => v.ResourceShare.CudaMs,  totals.CudaMs);
+
+        void RenderOne(string label, Func<VideoSummary, long> select, long total)
+        {
+            if (total <= 0) return;
+            List<(string Id, long Ms)> ranked = videos
+                .Select(v => (v.VideoId, select(v)))
+                .Where(t => t.Item2 > 0)
+                .OrderByDescending(t => t.Item2)
+                .ToList();
+            if (ranked.Count == 0) return;
+            AnsiConsole.MarkupLine($"    [grey]{label,-5}[/]");
+            int shown = 0;
+            long shownSum = 0;
+            foreach ((string Id, long Ms) row in ranked.Take(5))
+            {
+                double pct = 100.0 * row.Ms / total;
+                AnsiConsole.MarkupLine(
+                    $"      {Markup.Escape(Truncate(row.Id, 50)),-50} " +
+                    $"[cyan]{pct,5:F1}%[/] ({row.Ms / 1000.0:F1} slot-s)");
+                shown++;
+                shownSum += row.Ms;
+            }
+            int remaining = ranked.Count - shown;
+            if (remaining > 0)
+            {
+                double restPct = 100.0 * (total - shownSum) / total;
+                AnsiConsole.MarkupLine(
+                    $"      {$"({remaining} other file(s))",-50} " +
+                    $"[grey]{restPct,5:F1}%[/] ({(total - shownSum) / 1000.0:F1} slot-s)");
+            }
+        }
     }
 
     /// <summary>
@@ -210,6 +295,19 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         AnsiConsole.MarkupLine(
             $"    [grey]CUDA  [/] pool [yellow]{s.CudaBusyPct,5:F1}%[/] busy / {gpuActualCuda}");
 
+        // VRAM peak vs ceiling.  Config.cs sizes CudaSlots so the realistic
+        // worst-case mix lands just under the card's total memory — show the
+        // observed peak alongside the ceiling so a user can confirm the sizing
+        // held at runtime (or notice they're at the edge and should back off).
+        if (s.VramMbMax is { } vmax)
+        {
+            string ceilingPart = s.VramMbTotal is { } vtotal
+                ? $" / {vtotal / 1024.0:F1} GiB total ({(vtotal - vmax) / 1024.0:F1} GiB headroom)"
+                : "";
+            AnsiConsole.MarkupLine(
+                $"    [grey]VRAM  [/] peak [yellow]{vmax / 1024.0:F1} GiB[/]" + ceilingPart);
+        }
+
         // Hints — pool ≥ 75% busy but the hardware proxy says ≤ 30%.
         List<string> hints = [];
         const double BusyThreshold = 75.0;
@@ -222,6 +320,15 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             hints.Add($"NVDEC pool {s.NvdecBusyPct:F0}% busy but GPU only {gd:F1}% — consider raising NvdecSlots.");
         if (s.CudaBusyPct >= BusyThreshold && s.GpuPctAvg is { } gc && gc <= IdleThreshold)
             hints.Add($"CUDA pool {s.CudaBusyPct:F0}% busy but GPU only {gc:F1}% — consider raising CudaSlots.");
+
+        // VRAM-edge hint — if peak landed within 1 GiB of the card total,
+        // the user is at the line and probably wants to back off slots
+        // before adding any.  Cross-checks the slot-tuning hints above
+        // against the actual memory the run consumed.
+        if (s.VramMbMax is { } vmaxH && s.VramMbTotal is { } vtotalH && vtotalH - vmaxH < 1024)
+            hints.Add(
+                $"VRAM peak {vmaxH / 1024.0:F1} GiB is within 1 GiB of the {vtotalH / 1024.0:F1} GiB " +
+                "card ceiling — back off CudaSlots or NvencSlots before raising any GPU pool further.");
 
         foreach (string h in hints)
             AnsiConsole.MarkupLine($"    [yellow]Hint:[/] {Markup.Escape(h)}");
@@ -378,13 +485,14 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         logger.LogInfo($"Input: {input}");
         logger.LogInfo($"Output dir: {outDir}");
-        logger.LogInfo($"Container image: {ContainerTools.ImageTag}");
 
         FfprobeStream vstream = probe.Streams?.FirstOrDefault(s => s.IsActualVideo())
                      ?? throw new InvalidOperationException("No usable video stream found.");
 
         bool isHdr = SourceClassifier.IsHdr(vstream);
-        logger.LogInfo($"HDR: {isHdr}");
+        // HDR detection is keyed off color_transfer — include the trigger
+        // so a reader can see exactly which colorimetry tag drove the call.
+        logger.LogInfo($"HDR: {isHdr} (color_transfer={vstream.ColorTransfer ?? "—"})");
 
         HdrMetadata? hdrMetadata = isHdr
             ? await SourceClassifier.ExtractHdrMetadataAsync(cfg, input, ct)
@@ -404,7 +512,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         string vmafModelVersion = cfg.ResolveVmafModelVersion(vstream.Width, vstream.Height);
         logger.LogInfo($"VMAF model: {vmafModelVersion} (source {vstream.Width}x{vstream.Height})");
 
-        Stopwatch sw = Stopwatch.StartNew();
+        Stopwatch detectionSw = Stopwatch.StartNew();
         ContentDetectionResult detection;
         AcquireResult detectAdmit = await pool.AcquireAnyAsync(
             cfg.DetectionAlternatives, ct, file: id, op: "detection");
@@ -416,26 +524,36 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 $"Detection acquired: decoder={(useHwaccel ? "NVDEC" : "CPU")} " +
                 $"(alt {detectAdmit.AlternativeIndex}, waited {detectAdmit.WaitMs}ms); " +
                 $"pool now {FormatPool(detectAdmit.PoolAfter, pool)}");
+            if (detectAdmit.AlternativeIndex > 0)
+                // NVDEC-first ordering; fallback to alt 1 = CPU means NVDEC
+                // was saturated.  Worth a per-file note since it changes the
+                // detection latency profile.
+                logger.LogInfo(
+                    "Detection fell back to CPU decode (NVDEC pool saturated at admission).");
             detection = await ContentDetector.DetectAsync(cfg, input, vstream, useHwaccel, ct, logger);
         }
         detectHold.Stop();
+        int detectHoldMs = (int)detectHold.Elapsed.TotalMilliseconds;
+        logger.RecordOp("detection", detectAdmit.Granted, detectAdmit.WaitMs, detectHoldMs);
         logger.LogInfo(
             $"Detection released: held resources for {detectHold.Elapsed.TotalSeconds:F1}s " +
             $"(wait was {detectAdmit.WaitMs}ms).");
-        timings.Detection = sw.Elapsed;
+        timings.Detection = new PhaseTiming(
+            Wall: detectionSw.Elapsed,
+            QueueSum: TimeSpan.FromMilliseconds(detectAdmit.WaitMs),
+            RunSum: detectHold.Elapsed,
+            OpCount: 1);
 
         RestoreDecision restore = RestoreStrategyMapper.MapToRestore(detection);
-        logger.LogInfo($"Restore decision: {restore.Mode} (filter=\"{restore.FilterGraph}\", fps={restore.OutputFps?.ToString() ?? "native"})");
+        logger.LogInfo(
+            $"Restore decision: {restore.Mode} (confidence={restore.Confidence:P0}, " +
+            $"filter=\"{restore.FilterGraph}\", fps={restore.OutputFps?.ToString() ?? "native"})");
         logger.LogInfo($"  Reason: {restore.Notes}");
-
-        logger.LogInfo(isHdr
-            ? "VMAF execution: GPU (libvmaf_cuda); AV1 sample decode on NVDEC; HDR tonemap chain on CPU"
-            : "VMAF execution: GPU (libvmaf_cuda); AV1 sample decode on NVDEC");
 
         TuningResult tuning = await VmafTuner.TuneAsync(cfg, pool, input, outDir, restore,
             isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, vstream, ct, logger);
-        timings.TuningPhase1 = tuning.Phase1Elapsed;
-        timings.TuningPhase2 = tuning.Phase2Elapsed;
+        timings.TuningPhase1 = tuning.Phase1Timing;
+        timings.TuningPhase2 = tuning.Phase2Timing;
 
         if (tuning.Selection.IsMarginal)
         {
@@ -447,9 +565,21 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
 
         int finalCq = tuning.Selection.SelectedCq;
         string finalOut = Path.Combine(outDir, $"{id}_av1_cq{finalCq}{cfg.OutputExtension}");
-        sw.Restart();
+        Stopwatch finalSw = Stopwatch.StartNew();
+        // Snapshot metrics before/after so we can split the final-encode op
+        // into wall (whole call) and queue/run (the pool acquire).
+        int finalOpsBefore = logger.Metrics?.Snapshot().Count ?? 0;
         await FinalEncoder.EncodeAsync(cfg, pool, input, finalOut, restore, finalCq, pipelineFormat, ct, logger);
-        timings.FinalEncode = sw.Elapsed;
+        finalSw.Stop();
+        IReadOnlyList<FileMetricsCollector.OpRecord> finalOps =
+            logger.Metrics?.Snapshot().Skip(finalOpsBefore).ToArray()
+            ?? (IReadOnlyList<FileMetricsCollector.OpRecord>)[];
+        FileMetricsCollector.OpRecord? finalRec = finalOps.FirstOrDefault(o => o.Op == "final-encode");
+        timings.FinalEncode = new PhaseTiming(
+            Wall: finalSw.Elapsed,
+            QueueSum: TimeSpan.FromMilliseconds(finalRec?.WaitMs ?? 0),
+            RunSum: TimeSpan.FromMilliseconds(finalRec?.HoldMs ?? 0),
+            OpCount: 1);
         logger.LogInfo($"Final encode written: {finalOut}");
 
         // SizeGuard does the (instant) size check inline; it acquires a small
@@ -457,7 +587,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         SizeGuardOutcome sizeGuard = await SizeGuard.MaybeFallbackAsync(cfg, pool, input, finalOut, restore, logger, ct);
         finalOut = sizeGuard.OutputPath;
 
-        sw.Restart();
+        Stopwatch verifySw = Stopwatch.StartNew();
         OutputVerificationResult verification;
         AcquireResult verifyAdmit = await pool.AcquireAnyAsync(
             cfg.VerificationAlternatives, ct, file: id, op: "verification");
@@ -469,22 +599,38 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 $"Verification acquired: decoder={(useHwaccel ? "NVDEC" : "CPU")} " +
                 $"(alt {verifyAdmit.AlternativeIndex}, waited {verifyAdmit.WaitMs}ms); " +
                 $"pool now {FormatPool(verifyAdmit.PoolAfter, pool)}");
+            if (verifyAdmit.AlternativeIndex > 0)
+                logger.LogInfo(
+                    "Verification fell back to CPU decode (NVDEC pool saturated at admission).");
             verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, useHwaccel, ct, logger);
         }
         verifyHold.Stop();
+        int verifyHoldMs = (int)verifyHold.Elapsed.TotalMilliseconds;
+        logger.RecordOp("verification", verifyAdmit.Granted, verifyAdmit.WaitMs, verifyHoldMs);
         logger.LogInfo(
             $"Verification released: held resources for {verifyHold.Elapsed.TotalSeconds:F1}s " +
             $"(wait was {verifyAdmit.WaitMs}ms).");
-        timings.Verification = sw.Elapsed;
+        timings.Verification = new PhaseTiming(
+            Wall: verifySw.Elapsed,
+            QueueSum: TimeSpan.FromMilliseconds(verifyAdmit.WaitMs),
+            RunSum: verifyHold.Elapsed,
+            OpCount: 1);
         timings.Total = totalSw.Elapsed;
 
-        logger.LogInfo(
-            $"Timings (total {timings.Total.TotalSeconds:F1}s): " +
-            $"detect={timings.Detection.TotalSeconds:F1}s, " +
-            $"tune.p1={timings.TuningPhase1.TotalSeconds:F1}s, " +
-            $"tune.p2={timings.TuningPhase2.TotalSeconds:F1}s, " +
-            $"final={timings.FinalEncode.TotalSeconds:F1}s, " +
-            $"verify={timings.Verification.TotalSeconds:F1}s.");
+        // Per-file time card — replaces the one-line "Timings…" summary
+        // with a phase-by-phase breakdown that names queue vs run and gives
+        // each phase's share of the total.  When run time is dominated by
+        // queue waits, the queue column makes the contention pattern obvious
+        // without grep over events.jsonl.
+        RenderTimeCard(logger, timings);
+
+        // Top-3 longest waits across every pool acquire this file made.  A
+        // big wait buried in 80+ acquires is hard to find; surfacing the
+        // worst three answers "which op held this file up the longest."
+        RenderTopWaits(logger);
+
+        ResourceTimeShare share = logger.Metrics?.ResourceShare()
+            ?? new ResourceTimeShare();
 
         VideoSummary summary = new()
         {
@@ -502,12 +648,67 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
             SizeGuard = sizeGuard,
             Timings = timings,
             HdrMetadata = hdrMetadata,
+            ResourceShare = share,
         };
 
         await JsonIO.WriteAsync(Path.Combine(outDir, "log.json"), summary, ct);
         CleanIntermediates(outDir);
 
         return summary;
+    }
+
+    /// <summary>
+    /// Per-file end-of-pipeline timing table.  One row per phase showing
+    /// wall-clock, percent of total, queue (sum of pool waits in that phase),
+    /// and run (sum of pool holds, may exceed wall on parallel phases).
+    /// </summary>
+    private static void RenderTimeCard(IPipelineLogger logger, PhaseTimings t)
+    {
+        double total = t.Total.TotalSeconds;
+        logger.LogInfo($"Time card (total {FormatHms(t.Total)}):");
+        Emit("Detection",   t.Detection,   total, logger);
+        Emit("Phase 1",     t.TuningPhase1, total, logger);
+        Emit("Phase 2",     t.TuningPhase2, total, logger);
+        Emit("Final encode", t.FinalEncode, total, logger);
+        Emit("Verify",      t.Verification, total, logger);
+
+        static void Emit(string name, PhaseTiming p, double totalSec, IPipelineLogger l)
+        {
+            double pct = totalSec > 0 ? p.Wall.TotalSeconds / totalSec * 100 : 0;
+            l.LogInfo(
+                $"  {name,-12}  wall {FormatHms(p.Wall),8}  {pct,5:F1}%  " +
+                $"queue-sum {FormatHms(p.QueueSum),8}  run-sum {FormatHms(p.RunSum),8}  " +
+                $"({p.OpCount} op{(p.OpCount == 1 ? "" : "s")})");
+        }
+    }
+
+    /// <summary>
+    /// Surface the top three longest pool waits this file experienced — the
+    /// "which op was the worst offender" view.  Skipped when no acquires
+    /// recorded a wait greater than 0 (every op ran fast-path).
+    /// </summary>
+    private static void RenderTopWaits(IPipelineLogger logger)
+    {
+        IReadOnlyList<FileMetricsCollector.OpRecord> top =
+            logger.Metrics?.TopWaits(3)
+            ?? (IReadOnlyList<FileMetricsCollector.OpRecord>)[];
+        if (top.Count == 0 || top.All(r => r.WaitMs == 0)) return;
+
+        logger.LogInfo("Top pool waits this file:");
+        foreach (FileMetricsCollector.OpRecord r in top.Where(r => r.WaitMs > 0))
+            logger.LogInfo(
+                $"  {r.Op,-32}  waited {r.WaitMs,7}ms  held {r.HoldMs,7}ms  " +
+                $"granted {{cpu={r.Granted.Cpu} nvenc={r.Granted.Nvenc} " +
+                $"nvdec={r.Granted.Nvdec} cuda={r.Granted.Cuda}}}");
+    }
+
+    private static string FormatHms(TimeSpan t)
+    {
+        if (t.TotalHours >= 1)
+            return $"{(int)t.TotalHours}:{t.Minutes:D2}:{t.Seconds:D2}";
+        if (t.TotalMinutes >= 1)
+            return $"{(int)t.TotalMinutes}:{t.Seconds:D2}";
+        return $"{t.TotalSeconds:F1}s";
     }
 
     private static void CleanIntermediates(string outDir)

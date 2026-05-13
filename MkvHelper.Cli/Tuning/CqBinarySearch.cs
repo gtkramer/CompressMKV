@@ -27,11 +27,17 @@ public static class CqBinarySearch
     /// passed.  The +1 bias in the mid formula starts the search at the
     /// upper midpoint of the range — for the default <c>[25, 55]</c>, the
     /// first probe is CQ=40.
+    ///
+    /// <paramref name="onStep"/> is invoked before each probe with the
+    /// current <c>(lo, hi, mid)</c> so the caller can render the search
+    /// state inline with its per-probe log.  Optional; null disables the
+    /// callback.
     /// </summary>
     public static async Task<int?> FindHighestPassingAsync(
         int minCq, int maxCq,
         Func<int, Task<bool>> probe,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<int, int, int>? onStep = null)
     {
         if (minCq > maxCq)
             throw new ArgumentException($"minCq ({minCq}) must be <= maxCq ({maxCq}).");
@@ -44,6 +50,7 @@ public static class CqBinarySearch
         {
             ct.ThrowIfCancellationRequested();
             int mid = (lo + hi + 1) / 2;
+            onStep?.Invoke(lo, hi, mid);
 
             if (await probe(mid))
             {
