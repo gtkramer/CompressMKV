@@ -240,28 +240,63 @@ public sealed class Config
 
     public ResourceRequest SizeGuardRemuxRequest => new(Cpu: 1);
 
-    // -- CQ search range --
+    // -- CQ search range (resolution-tiered) --
     //
     // The tuning search looks for the highest CQ (most compression) that still
-    // meets the VMAF gates below.  A binary search over the [MinCq, MaxCq]
-    // integer range converges in ~log2(N) probes regardless of where the
-    // answer lies — so the bounds are about pruning regions where the answer
-    // is determined a priori, not about constraining the search granularity.
+    // meets the VMAF gates below.  Binary search over [Min, Max] converges in
+    // ceil(log2(MaxCq - MinCq + 2)) probes worst case, so the window width
+    // directly bounds Phase 2 cost.  Each tier sits within a ≤ 31-CQ window
+    // so search completes in ≤ 5 probes for every resolution class.
     //
-    // NVENC AV1 supports CQ 0–63.  We default to a tighter window because:
-    //   - Below MinCq=8: encodes are already perceptually transparent at any
-    //     quality target we'd realistically set; smaller CQ just wastes bits.
-    //   - Above MaxCq=55: real content uniformly fails the 97/95/90 gates;
-    //     no point sampling there.
-    // Bump MaxCq toward 63 if you're working with content that can survive
-    // very aggressive compression; bump MinCq toward 0 if you target archive-
-    // grade quality (mean ≥ 99).
+    // The ranges are tiered by source resolution so the FIRST probe — the
+    // upper-midpoint of the range — lands near where the answer cluster sits
+    // for that resolution class.  Average-case probe count drops when the
+    // first probe is near the answer (most paths short-circuit on a binary
+    // leaf), so tier-aware ranges save real wall time on top of the worst-
+    // case bound:
+    //
+    //   UHD   (4K+)        [25, 55]  first probe 40  ← measured: pristine 4K
+    //                                                  HDR clustered at 38–45
+    //   1080p (Full HD)    [28, 58]  first probe 43  ← inferred from 4K data
+    //   720p  (HD)         [32, 62]  first probe 47  ← inferred
+    //   SD    (DVD, etc.)  [38, 63]  first probe 51  ← inferred; capped at
+    //                                                  NVENC's hard CQ ceiling
+    //
+    // Worst-case probe count per tier:
+    //   UHD/1080p/720p: ceil(log2(32)) = 5
+    //   SD:             ceil(log2(27)) = 5  (range narrower; upper at 63)
+    //
+    // Resolution → tier mapping (see ResolveCqRange below):
+    //   width≥3840 OR height≥2160 → UHD
+    //   width≥1920 OR height≥1080 → 1080p
+    //   width≥1280 OR height≥720  → 720p
+    //   otherwise                  → SD
+    //
+    // Adjust tier bounds if real-content trajectories in decisions.log
+    // consistently land outside the picked range or right at MaxCq (the
+    // "clamp" failure: the true answer was beyond MaxCq and search clipped).
+    // The binary search remains correct if bounds are mis-tuned; only first-
+    // probe efficiency suffers.
 
-    /// <summary>Lower bound (inclusive) of the binary CQ search.  Must be ≥ 0.</summary>
-    public int MinCq { get; set; } = 8;
+    /// <summary>UHD (4K+) lower bound.  Must be ≥ 0.</summary>
+    public int MinCqUhd { get; set; } = 25;
+    /// <summary>UHD (4K+) upper bound.  Must be ≤ 63 (NVENC AV1 hard ceiling).</summary>
+    public int MaxCqUhd { get; set; } = 55;
 
-    /// <summary>Upper bound (inclusive) of the binary CQ search.  Must be ≤ 63 (NVENC AV1 hard ceiling).</summary>
-    public int MaxCq { get; set; } = 55;
+    /// <summary>1080p / Full HD lower bound.  Must be ≥ 0.</summary>
+    public int MinCqFhd { get; set; } = 28;
+    /// <summary>1080p / Full HD upper bound.  Must be ≤ 63 (NVENC AV1 hard ceiling).</summary>
+    public int MaxCqFhd { get; set; } = 58;
+
+    /// <summary>720p HD lower bound.  Must be ≥ 0.</summary>
+    public int MinCqHd { get; set; } = 32;
+    /// <summary>720p HD upper bound.  Must be ≤ 63 (NVENC AV1 hard ceiling).</summary>
+    public int MaxCqHd { get; set; } = 62;
+
+    /// <summary>SD (DVD, sub-720p) lower bound.  Must be ≥ 0.</summary>
+    public int MinCqSd { get; set; } = 38;
+    /// <summary>SD (DVD, sub-720p) upper bound.  Must be ≤ 63 (NVENC AV1 hard ceiling).</summary>
+    public int MaxCqSd { get; set; } = 63;
 
     /// <summary>
     /// Target number of stratified random sample windows.  16 × 12s = 192s
@@ -344,5 +379,26 @@ public sealed class Config
     {
         bool is4k = (width ?? 0) >= 3840 || (height ?? 0) >= 2160;
         return is4k ? Vmaf4kModelVersion : VmafStandardModelVersion;
+    }
+
+    /// <summary>
+    /// Selects the resolution-tiered CQ search range for a source.  The first
+    /// probe of a binary search over [Min, Max] is the upper midpoint of the
+    /// range, so each tier is sized so that first probe lands near the
+    /// expected answer cluster for that resolution class — saving expected-
+    /// case probes on top of the worst-case log₂ bound.
+    /// Tier name is returned alongside the bounds so logs can record which
+    /// tier was picked for each file.  Inputs are nullable for parity with
+    /// <see cref="ResolveVmafModelVersion"/>; in practice every video stream
+    /// has both width and height present by the time this is called.
+    /// </summary>
+    public (int MinCq, int MaxCq, string Tier) ResolveCqRange(int? width, int? height)
+    {
+        int w = width ?? 0;
+        int h = height ?? 0;
+        if (w >= 3840 || h >= 2160) return (MinCqUhd, MaxCqUhd, "UHD");
+        if (w >= 1920 || h >= 1080) return (MinCqFhd, MaxCqFhd, "1080p");
+        if (w >= 1280 || h >= 720)  return (MinCqHd,  MaxCqHd,  "720p");
+        return (MinCqSd, MaxCqSd, "SD");
     }
 }

@@ -275,10 +275,14 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         NvdecSlots = 4,
         CudaSlots = 4,
 
-        // CQ binary search range — full NVENC AV1 range is 0..63; we
-        // narrow to the practically-useful window (see Config docs).
-        MinCq = 8,
-        MaxCq = 55,
+        // CQ binary search range — resolution-tiered.  Each tier ≤ 31 wide
+        // so search completes in ≤ 5 probes regardless of where the answer
+        // lands.  Tier-aware ranges put the first probe near the expected
+        // answer cluster for that resolution class (see Config docs).
+        MinCqUhd = 25, MaxCqUhd = 55,   // first probe 40
+        MinCqFhd = 28, MaxCqFhd = 58,   // first probe 43
+        MinCqHd  = 32, MaxCqHd  = 62,   // first probe 47
+        MinCqSd  = 38, MaxCqSd  = 63,   // first probe 51
 
         SampleCount = 16,
         SampleWindowSeconds = 12,

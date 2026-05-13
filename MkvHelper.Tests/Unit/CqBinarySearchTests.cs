@@ -23,12 +23,12 @@ public class CqBinarySearchTests
     [Test]
     public async Task FindsHighestPassingForEveryThresholdInRange()
     {
-        // For every possible threshold in [8..55], the search should
+        // For every possible threshold in [25..55], the search should
         // converge on exactly that threshold — the highest passing CQ.
-        for (int threshold = 8; threshold <= 55; threshold++)
+        for (int threshold = 25; threshold <= 55; threshold++)
         {
             int? result = await CqBinarySearch.FindHighestPassingAsync(
-                minCq: 8, maxCq: 55, probe: Threshold(threshold));
+                minCq: 25, maxCq: 55, probe: Threshold(threshold));
             Assert.That(result, Is.EqualTo(threshold), $"threshold={threshold}");
         }
     }
@@ -38,7 +38,7 @@ public class CqBinarySearchTests
     {
         // Threshold below MinCq → predicate returns false for every probe.
         int? result = await CqBinarySearch.FindHighestPassingAsync(
-            minCq: 8, maxCq: 55, probe: Threshold(threshold: 7));
+            minCq: 25, maxCq: 55, probe: Threshold(threshold: 24));
         Assert.That(result, Is.Null);
     }
 
@@ -47,24 +47,24 @@ public class CqBinarySearchTests
     {
         // Threshold above MaxCq → predicate returns true for every probe.
         int? result = await CqBinarySearch.FindHighestPassingAsync(
-            minCq: 8, maxCq: 55, probe: Threshold(threshold: 100));
+            minCq: 25, maxCq: 55, probe: Threshold(threshold: 100));
         Assert.That(result, Is.EqualTo(55));
     }
 
     // ------------------------------------------------------------------
-    // Specific arithmetic checks for the user-visible "first probe = 32"
+    // Specific arithmetic checks for the user-visible "first probe = 40"
     // promise on the default range.
     // ------------------------------------------------------------------
 
     [Test]
     public async Task FirstProbeIsMidpointOfRange()
     {
-        // Default [8, 55] — the upper-biased midpoint should land on 32.
+        // Default [25, 55] — the upper-biased midpoint lands on 40.
         List<int> probes = [];
         await CqBinarySearch.FindHighestPassingAsync(
-            minCq: 8, maxCq: 55, probe: Threshold(threshold: 24, log: probes));
-        Assert.That(probes[0], Is.EqualTo(32),
-            "Default [8, 55] range must start probing at CQ=32 (the search midpoint).");
+            minCq: 25, maxCq: 55, probe: Threshold(threshold: 39, log: probes));
+        Assert.That(probes[0], Is.EqualTo(40),
+            "Default [25, 55] range must start probing at CQ=40 (the search midpoint).");
     }
 
     [Test]
@@ -84,14 +84,17 @@ public class CqBinarySearchTests
     [Test]
     public async Task ProbeCountIsLogarithmic()
     {
-        // [8, 55] is a span of 48 values; log2(48) ≈ 5.58 → at most 6 probes.
-        for (int threshold = 8; threshold <= 55; threshold++)
+        // [25, 55] is a span of 31 values; ceil(log2(32)) = 5 → at most 5 probes.
+        // This bound is load-bearing: shrinking the search budget from 6 → 5
+        // probes was a deliberate Phase 2 wall-time cut, so a regression that
+        // pushed a search to 6 probes would silently cost ~20% per file.
+        for (int threshold = 25; threshold <= 55; threshold++)
         {
             List<int> probes = [];
             await CqBinarySearch.FindHighestPassingAsync(
-                minCq: 8, maxCq: 55, probe: Threshold(threshold, probes));
-            Assert.That(probes.Count, Is.LessThanOrEqualTo(6),
-                $"threshold={threshold}: expected ≤6 probes, got {probes.Count} ({string.Join(",", probes)})");
+                minCq: 25, maxCq: 55, probe: Threshold(threshold, probes));
+            Assert.That(probes.Count, Is.LessThanOrEqualTo(5),
+                $"threshold={threshold}: expected ≤5 probes, got {probes.Count} ({string.Join(",", probes)})");
         }
     }
 
@@ -102,11 +105,11 @@ public class CqBinarySearchTests
     [Test]
     public async Task NoCqIsProbedTwice()
     {
-        for (int threshold = 8; threshold <= 55; threshold++)
+        for (int threshold = 25; threshold <= 55; threshold++)
         {
             List<int> probes = [];
             await CqBinarySearch.FindHighestPassingAsync(
-                minCq: 8, maxCq: 55, probe: Threshold(threshold, probes));
+                minCq: 25, maxCq: 55, probe: Threshold(threshold, probes));
             Assert.That(probes.Distinct().Count(), Is.EqualTo(probes.Count),
                 $"threshold={threshold}: duplicate probe in {string.Join(",", probes)}");
         }
@@ -158,6 +161,6 @@ public class CqBinarySearchTests
         cts.Cancel();
         Assert.ThrowsAsync<OperationCanceledException>(async () =>
             await CqBinarySearch.FindHighestPassingAsync(
-                minCq: 8, maxCq: 55, probe: _ => Task.FromResult(true), ct: cts.Token));
+                minCq: 25, maxCq: 55, probe: _ => Task.FromResult(true), ct: cts.Token));
     }
 }

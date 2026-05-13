@@ -41,7 +41,10 @@ public static class VmafTuner
         FfprobeRoot probe = await Ffprobe.RunAsync(cfg, input, ct);
         double dur = probe.Format?.DurationSeconds ?? throw new InvalidOperationException("No duration.");
 
-        ValidateSearchRange(cfg);
+        // Resolution-tiered CQ range — first probe lands near where the
+        // answer cluster sits for this resolution class.  See Config.ResolveCqRange.
+        (int minCq, int maxCq, string cqTier) = cfg.ResolveCqRange(vstream.Width, vstream.Height);
+        ValidateSearchRange(minCq, maxCq);
 
         Sampler sampler = new(cfg.RandomSeed);
         List<SampleWindow> windows = sampler.StratifiedRandomWindows(dur, cfg.SampleCount, cfg.SampleWindowSeconds);
@@ -136,7 +139,7 @@ public static class VmafTuner
         // =======================================================
         Stopwatch phase2Sw = Stopwatch.StartNew();
         int probeCount = 0;
-        int expectedProbes = (int)Math.Ceiling(Math.Log2(cfg.MaxCq - cfg.MinCq + 2));
+        int expectedProbes = (int)Math.Ceiling(Math.Log2(maxCq - minCq + 2));
         List<CqAggregate> cqResults = [];
         // Probe order trajectory — CQ tried at each step and its pass/fail
         // verdict.  Logged at Phase 2 end so the decisions.log shows the
@@ -144,11 +147,11 @@ public static class VmafTuner
         List<(int Cq, bool Pass)> trajectory = [];
 
         logger.LogInfo(
-            $"Phase 2: binary search CQ in [{cfg.MinCq}..{cfg.MaxCq}] " +
+            $"Phase 2: binary search CQ in [{minCq}..{maxCq}] (tier: {cqTier}) " +
             $"(≤{expectedProbes} probes).");
 
         int? bestPassingCq = await CqBinarySearch.FindHighestPassingAsync(
-            cfg.MinCq, cfg.MaxCq,
+            minCq, maxCq,
             async cq =>
             {
                 probeCount++;
@@ -204,8 +207,8 @@ public static class VmafTuner
             SampleWindows = windows,
             CqResults = cqResults,
             Selection = selection,
-            SearchMinCq = cfg.MinCq,
-            SearchMaxCq = cfg.MaxCq,
+            SearchMinCq = minCq,
+            SearchMaxCq = maxCq,
             Phase1Elapsed = phase1Sw.Elapsed,
             Phase2Elapsed = phase2Sw.Elapsed,
         };
@@ -282,15 +285,17 @@ public static class VmafTuner
     /// <summary>
     /// Catch obviously-bad search ranges before kicking off Phase 1.  All
     /// of these would otherwise produce confusing late failures (or, worse,
-    /// silently undefined behavior in the binary search loop).
+    /// silently undefined behavior in the binary search loop).  Validates
+    /// the resolved tier range (not every configured tier) so a bad tier
+    /// only fails when content of that resolution actually runs.
     /// </summary>
-    private static void ValidateSearchRange(Config cfg)
+    private static void ValidateSearchRange(int minCq, int maxCq)
     {
-        if (cfg.MinCq < 0 || cfg.MinCq > 63)
-            throw new InvalidOperationException($"Config.MinCq={cfg.MinCq} is out of range [0..63] (NVENC AV1).");
-        if (cfg.MaxCq < 0 || cfg.MaxCq > 63)
-            throw new InvalidOperationException($"Config.MaxCq={cfg.MaxCq} is out of range [0..63] (NVENC AV1).");
-        if (cfg.MinCq > cfg.MaxCq)
-            throw new InvalidOperationException($"Config.MinCq={cfg.MinCq} > MaxCq={cfg.MaxCq}.");
+        if (minCq < 0 || minCq > 63)
+            throw new InvalidOperationException($"Resolved MinCq={minCq} is out of range [0..63] (NVENC AV1).");
+        if (maxCq < 0 || maxCq > 63)
+            throw new InvalidOperationException($"Resolved MaxCq={maxCq} is out of range [0..63] (NVENC AV1).");
+        if (minCq > maxCq)
+            throw new InvalidOperationException($"Resolved MinCq={minCq} > MaxCq={maxCq}.");
     }
 }

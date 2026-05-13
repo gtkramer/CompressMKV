@@ -25,8 +25,8 @@ public static class CqBinarySearch
     /// Returns the highest CQ in <c>[minCq, maxCq]</c> for which
     /// <paramref name="probe"/> returned true, or <c>null</c> if no probe
     /// passed.  The +1 bias in the mid formula starts the search at the
-    /// upper midpoint of the range — for the default <c>[8, 55]</c>, the
-    /// first probe is CQ=32.
+    /// upper midpoint of the range — for the default <c>[25, 55]</c>, the
+    /// first probe is CQ=40.
     /// </summary>
     public static async Task<int?> FindHighestPassingAsync(
         int minCq, int maxCq,
