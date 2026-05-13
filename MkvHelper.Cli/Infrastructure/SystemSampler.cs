@@ -39,10 +39,36 @@ public sealed class SystemSampler : IAsyncDisposable
     // Previous /proc/stat first-line counters; null on the first tick.
     private (ulong Total, ulong Idle)? _prevCpu;
 
+    // Streaming accumulator over every tick.  Read at run-end via Summarize()
+    // to compare what the pool *thought* it was scheduling against what the
+    // hardware actually did.  Kept as running sums + counts so memory cost is
+    // O(1) regardless of run length.
+    private readonly Lock _statLock = new();
+    private long _sampleCount;
+    private long _cpuFreeSum, _nvencFreeSum, _nvdecFreeSum, _cudaFreeSum;
+    private int _cpuFreeMin, _nvencFreeMin, _nvdecFreeMin, _cudaFreeMin;
+    private double _cpuPctSum;
+    private double _cpuPctMax;
+    private long _gpuPctCount;
+    private double _gpuPctSum;
+    private int _gpuPctMax;
+    private long _memPctCount;
+    private double _memPctSum;
+    private long _vramMbCount;
+    private double _vramMbSum;
+    private int _vramMbMax;
+    private long _nvencSessCount;
+    private double _nvencSessSum;
+    private int _nvencSessMax;
+
     public SystemSampler(ResourcePool pool, TimeSpan interval, CancellationToken parent)
     {
         _pool = pool;
         _interval = interval;
+        _cpuFreeMin = pool.CpuTotal;
+        _nvencFreeMin = pool.NvencTotal;
+        _nvdecFreeMin = pool.NvdecTotal;
+        _cudaFreeMin = pool.CudaTotal;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(parent);
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
@@ -74,10 +100,111 @@ public sealed class SystemSampler : IAsyncDisposable
         (double cpuPct, double load1m) = ReadCpuUsage();
         GpuStats gpu = await ReadGpuStatsAsync(ct);
 
+        Accumulate(pool, cpuPct, gpu);
+
         Log.Logger.Information(
             "System util sample: pool {@Pool}; cpu {CpuPct:F1}% (load1m {Load1m:F2}); " +
             "gpu {@Gpu}",
             pool, cpuPct, load1m, gpu);
+    }
+
+    private void Accumulate(PoolSnapshot pool, double cpuPct, GpuStats gpu)
+    {
+        lock (_statLock)
+        {
+            _sampleCount++;
+            _cpuFreeSum   += pool.Cpu;
+            _nvencFreeSum += pool.Nvenc;
+            _nvdecFreeSum += pool.Nvdec;
+            _cudaFreeSum  += pool.Cuda;
+            if (pool.Cpu   < _cpuFreeMin)   _cpuFreeMin   = pool.Cpu;
+            if (pool.Nvenc < _nvencFreeMin) _nvencFreeMin = pool.Nvenc;
+            if (pool.Nvdec < _nvdecFreeMin) _nvdecFreeMin = pool.Nvdec;
+            if (pool.Cuda  < _cudaFreeMin)  _cudaFreeMin  = pool.Cuda;
+
+            _cpuPctSum += cpuPct;
+            if (cpuPct > _cpuPctMax) _cpuPctMax = cpuPct;
+
+            if (gpu.GpuUtilPct is { } g)
+            {
+                _gpuPctCount++;
+                _gpuPctSum += g;
+                if (g > _gpuPctMax) _gpuPctMax = g;
+            }
+            if (gpu.MemoryUtilPct is { } m)
+            {
+                _memPctCount++;
+                _memPctSum += m;
+            }
+            if (gpu.VramMbUsed is { } v)
+            {
+                _vramMbCount++;
+                _vramMbSum += v;
+                if (v > _vramMbMax) _vramMbMax = v;
+            }
+            if (gpu.NvencSessionCount is { } n)
+            {
+                _nvencSessCount++;
+                _nvencSessSum += n;
+                if (n > _nvencSessMax) _nvencSessMax = n;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Snapshot the accumulator and return per-pool declared-busy% next to the
+    /// real CPU/GPU/NVENC-session figures.  Safe to call at any time; the
+    /// caller decides when to render it (typically at run end before
+    /// <see cref="DisposeAsync"/>).
+    /// </summary>
+    public SystemSamplerSummary Summarize()
+    {
+        int cpuTotal   = _pool.CpuTotal;
+        int nvencTotal = _pool.NvencTotal;
+        int nvdecTotal = _pool.NvdecTotal;
+        int cudaTotal  = _pool.CudaTotal;
+
+        lock (_statLock)
+        {
+            if (_sampleCount == 0) return SystemSamplerSummary.Empty;
+
+            double cpuFreeAvg   = (double)_cpuFreeSum   / _sampleCount;
+            double nvencFreeAvg = (double)_nvencFreeSum / _sampleCount;
+            double nvdecFreeAvg = (double)_nvdecFreeSum / _sampleCount;
+            double cudaFreeAvg  = (double)_cudaFreeSum  / _sampleCount;
+
+            double cpuBusyPct   = cpuTotal   > 0 ? 100.0 * (cpuTotal   - cpuFreeAvg)   / cpuTotal   : 0;
+            double nvencBusyPct = nvencTotal > 0 ? 100.0 * (nvencTotal - nvencFreeAvg) / nvencTotal : 0;
+            double nvdecBusyPct = nvdecTotal > 0 ? 100.0 * (nvdecTotal - nvdecFreeAvg) / nvdecTotal : 0;
+            double cudaBusyPct  = cudaTotal  > 0 ? 100.0 * (cudaTotal  - cudaFreeAvg)  / cudaTotal  : 0;
+
+            double cpuPctAvg = _cpuPctSum / _sampleCount;
+            double? gpuPctAvg     = _gpuPctCount    > 0 ? _gpuPctSum    / _gpuPctCount    : null;
+            double? memPctAvg     = _memPctCount    > 0 ? _memPctSum    / _memPctCount    : null;
+            double? vramMbAvg     = _vramMbCount    > 0 ? _vramMbSum    / _vramMbCount    : null;
+            double? nvencSessAvg  = _nvencSessCount > 0 ? _nvencSessSum / _nvencSessCount : null;
+
+            return new SystemSamplerSummary(
+                _sampleCount,
+                cpuTotal, nvencTotal, nvdecTotal, cudaTotal,
+                CpuBusyPct:   cpuBusyPct,
+                NvencBusyPct: nvencBusyPct,
+                NvdecBusyPct: nvdecBusyPct,
+                CudaBusyPct:  cudaBusyPct,
+                CpuFreeMin:   _cpuFreeMin,
+                NvencFreeMin: _nvencFreeMin,
+                NvdecFreeMin: _nvdecFreeMin,
+                CudaFreeMin:  _cudaFreeMin,
+                CpuPctAvg: cpuPctAvg,
+                CpuPctMax: _cpuPctMax,
+                GpuPctAvg: gpuPctAvg,
+                GpuPctMax: _gpuPctCount > 0 ? _gpuPctMax : null,
+                MemoryPctAvg: memPctAvg,
+                VramMbAvg: vramMbAvg,
+                VramMbMax: _vramMbCount > 0 ? _vramMbMax : null,
+                NvencSessionAvg: nvencSessAvg,
+                NvencSessionMax: _nvencSessCount > 0 ? _nvencSessMax : null);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -217,4 +344,39 @@ public readonly record struct GpuStats(
     int? NvencSessionCount)
 {
     public static GpuStats Empty => new(null, null, null, null);
+}
+
+/// <summary>
+/// Run-end aggregate of <see cref="SystemSampler"/> ticks, paired up against
+/// the pool's declared capacities so a reader can see whether the pool was
+/// over- or under-subscribed relative to what the hardware actually did.
+///
+/// Each <c>*BusyPct</c> is the time-weighted fraction of pool slots that were
+/// in-use (averaged across ticks); each *PctAvg is the matching real-hardware
+/// number from <c>/proc/stat</c> or nvidia-smi.  A divergence of "pool 90%
+/// busy / hardware 5% busy" is the textbook signature of a pool whose slot
+/// count is too tight — the pool is queueing work that the silicon could
+/// have absorbed.
+/// </summary>
+public sealed record class SystemSamplerSummary(
+    long SampleCount,
+    int CpuTotal, int NvencTotal, int NvdecTotal, int CudaTotal,
+    double CpuBusyPct, double NvencBusyPct, double NvdecBusyPct, double CudaBusyPct,
+    int CpuFreeMin, int NvencFreeMin, int NvdecFreeMin, int CudaFreeMin,
+    double CpuPctAvg, double CpuPctMax,
+    double? GpuPctAvg, int? GpuPctMax,
+    double? MemoryPctAvg,
+    double? VramMbAvg, int? VramMbMax,
+    double? NvencSessionAvg, int? NvencSessionMax)
+{
+    public static SystemSamplerSummary Empty { get; } = new(
+        SampleCount: 0,
+        CpuTotal: 0, NvencTotal: 0, NvdecTotal: 0, CudaTotal: 0,
+        CpuBusyPct: 0, NvencBusyPct: 0, NvdecBusyPct: 0, CudaBusyPct: 0,
+        CpuFreeMin: 0, NvencFreeMin: 0, NvdecFreeMin: 0, CudaFreeMin: 0,
+        CpuPctAvg: 0, CpuPctMax: 0,
+        GpuPctAvg: null, GpuPctMax: null,
+        MemoryPctAvg: null,
+        VramMbAvg: null, VramMbMax: null,
+        NvencSessionAvg: null, NvencSessionMax: null);
 }

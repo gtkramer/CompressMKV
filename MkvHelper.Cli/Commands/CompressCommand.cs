@@ -128,6 +128,12 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         try { await workTask; }
         catch (OperationCanceledException) { /* user-initiated */ }
 
+        // Snapshot the sampler BEFORE disposing so the run summary has the
+        // pool-vs-hardware comparison even on graceful shutdown.  The sampler's
+        // accumulator is safe to read concurrently, but we wait for the work
+        // task to settle first to get a stable end-of-run view.
+        SystemSamplerSummary? samplerSummary = sampler?.Summarize();
+        overall.SamplerSummary = samplerSummary;
         if (sampler is not null) await sampler.DisposeAsync();
 
         DateTime finishedUtc = DateTime.UtcNow;
@@ -136,9 +142,11 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         await JsonIO.WriteAsync(overallPath, overall, cts.Token);
 
         Serilog.Log.Logger.Information(
-            "Run end: completed={Completed}, errors={Errors}, duration={DurationS:F1}s",
+            "Run end: completed={Completed}, errors={Errors}, duration={DurationS:F1}s; " +
+            "sampler={@Sampler}",
             overall.Videos.Count - overall.Errors.Count, overall.Errors.Count,
-            (finishedUtc - overall.StartedUtc).TotalSeconds);
+            (finishedUtc - overall.StartedUtc).TotalSeconds,
+            samplerSummary);
         await Serilog.Log.CloseAndFlushAsync();
 
         AnsiConsole.WriteLine();
@@ -154,9 +162,69 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         int passthroughCount = overall.Videos.Count(v => v.SizeGuard?.FellBack == true);
         if (passthroughCount > 0)
             AnsiConsole.MarkupLine($"  [yellow]Passthrough fallback:[/] {passthroughCount} (source already efficiently compressed)");
+
+        RenderSamplerSummary(samplerSummary);
+
         AnsiConsole.MarkupLine($"  [grey]Wrote {overallPath}[/]");
 
         return overall.Errors.Count == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Side-by-side render of pool declared-busy% next to the real CPU/GPU/
+    /// NVENC numbers, plus a one-line hint when a pool is ≥ 75% busy while
+    /// the hardware proxy says ≤ 30% — the textbook "raise the slot count"
+    /// signal.  Heuristic, not authoritative: a single hint can be wrong
+    /// (e.g. on very short runs with too few samples), so we mark it as
+    /// "consider" rather than "do".
+    /// </summary>
+    private static void RenderSamplerSummary(SystemSamplerSummary? s)
+    {
+        if (s is null || s.SampleCount == 0) return;
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"  [bold]Pool vs hardware[/] [grey](averaged over {s.SampleCount} samples)[/]");
+
+        // Each line: declared pool busy% next to the closest real-hardware
+        // proxy.  GPU% is the same proxy for NVDEC and CUDA — nvidia-smi
+        // doesn't break out decode/compute, and that's fine for the
+        // over/under-subscription signal we're looking for.
+        AnsiConsole.MarkupLine(
+            $"    [grey]CPU   [/] pool [yellow]{s.CpuBusyPct,5:F1}%[/] busy / actual CPU [cyan]{s.CpuPctAvg,5:F1}%[/] avg, peak {s.CpuPctMax:F0}%");
+
+        string nvencActual = s.NvencSessionAvg is { } na
+            ? $"NVENC sessions [cyan]{na:F1}[/] avg of {s.NvencTotal} declared (peak {s.NvencSessionMax})"
+            : "[grey]NVENC sessions n/a[/]";
+        AnsiConsole.MarkupLine(
+            $"    [grey]NVENC [/] pool [yellow]{s.NvencBusyPct,5:F1}%[/] busy / {nvencActual}");
+
+        string gpuActualNvdec = s.GpuPctAvg is { } g1
+            ? $"GPU compute [cyan]{g1,5:F1}%[/] avg, peak {s.GpuPctMax}%"
+            : "[grey]GPU compute n/a[/]";
+        AnsiConsole.MarkupLine(
+            $"    [grey]NVDEC [/] pool [yellow]{s.NvdecBusyPct,5:F1}%[/] busy / {gpuActualNvdec}");
+
+        string gpuActualCuda = s.GpuPctAvg is { } g2
+            ? $"GPU compute [cyan]{g2,5:F1}%[/] avg, peak {s.GpuPctMax}%"
+            : "[grey]GPU compute n/a[/]";
+        AnsiConsole.MarkupLine(
+            $"    [grey]CUDA  [/] pool [yellow]{s.CudaBusyPct,5:F1}%[/] busy / {gpuActualCuda}");
+
+        // Hints — pool ≥ 75% busy but the hardware proxy says ≤ 30%.
+        List<string> hints = [];
+        const double BusyThreshold = 75.0;
+        const double IdleThreshold = 30.0;
+        if (s.CpuBusyPct >= BusyThreshold && s.CpuPctAvg <= IdleThreshold)
+            hints.Add($"CPU pool {s.CpuBusyPct:F0}% busy but actual CPU only {s.CpuPctAvg:F0}% — declared thread costs may be inflated.");
+        if (s.NvencBusyPct >= BusyThreshold && s.NvencSessionAvg is { } nv && s.NvencTotal > 0 && nv / s.NvencTotal * 100 <= IdleThreshold)
+            hints.Add($"NVENC pool {s.NvencBusyPct:F0}% busy but only {nv:F1} of {s.NvencTotal} sessions used on average — consider raising NvencSlots.");
+        if (s.NvdecBusyPct >= BusyThreshold && s.GpuPctAvg is { } gd && gd <= IdleThreshold)
+            hints.Add($"NVDEC pool {s.NvdecBusyPct:F0}% busy but GPU only {gd:F1}% — consider raising NvdecSlots.");
+        if (s.CudaBusyPct >= BusyThreshold && s.GpuPctAvg is { } gc && gc <= IdleThreshold)
+            hints.Add($"CUDA pool {s.CudaBusyPct:F0}% busy but GPU only {gc:F1}% — consider raising CudaSlots.");
+
+        foreach (string h in hints)
+            AnsiConsole.MarkupLine($"    [yellow]Hint:[/] {Markup.Escape(h)}");
     }
 
     // ----------------------------------------------------------------
@@ -340,6 +408,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         ContentDetectionResult detection;
         AcquireResult detectAdmit = await pool.AcquireAnyAsync(
             cfg.DetectionAlternatives, ct, file: id, op: "detection");
+        Stopwatch detectHold = Stopwatch.StartNew();
         using (detectAdmit.Lease)
         {
             bool useHwaccel = detectAdmit.Granted.Nvdec > 0;
@@ -349,6 +418,10 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 $"pool now {FormatPool(detectAdmit.PoolAfter, pool)}");
             detection = await ContentDetector.DetectAsync(cfg, input, vstream, useHwaccel, ct, logger);
         }
+        detectHold.Stop();
+        logger.LogInfo(
+            $"Detection released: held resources for {detectHold.Elapsed.TotalSeconds:F1}s " +
+            $"(wait was {detectAdmit.WaitMs}ms).");
         timings.Detection = sw.Elapsed;
 
         RestoreDecision restore = RestoreStrategyMapper.MapToRestore(detection);
@@ -388,6 +461,7 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         OutputVerificationResult verification;
         AcquireResult verifyAdmit = await pool.AcquireAnyAsync(
             cfg.VerificationAlternatives, ct, file: id, op: "verification");
+        Stopwatch verifyHold = Stopwatch.StartNew();
         using (verifyAdmit.Lease)
         {
             bool useHwaccel = verifyAdmit.Granted.Nvdec > 0;
@@ -397,6 +471,10 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
                 $"pool now {FormatPool(verifyAdmit.PoolAfter, pool)}");
             verification = await OutputVerifier.VerifyAsync(cfg, finalOut, restore, useHwaccel, ct, logger);
         }
+        verifyHold.Stop();
+        logger.LogInfo(
+            $"Verification released: held resources for {verifyHold.Elapsed.TotalSeconds:F1}s " +
+            $"(wait was {verifyAdmit.WaitMs}ms).");
         timings.Verification = sw.Elapsed;
         timings.Total = totalSw.Elapsed;
 

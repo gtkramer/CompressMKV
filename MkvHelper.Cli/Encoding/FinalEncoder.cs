@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace MkvHelper;
 
 /// <summary>
@@ -23,6 +25,7 @@ public static class FinalEncoder
 
         ResourceRequest request = cfg.FinalEncodeRequestFor(restore);
         IDisposable lease = await pool.AcquireAsync(request, ct, file: logger.VideoId, op: "final-encode");
+        Stopwatch holdSw = Stopwatch.StartNew();
         using (lease)
         {
             logger.LogInfo(
@@ -31,5 +34,7 @@ public static class FinalEncoder
             await Pipelines.EncodeFullNvencAsync(
                 cfg, input, output, restore, cq, format, request.Cpu, ct, logger);
         }
+        holdSw.Stop();
+        logger.LogInfo($"Final encode released: held resources for {holdSw.Elapsed.TotalSeconds:F1}s.");
     }
 }

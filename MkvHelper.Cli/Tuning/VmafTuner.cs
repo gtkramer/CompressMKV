@@ -93,21 +93,27 @@ public static class VmafTuner
         IReadOnlyList<ResourceRequest> refExtractAlternatives = cfg.RefExtractAlternativesFor(restore);
         // Phase 1 fires 16+ acquires per file in tight parallelism.  Per-acquire
         // logging would flood the per-file decisions.log, so we accumulate
-        // wait stats here and emit one summary at phase end.  The structured
-        // events.jsonl still has every individual acquire/release.
+        // wait + hold stats here and emit one summary at phase end.  The
+        // structured events.jsonl still has every individual acquire/release.
+        // Hold-time is release-minus-acquire wall time around the ffmpeg call,
+        // which is what answers "how long did each op actually keep its
+        // resources" — the missing half of the queue-wait picture.
         int[] refWaitMs = new int[windows.Count];
+        int[] refHoldMs = new int[windows.Count];
         Task[] refTasks = windows.Select(async (w, i) =>
         {
             string refPath = Path.Combine(refsDir, $"ref_s{i:00}.mkv");
             AcquireResult admit = await pool.AcquireAnyAsync(
                 refExtractAlternatives, ct, file: logger.VideoId, op: "phase1.ref-extract");
             refWaitMs[i] = admit.WaitMs;
+            Stopwatch holdSw = Stopwatch.StartNew();
             using (admit.Lease)
             {
                 bool useHwaccel = admit.Granted.Nvdec > 0;
                 await Pipelines.ExtractReferenceClipAsync(
                     cfg, input, refPath, w, restore, vstream, useHwaccel, admit.Granted.Cpu, ct);
             }
+            refHoldMs[i] = (int)holdSw.ElapsedMilliseconds;
             refClips[i] = refPath;
             int done = Interlocked.Increment(ref extractedCount);
             logger.SetStage("Phase 1", $"extracted {done}/{windows.Count} refs");
@@ -117,9 +123,13 @@ public static class VmafTuner
         phase1Sw.Stop();
         int p1MaxWait = refWaitMs.Length > 0 ? refWaitMs.Max() : 0;
         double p1AvgWait = refWaitMs.Length > 0 ? refWaitMs.Average() : 0;
+        int p1MaxHold = refHoldMs.Length > 0 ? refHoldMs.Max() : 0;
+        double p1AvgHold = refHoldMs.Length > 0 ? refHoldMs.Average() : 0;
+        long p1SumHold = refHoldMs.Sum();
         logger.LogInfo(
             $"Phase 1 complete in {phase1Sw.Elapsed.TotalSeconds:F1}s " +
-            $"({refWaitMs.Length} acquires; pool wait avg {p1AvgWait:F0}ms, max {p1MaxWait}ms).");
+            $"({refWaitMs.Length} acquires; pool wait avg {p1AvgWait:F0}ms, max {p1MaxWait}ms; " +
+            $"op runtime avg {p1AvgHold / 1000:F1}s, max {p1MaxHold / 1000:F1}s, total {p1SumHold / 1000:F1}s).");
 
         // =======================================================
         //  Phase 2: Binary search the [MinCq, MaxCq] integer range
@@ -227,12 +237,17 @@ public static class VmafTuner
         int cq, IPipelineLogger logger, CancellationToken ct)
     {
         int doneSamples = 0;
-        // Per-probe pool wait accumulation (per window).  Aggregated into a
-        // probe summary at the bottom — individual acquires still emit their
-        // own structured events into events.jsonl.
+        // Per-probe wait + hold accumulators (one slot per window).  Aggregated
+        // into a probe summary at the bottom — individual acquires still emit
+        // their own structured events into events.jsonl.  Holds are wall-clock
+        // around the ffmpeg call, so they double as the per-op runtime that
+        // decomposes the probe's total time into encode vs vmaf vs queueing.
         int[] sampleWaitMs = new int[windows.Count];
+        int[] sampleHoldMs = new int[windows.Count];
         int[] vmafWaitMs   = new int[windows.Count];
+        int[] vmafHoldMs   = new int[windows.Count];
 
+        Stopwatch probeWall = Stopwatch.StartNew();
         Task<SampleMetric>[] sampleTasks = Enumerable.Range(0, windows.Count).Select(async i =>
         {
             string refClip = refClips[i];
@@ -246,8 +261,10 @@ public static class VmafTuner
                 [cfg.SampleEncodeRequest], ct,
                 file: logger.VideoId, op: $"phase2.sample-encode.cq{cq}");
             sampleWaitMs[i] = sampleAdmit.WaitMs;
+            Stopwatch sampleHoldSw = Stopwatch.StartNew();
             using (sampleAdmit.Lease)
                 await Pipelines.EncodeSampleFromRefAsync(cfg, refClip, encPath, cq, format, ct);
+            sampleHoldMs[i] = (int)sampleHoldSw.ElapsedMilliseconds;
 
             // 2. VMAF — declares CPU (for FFV1+AV1 decode + zscale/tonemap on
             //    HDR + format conversion) and one CUDA lane.  See
@@ -256,8 +273,10 @@ public static class VmafTuner
                 [cfg.VmafRequest], ct,
                 file: logger.VideoId, op: $"phase2.vmaf.cq{cq}");
             vmafWaitMs[i] = vmafAdmit.WaitMs;
+            Stopwatch vmafHoldSw = Stopwatch.StartNew();
             using (vmafAdmit.Lease)
                 await Pipelines.RunVmafDirectAsync(cfg, refClip, encPath, isHdr, hdrMetadata, format, vmafLog, vmafModelVersion, ct);
+            vmafHoldMs[i] = (int)vmafHoldSw.ElapsedMilliseconds;
 
             VmafResult vmafResult = await Vmaf.ParseAsync(vmafLog, ct);
             int done = Interlocked.Increment(ref doneSamples);
@@ -276,10 +295,42 @@ public static class VmafTuner
         }).ToArray();
 
         List<SampleMetric> metrics = (await Task.WhenAll(sampleTasks)).ToList();
+        probeWall.Stop();
+
+        long sampleWaitTotal = sampleWaitMs.Sum(x => (long)x);
+        long vmafWaitTotal   = vmafWaitMs.Sum(x => (long)x);
+        long sampleHoldTotal = sampleHoldMs.Sum(x => (long)x);
+        long vmafHoldTotal   = vmafHoldMs.Sum(x => (long)x);
+
         logger.LogInfo(
             $"  CQ={cq} pool waits: sample-encode avg {sampleWaitMs.Average():F0}ms / " +
             $"max {sampleWaitMs.Max()}ms; vmaf avg {vmafWaitMs.Average():F0}ms / max {vmafWaitMs.Max()}ms.");
+        logger.LogInfo(
+            $"  CQ={cq} op runtime (sum across {windows.Count} samples): " +
+            $"sample-encode {FormatDuration(sampleHoldTotal)} (avg {FormatDuration(sampleHoldTotal / windows.Count)}, " +
+            $"max {FormatDuration(sampleHoldMs.Max())}); " +
+            $"vmaf {FormatDuration(vmafHoldTotal)} (avg {FormatDuration(vmafHoldTotal / windows.Count)}, " +
+            $"max {FormatDuration(vmafHoldMs.Max())}).");
+        logger.LogInfo(
+            $"  CQ={cq} probe breakdown: walltime {FormatDuration((long)probeWall.Elapsed.TotalMilliseconds)} " +
+            $"= encode-runtime sum {FormatDuration(sampleHoldTotal)} " +
+            $"+ vmaf-runtime sum {FormatDuration(vmafHoldTotal)} " +
+            $"+ queue-wait sum {FormatDuration(sampleWaitTotal + vmafWaitTotal)} " +
+            $"(encode {FormatDuration(sampleWaitTotal)}, vmaf {FormatDuration(vmafWaitTotal)}); " +
+            $"sums exceed walltime when ops overlap across pool slots.");
         return CqAggregate.From(cq, metrics);
+    }
+
+    /// <summary>
+    /// Compact duration formatter for the probe-breakdown line — short ops in
+    /// seconds, long sums in m:ss.  Keeps the decomposition readable without
+    /// dragging in a unit-conversion helper from elsewhere.
+    /// </summary>
+    private static string FormatDuration(long ms)
+    {
+        if (ms < 60_000) return $"{ms / 1000.0:F1}s";
+        long totalSec = ms / 1000;
+        return $"{totalSec / 60}m{totalSec % 60:D2}s";
     }
 
     /// <summary>
