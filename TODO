@@ -1,0 +1,14 @@
+Review logs, prove that the program is making the right decisions, identify logging gaps if we can't tell for sure.
+Marginal passes on CQ, what are they, are they needed?  If we have a marginal pass, maybe we blindly add +1 to the CQ for preferring quality?
+Review steps that toggle between CPU and GPU, and if we're doing the right work on the right hardware to minimize overall time, not taking on too much extra cost for this flexibility to maximize hardware utilization that increases the overall time to compress too much.
+Review the VMAF process and the tolerances here, how close to the source material quality are we?  What do my tolerances here actually mean and permit for source material degredation after compression?
+Review the binary search process, are we doing this well?  Is this performing in a way that is repeatable?  This ties into how we handle VMAF.
+Review C# source file organization again
+Review sampling strategy, consider splitting long videos into multiple files, each gets their own CQ, and then merge, to better tune for the entire move
+Remove dead code
+What happens to HDR metadata?  Is it preserved during re-encoding?  I have content in both HDR10 and Dolby Vision.  How does this translate to a movie that gets compressed?  How well is our overall HDR handling strategy?
+Review threading/async implementation, not blocking unnecessarily
+
+HDR content waits for tonemapping from the CPU to finish, need tonemap_opencl + vulkan to do this
+
+README commands mentioned in multiple places--deduplicte
