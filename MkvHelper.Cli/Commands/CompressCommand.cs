@@ -403,8 +403,8 @@ public sealed class CompressCommand : AsyncCommand<CompressSettings>
         }
 
         logger.LogInfo(isHdr
-            ? "VMAF execution: GPU (libvmaf_cuda); HDR tonemap chain on CPU"
-            : "VMAF execution: GPU (libvmaf_cuda)");
+            ? "VMAF execution: GPU (libvmaf_cuda); AV1 sample decode on NVDEC; HDR tonemap chain on CPU"
+            : "VMAF execution: GPU (libvmaf_cuda); AV1 sample decode on NVDEC");
 
         TuningResult tuning = await VmafTuner.TuneAsync(cfg, pool, input, outDir, restore,
             isHdr, hdrMetadata, pipelineFormat, vmafModelVersion, vstream, ct, logger);

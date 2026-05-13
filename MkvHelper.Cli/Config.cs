@@ -105,13 +105,14 @@ public sealed class Config
     public int SampleEncodeThreads { get; set; } = 2;
 
     /// <summary>
-    /// CPU threads for one Phase 2 VMAF measurement.  The process runs two
-    /// CPU decoders (FFV1 ref + AV1 sample) plus the filtergraph (zscale /
-    /// tonemap on HDR, format conversion, hwupload_cuda); libvmaf_cuda itself
-    /// is GPU-bound and consumes no CPU.  4 = 1 thread per input decoder
-    /// (×2 inputs) + 2 filter threads, matching the pins below.
+    /// CPU threads for one Phase 2 VMAF measurement.  The process runs one
+    /// CPU decoder (FFV1 ref; AV1 sample is on NVDEC and its parser thread
+    /// is effectively free) plus the filtergraph (zscale / tonemap on HDR,
+    /// format conversion, hwupload_cuda); libvmaf_cuda itself is GPU-bound
+    /// and consumes no CPU.  3 = 1 thread for the FFV1 decoder + 2 filter
+    /// threads, matching the pins below.
     /// </summary>
-    public int VmafThreads { get; set; } = 4;
+    public int VmafThreads { get; set; } = 3;
 
     /// <summary>
     /// `-threads` value passed to ffmpeg for VMAF ops, applied as the default
@@ -148,12 +149,21 @@ public sealed class Config
     // --- ResourceRequest factories (one per operation) ---
     //
     // Phases listed as *Alternatives expose both a CPU-only and a GPU-decode
-    // shape; ResourcePool.AcquireAnyAsync picks the first that fits.  CPU
-    // path is listed first so it's preferred when both are free — that keeps
-    // NVDEC engines available for the final encode pipeline, which always
-    // needs them.  When the CPU pool is saturated (typically at the start
-    // of a batch where every file wants Detection at once), the GPU path
-    // is granted instead so files don't sit idle waiting for CPU.
+    // shape; ResourcePool.AcquireAnyAsync picks the first that fits.  Each
+    // phase picks its preferred ordering based on which resource is the
+    // scarce one in practice:
+    //
+    //   Detection / Verification — NVDEC-first.  These are long-running
+    //     full-file decode passes (10–18 min per file).  NVDEC sits idle
+    //     when the batch starts (Phase 2 hasn't begun anywhere); preferring
+    //     it lets two files do detection on the GPU simultaneously while
+    //     leaving the entire CPU pool for the contended Phase 1 / Phase 2
+    //     work on already-detected files.  Falls back to CPU once both
+    //     NVDEC engines are busy.
+    //
+    //   RefExtract — CPU-first.  Short ops (seconds per clip); CPU has more
+    //     concurrency headroom than NVDEC's 2 engines.  Falling back to
+    //     NVDEC kicks in only when the CPU pool is exhausted by VMAFs.
     //
     // Alternatives lists are cached after first read so AcquireAnyAsync
     // doesn't re-allocate the 2-element collection on every acquire.
@@ -162,8 +172,8 @@ public sealed class Config
     public IReadOnlyList<ResourceRequest> DetectionAlternatives =>
         _detectionAlternatives ??=
         [
-            new(Cpu: DetectionCpuThreads),
             new(Cpu: DetectionGpuThreads, Nvdec: 1),
+            new(Cpu: DetectionCpuThreads),
         ];
 
     public IReadOnlyList<ResourceRequest> VerificationAlternatives => DetectionAlternatives;
@@ -194,7 +204,7 @@ public sealed class Config
 
     public ResourceRequest PreviewRequest        => new(Cpu: PreviewThreads);
     public ResourceRequest SampleEncodeRequest   => new(Cpu: SampleEncodeThreads, Nvenc: 1);
-    public ResourceRequest VmafRequest           => new(Cpu: VmafThreads, Cuda: 1);
+    public ResourceRequest VmafRequest           => new(Cpu: VmafThreads, Nvdec: 1, Cuda: 1);
 
     public ResourceRequest FinalEncodeProgressiveRequest =>
         new(Cpu: FinalEncodeProgressiveThreads, Nvenc: 1, Nvdec: 1);

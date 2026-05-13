@@ -130,10 +130,18 @@ public static class Pipelines
     //  VMAF: compare reference clip vs encoded clip directly.
     //  Both are already progressive with matching cadence/framecount.
     //
-    //  Frames are software-decoded (FFV1 has no NVDEC path; AV1 sample
-    //  is small enough that NVDEC bookkeeping isn't worth a slot),
-    //  uploaded to GPU via hwupload_cuda, then libvmaf_cuda runs the
-    //  perceptual math on CUDA cores.
+    //  Decode split:
+    //    - FFV1 reference  → CPU.  FFV1 has no NVDEC path (and never will;
+    //                        it's a CPU-archival codec).
+    //    - AV1 sample      → NVDEC.  Auto-downloads to system memory in
+    //                        the source's native bit depth so the CPU-side
+    //                        tonemap chain consumes it unchanged.  Costs one
+    //                        extra GPU→CPU DMA per frame (~0.3 ms at 4K on
+    //                        PCIe 5.0) and frees one CPU decode thread.
+    //
+    //  After decode both streams meet on CPU, hit the tonemap chain (HDR
+    //  only), then hwupload_cuda lifts them to the GPU where libvmaf_cuda
+    //  runs the perceptual math on CUDA cores.
     //
     //  HDR caveat: zscale + tonemap stay on CPU.  GPU tonemap routes
     //  (tonemap_cuda, tonemap_opencl, libplacebo) all failed to compose
@@ -142,10 +150,12 @@ public static class Pipelines
     //  space conversion cost stays on CPU and is accounted for via
     //  cfg.VmafFilterThreads.
     //
-    //  CPU accounting: -threads applies per-input decoder (2 inputs × this
-    //  value), and -filter_threads sizes the filtergraph pool.  Total CPU
-    //  consumption = 2 × VmafFfmpegThreads + VmafFilterThreads, which equals
-    //  cfg.VmafThreads (what the ResourcePool reserved).
+    //  CPU accounting: -threads applies per-input decoder.  The FFV1 input
+    //  consumes VmafFfmpegThreads of real CPU; the AV1/NVDEC input's
+    //  -threads only sizes the parser/bsf and is effectively free.
+    //  -filter_threads sizes the filtergraph pool.  Total real CPU =
+    //  1 × VmafFfmpegThreads + VmafFilterThreads = cfg.VmafThreads,
+    //  matching what the ResourcePool reserved.
     //
     //  Bit depth: for SDR, compare at matching bit depth (yuv420p for
     //  8-bit, yuv420p10le for 10-bit) so an 8-bit reference's zero-padded
@@ -204,23 +214,29 @@ public static class Pipelines
             refChain, encChain,
             $"[enc_cuda][ref_cuda]libvmaf_cuda={vmafOpts}");
 
-        // -threads sets the per-input decoder thread count (applied to both
-        // FFV1 ref and AV1 encode inputs).  -filter_threads sizes the
-        // filtergraph engine running zscale/tonemap/format/hwupload.  Total
-        // CPU = 2 × VmafFfmpegThreads + VmafFilterThreads = cfg.VmafThreads,
-        // matching what the ResourcePool reserved.
-        string[] args =
+        // -threads sets the per-input decoder thread count.  For the FFV1
+        // ref it's a real CPU thread count; for the AV1 sample (NVDEC) it
+        // only sizes the parser/bsf and barely consumes CPU.  -hwaccel cuda
+        // -hwaccel_output_format <native> on the AV1 input triggers NVDEC
+        // decode with auto-download to system memory in the source's native
+        // bit depth, so the tonemap chain consumes it unchanged.
+        // -filter_threads sizes the filtergraph engine running zscale /
+        // tonemap / format / hwupload.  Total CPU = 1 × VmafFfmpegThreads
+        // + VmafFilterThreads = cfg.VmafThreads, matching the ResourcePool
+        // reservation.
+        List<string> args =
         [
             "-hide_banner", "-loglevel", "error",
             "-threads", cfg.VmafFfmpegThreads.ToString(CultureInfo.InvariantCulture),
             "-filter_threads", cfg.VmafFilterThreads.ToString(CultureInfo.InvariantCulture),
             "-i", refInput,
+            "-hwaccel", "cuda", "-hwaccel_output_format", format.HwaccelOutputFormat,
             "-i", encInput,
             "-lavfi", filter,
             "-f", "null", "-"
         ];
 
-        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args, ct);
+        (int code, string _, string err) = await ContainerTools.RunFfmpegAsync(args.ToArray(), ct);
         if (code != 0) throw new InvalidOperationException($"vmaf failed: {err}");
     }
 
