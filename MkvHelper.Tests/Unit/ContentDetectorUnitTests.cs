@@ -147,8 +147,8 @@ public class ContentDetectorUnitTests
     public void Classify_ZeroInterlaced_IsProgressive()
     {
         (ContentType type, double conf, string _) = ContentDetector.Classify(
-            intCount: 0, progFrac: 1.0, cadenceRate: 0.0, iInCadence: 0.0,
-            parityMismatch: false);
+            intCount: 0, totalClassified: 24000, progFrac: 1.0, cadenceRate: 0.0,
+            iInCadence: 0.0, parityMismatch: false);
         Assert.That(type, Is.EqualTo(ContentType.Progressive));
         Assert.That(conf, Is.GreaterThan(0.95));
     }
@@ -157,8 +157,8 @@ public class ContentDetectorUnitTests
     public void Classify_AllInterlaced_IsInterlaced()
     {
         (ContentType type, double _, string _) = ContentDetector.Classify(
-            intCount: 5000, progFrac: 0.02, cadenceRate: 0.0, iInCadence: 0.0,
-            parityMismatch: false);
+            intCount: 5000, totalClassified: 5100, progFrac: 0.02, cadenceRate: 0.0,
+            iInCadence: 0.0, parityMismatch: false);
         Assert.That(type, Is.EqualTo(ContentType.Interlaced));
     }
 
@@ -166,8 +166,8 @@ public class ContentDetectorUnitTests
     public void Classify_HighCadence_IsTelecined()
     {
         (ContentType type, double _, string _) = ContentDetector.Classify(
-            intCount: 2000, progFrac: 0.60, cadenceRate: 0.95, iInCadence: 0.95,
-            parityMismatch: false);
+            intCount: 2000, totalClassified: 5000, progFrac: 0.60, cadenceRate: 0.95,
+            iInCadence: 0.95, parityMismatch: false);
         Assert.That(type, Is.EqualTo(ContentType.Telecined));
     }
 
@@ -175,8 +175,8 @@ public class ContentDetectorUnitTests
     public void Classify_IFramesInCadence_IsMixedProgressiveTelecine()
     {
         (ContentType type, double _, string _) = ContentDetector.Classify(
-            intCount: 200, progFrac: 0.85, cadenceRate: 0.50, iInCadence: 0.80,
-            parityMismatch: false);
+            intCount: 200, totalClassified: 1333, progFrac: 0.85, cadenceRate: 0.50,
+            iInCadence: 0.80, parityMismatch: false);
         Assert.That(type, Is.EqualTo(ContentType.MixedProgressiveTelecine));
     }
 
@@ -184,8 +184,8 @@ public class ContentDetectorUnitTests
     public void Classify_LowIInCadenceWithMixedProgInt_IsMixedProgressiveInterlaced()
     {
         (ContentType type, double _, string _) = ContentDetector.Classify(
-            intCount: 1000, progFrac: 0.50, cadenceRate: 0.10, iInCadence: 0.05,
-            parityMismatch: false);
+            intCount: 1000, totalClassified: 2000, progFrac: 0.50, cadenceRate: 0.10,
+            iInCadence: 0.05, parityMismatch: false);
         Assert.That(type, Is.EqualTo(ContentType.MixedProgressiveInterlaced));
     }
 
@@ -193,12 +193,113 @@ public class ContentDetectorUnitTests
     public void Classify_ParityMismatch_LowersConfidence()
     {
         (ContentType _, double withMismatch, string _) = ContentDetector.Classify(
-            intCount: 5000, progFrac: 0.02, cadenceRate: 0.0, iInCadence: 0.0,
-            parityMismatch: true);
+            intCount: 5000, totalClassified: 5100, progFrac: 0.02, cadenceRate: 0.0,
+            iInCadence: 0.0, parityMismatch: true);
         (ContentType _, double withoutMismatch, string _) = ContentDetector.Classify(
-            intCount: 5000, progFrac: 0.02, cadenceRate: 0.0, iInCadence: 0.0,
-            parityMismatch: false);
+            intCount: 5000, totalClassified: 5100, progFrac: 0.02, cadenceRate: 0.0,
+            iInCadence: 0.0, parityMismatch: false);
         Assert.That(withMismatch, Is.LessThan(withoutMismatch));
+    }
+
+    // ===================================================================
+    // §7.2.2.1 idet noise floor: unstructured trace I-frames are absorbed
+    // into Progressive (with reduced confidence) when they fall below
+    // idet's known false-positive rate and carry no cadence or cluster
+    // signal.  Mirrors what a human watcher would dismiss as imperceptible.
+    // ===================================================================
+
+    [Test]
+    public void Classify_TraceInterlacedNoise_AbsorbedIntoProgressive()
+    {
+        // The Prince of Egypt UHD split-006 case: 5 I-frames in 23,690 classified
+        // (0.021%), no cadence, no cluster.  Strictly the guide says "never see
+        // any interlacing", but idet has known false-positive modes the guide
+        // doesn't account for — this is exactly that pattern.
+        (ContentType type, double conf, string reason) = ContentDetector.Classify(
+            intCount: 5, totalClassified: 23690, progFrac: 23685.0 / 23690.0,
+            cadenceRate: 0.0, iInCadence: 0.0, parityMismatch: false);
+        Assert.That(type, Is.EqualTo(ContentType.Progressive));
+        Assert.That(conf, Is.InRange(0.90, 0.96));
+        Assert.That(reason, Does.Contain("noise floor"));
+    }
+
+    [Test]
+    public void Classify_AbsoluteFloorAppliesToShortClips()
+    {
+        // Short clip (<8000 frames): the fractional floor would be <8, so the
+        // absolute floor of 8 governs.  7 I-frames in a 660-frame clip is past
+        // the fractional floor but within the absolute floor.
+        (ContentType type, _, _) = ContentDetector.Classify(
+            intCount: 7, totalClassified: 660, progFrac: 653.0 / 660.0,
+            cadenceRate: 0.0, iInCadence: 0.0, parityMismatch: false);
+        Assert.That(type, Is.EqualTo(ContentType.Progressive));
+    }
+
+    [Test]
+    public void Classify_NoiseFloorRefusesAbsorptionWhenIFramesShowCadence()
+    {
+        // Even a tiny intCount must not be absorbed if those frames sit in 3:2
+        // cycles — that's a telecine signal, not idet noise.  iInCadence above
+        // the noise ceiling forces us past the §7.2.2.1 relaxation branch.
+        (ContentType type, _, _) = ContentDetector.Classify(
+            intCount: 5, totalClassified: 23690, progFrac: 23685.0 / 23690.0,
+            cadenceRate: 0.0, iInCadence: 0.80, parityMismatch: false);
+        Assert.That(type, Is.Not.EqualTo(ContentType.Progressive));
+    }
+
+    [Test]
+    public void Classify_NoiseFloorRefusesAbsorptionWhenCadenceRateNonzero()
+    {
+        (ContentType type, _, _) = ContentDetector.Classify(
+            intCount: 5, totalClassified: 23690, progFrac: 23685.0 / 23690.0,
+            cadenceRate: 0.20, iInCadence: 0.0, parityMismatch: false);
+        Assert.That(type, Is.Not.EqualTo(ContentType.Progressive));
+    }
+
+    // ===================================================================
+    // §7.2.2.5 positive-evidence requirement: trace I-frames past the noise
+    // floor but below the verification threshold default to §7.2.2.4 per
+    // §7.2.3.1 ("Unless you are sure, it is safest to treat the video as
+    // mixed progressive and telecine") and footnote [3].  §7.2.2.5 only
+    // fires when there are enough I-frames for iInCadence to be meaningful.
+    // ===================================================================
+
+    [Test]
+    public void Classify_PastNoiseFloorButBelowVerification_DefaultsToSafeMixed()
+    {
+        // 50 I-frames in 24,000 classified (0.21%) — past the 0.1% noise floor
+        // but below the 0.5% / 100-frame §7.2.2.5 verification threshold.  No
+        // cadence, no clustering signal worth trusting.  Guide's safe default
+        // is §7.2.2.4 (pullup).
+        (ContentType type, double conf, string reason) = ContentDetector.Classify(
+            intCount: 50, totalClassified: 24000, progFrac: 23950.0 / 24000.0,
+            cadenceRate: 0.02, iInCadence: 0.10, parityMismatch: false);
+        Assert.That(type, Is.EqualTo(ContentType.MixedProgressiveTelecine));
+        Assert.That(conf, Is.LessThan(0.75));
+        Assert.That(reason, Does.Contain("§7.2.3.1"));
+    }
+
+    [Test]
+    public void Classify_SubstantialIFramesNoCadence_IsMixedProgressiveInterlaced()
+    {
+        // 500 I-frames clear of the verification threshold, none in cadence —
+        // positive evidence for §7.2.2.5 (genuine interlaced sections).
+        (ContentType type, _, _) = ContentDetector.Classify(
+            intCount: 500, totalClassified: 24000, progFrac: 23500.0 / 24000.0,
+            cadenceRate: 0.02, iInCadence: 0.05, parityMismatch: false);
+        Assert.That(type, Is.EqualTo(ContentType.MixedProgressiveInterlaced));
+    }
+
+    [Test]
+    public void Classify_AbsoluteIFrameFloorTriggersVerification()
+    {
+        // Short clip: 100 I-frames hits the absolute floor (intCount >=
+        // MixedInterlaceMinIFrames) even though it's only ~17% of the file,
+        // which is on the fractional boundary.  Verification fires.
+        (ContentType type, _, _) = ContentDetector.Classify(
+            intCount: 100, totalClassified: 600, progFrac: 500.0 / 600.0,
+            cadenceRate: 0.05, iInCadence: 0.10, parityMismatch: false);
+        Assert.That(type, Is.EqualTo(ContentType.MixedProgressiveInterlaced));
     }
 
     // ===================================================================

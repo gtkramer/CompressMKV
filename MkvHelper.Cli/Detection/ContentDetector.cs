@@ -33,13 +33,48 @@ namespace MkvHelper;
 //
 // Evaluation order (most specific first):
 //
-//   intCount == 0       → §7.2.2.1 Progressive (verified — "you should never
-//                          see any interlacing")
-//   progFrac ≤ 5%       → §7.2.2.3 Interlaced ("every single frame is interlaced")
-//   cadenceRate ≥ 80%   → §7.2.2.2 Telecined  (uniform PPPII pattern)
-//   iInCadence ≥ 60%    → §7.2.2.4 Mixed prog+telecine (the I frames sit inside
-//                          3:2 cycles — guide's verification step)
-//   else                → §7.2.2.5 Mixed prog+interlaced (I frames are clusters)
+//   intCount == 0                          → §7.2.2.1 Progressive (verified —
+//                                              "you should never see any interlacing")
+//   intCount within idet noise floor       → §7.2.2.1 Progressive (absorbed —
+//                                              see "idet noise floor" below)
+//   progFrac ≤ 5%                          → §7.2.2.3 Interlaced ("every single
+//                                              frame is interlaced")
+//   cadenceRate ≥ 80%                      → §7.2.2.2 Telecined (uniform PPPII)
+//   iInCadence ≥ 60%                       → §7.2.2.4 Mixed prog+telecine
+//                                              (I frames sit inside 3:2 cycles)
+//   intCount large enough to verify        → §7.2.2.5 Mixed prog+interlaced
+//                                              (I frames are clusters)
+//   else                                   → §7.2.2.4 Mixed prog+telecine (the
+//                                              guide's §7.2.3.1 safe default for
+//                                              trace I frames without cadence)
+//
+// idet noise floor (§7.2.2.1 relaxation):
+//   The MPlayer guide says "you should never see any interlacing" in a
+//   progressive source — but it was written for human visual inspection
+//   (frame-stepping with the `.` key), not for an automated detector. idet
+//   is a statistical heuristic: it compares inter-line correlation against
+//   fixed thresholds and produces false positives on content with high
+//   vertical frequencies (animation ink lines, scaled UHD detail), on
+//   grain in low-contrast regions, on compression artefacts near row
+//   boundaries, and at scene cuts where its 5-frame context spans
+//   unrelated images. A human watcher would dismiss these as imperceptible;
+//   the strict gate cannot.  We therefore allow a small unstructured-noise
+//   tolerance — capped at ~0.1% of classified frames (min 8) and only when
+//   the trace I-frames carry no cadence/cluster signal — to absorb idet's
+//   known false-positive rate without leaking real signal into Progressive.
+//
+// §7.2.2.5 positive-evidence requirement:
+//   The guide describes §7.2.2.5 as a category you reach by *verification*:
+//   "This category looks just like 'mixed progressive and telecine', until
+//    you examine the 30000/1001 fps sections and see that they do not have
+//    the telecine pattern."  That phrasing requires enough interlaced
+//   content to examine.  Reaching §7.2.2.5 by simple by-elimination on
+//   trace I-frames contradicts both that wording and §7.2.3.1's explicit
+//   "Unless you are sure, it is safest to treat the video as mixed
+//   progressive and telecine" (with footnote [3] reinforcing pullup as
+//   the safe default).  We therefore require positive evidence — enough
+//   I-frames for iInCadence to be statistically informative — before
+//   choosing §7.2.2.5, and fall back to §7.2.2.4 otherwise.
 //
 // Parity (TFF vs BFF):
 //   Strict 90% dominance from idet's interlaced-frame TFF/BFF counts.  When
@@ -77,6 +112,53 @@ public static partial class ContentDetector
     /// minority of frames idet flips.
     /// </summary>
     const double ParityStrictDominance = 0.90;
+
+    // ---- idet noise floor (§7.2.2.1 relaxation) ----
+
+    /// <summary>
+    /// Absolute floor on the number of false-positive I-frames absorbed into
+    /// Progressive.  Anchors the threshold for short clips where the
+    /// fractional floor would be negligible.
+    /// </summary>
+    const int IdetNoiseAbsFloor = 8;
+
+    /// <summary>
+    /// Fractional floor: I-frames counting as idet noise must not exceed this
+    /// share of classified frames.  0.1% is well above idet's published
+    /// false-positive rate on clean progressive content but well below the
+    /// I-frame density of any genuinely mixed source.
+    /// </summary>
+    const double IdetNoiseFracFloor = 0.001;
+
+    /// <summary>
+    /// Cadence-match rate ceiling for the noise-floor branch.  Trace I-frames
+    /// that happen to sit in 3:2 windows are not noise — they are evidence of
+    /// telecine — so we refuse to absorb them.
+    /// </summary>
+    const double IdetNoiseMaxCadenceRate = 0.05;
+
+    /// <summary>
+    /// iInCadence ceiling for the noise-floor branch.  With very few I-frames
+    /// the metric is statistically noisy; this is a safety net against
+    /// absorbing a handful of in-cadence frames.
+    /// </summary>
+    const double IdetNoiseMaxIInCadence = 0.10;
+
+    // ---- §7.2.2.5 positive-evidence thresholds ----
+
+    /// <summary>
+    /// Minimum absolute I-frame count required before iInCadence is considered
+    /// statistically meaningful enough to choose §7.2.2.5 over §7.2.2.4.  At
+    /// 100 I-frames the standard error on a 60% threshold is ~5 percentage
+    /// points — small enough to trust the verdict.
+    /// </summary>
+    const int MixedInterlaceMinIFrames = 100;
+
+    /// <summary>
+    /// Alternative fractional floor: 0.5% interlaced content is well clear of
+    /// idet's noise floor and large enough to verify lack of cadence.
+    /// </summary>
+    const double MixedInterlaceMinIFraction = 0.005;
 
     // ---- Regex for per-frame idet metadata ----
 
@@ -229,7 +311,7 @@ public static partial class ContentDetector
 
         // ---- Classify ----
         (ContentType contentType, double confidence, string reason) = Classify(
-            intCount, progFrac, cadenceRate, iInCadence, parityMismatch);
+            intCount, classified, progFrac, cadenceRate, iInCadence, parityMismatch);
 
         logger.LogInfo($"Detection complete: {contentType} (confidence={confidence:P0})");
         logger.LogInfo(
@@ -398,16 +480,37 @@ public static partial class ContentDetector
     // Order matters: each branch is the strictest qualifier for that category.
     // -------------------------------------------------------------------
     internal static (ContentType Type, double Confidence, string Reason) Classify(
-        int intCount, double progFrac, double cadenceRate, double iInCadence, bool parityMismatch)
+        int intCount, int totalClassified, double progFrac, double cadenceRate, double iInCadence,
+        bool parityMismatch)
     {
         double Penalize(double c) => parityMismatch ? Math.Max(0.20, c - 0.10) : c;
 
-        // §7.2.2.1: Progressive (verified).  Strict — only when zero interlaced frames.
-        // Per guide footnote [3], anything else gets the safe IVTC chain.
+        // §7.2.2.1 (strict): zero interlaced frames — verified pure progressive,
+        // matching the guide's literal "you should never see any interlacing."
         if (intCount == 0)
         {
             return (ContentType.Progressive, Penalize(0.99),
                 "Progressive (§7.2.2.1): zero interlaced frames — verified pure progressive.");
+        }
+
+        // §7.2.2.1 (noise-floor relaxation): the guide's strict wording was
+        // written for human visual inspection, which is immune to idet's known
+        // false-positive modes (high-frequency vertical detail, grain in
+        // low-contrast regions, compression artefacts, scene cuts).  Absorb a
+        // bounded amount of unstructured trace I-frames into Progressive — but
+        // only when they carry no cadence or cluster signal, so we never mask
+        // genuine §7.2.2.2/4/5 content.
+        int noiseCap = Math.Max(IdetNoiseAbsFloor,
+            (int)Math.Round(IdetNoiseFracFloor * totalClassified));
+        if (intCount <= noiseCap &&
+            cadenceRate < IdetNoiseMaxCadenceRate &&
+            iInCadence  < IdetNoiseMaxIInCadence)
+        {
+            return (ContentType.Progressive, Penalize(0.95),
+                $"Progressive (§7.2.2.1, idet noise floor): {intCount:N0} interlaced frame(s) " +
+                $"in {totalClassified:N0} classified ({1.0 - progFrac:P3}) — within idet's " +
+                $"false-positive floor ({noiseCap:N0}), no cadence (rate={cadenceRate:P2}) " +
+                $"or cluster signal (iInCadence={iInCadence:P1}).");
         }
 
         // §7.2.2.3: Interlaced.  "Every single frame is interlaced."
@@ -431,10 +534,9 @@ public static partial class ContentDetector
         // Implements the guide's explicit verification step:
         //   "You should check the '30000/1001 fps NTSC' sections to make sure they
         //    are actually telecine, and not just interlaced."
-        // Footnote [3]'s "safe pullup default for mostly-progressive content" is NOT
-        // implemented here — it lives in RestoreStrategyMapper, which gates on source
-        // fps so that non-NTSC-thirty sources (24p Blu-rays, 25p PAL, 60p sports)
-        // aren't pushed through a 24000/1001-pinning IVTC chain.
+        // The §7.2.3 mapper gates the IVTC chain on source fps so that non-NTSC-thirty
+        // sources (24p Blu-rays, 25p PAL, 60p sports) aren't pushed through a
+        // 24000/1001-pinning IVTC chain even when this branch fires.
         if (iInCadence >= TelecineIRatioMin)
         {
             double conf = Math.Clamp(0.60 + iInCadence * 0.3, 0.55, 0.90);
@@ -444,6 +546,17 @@ public static partial class ContentDetector
         }
 
         // §7.2.2.5: I frames are clustered (not in cadence) → genuine interlace mixed in.
+        // The guide treats this category as a verification step on top of §7.2.2.4
+        // ("looks just like §7.2.2.4, until you examine the 30000/1001 fps sections
+        // and see that they do not have the telecine pattern").  That examination
+        // is only meaningful with enough I-frames for iInCadence to be statistically
+        // informative — below the threshold the verdict is dominated by sampling
+        // noise.  Require positive evidence; otherwise fall through to §7.2.2.4.
+        bool enoughIFramesToVerify =
+            intCount >= MixedInterlaceMinIFrames ||
+            (totalClassified > 0 && intCount >= MixedInterlaceMinIFraction * totalClassified);
+
+        if (enoughIFramesToVerify)
         {
             // Confidence dips toward the §7.2.2.4 boundary (iInCadence ≈ 0.60).
             double margin = TelecineIRatioMin - iInCadence;
@@ -451,6 +564,22 @@ public static partial class ContentDetector
             return (ContentType.MixedProgressiveInterlaced, Penalize(conf),
                 $"Mixed progressive+interlaced (§7.2.2.5): only {iInCadence:P1} of interlaced " +
                 $"frames are in 3:2 cycles, progFrac = {progFrac:P2}, cadence = {cadenceRate:P2}.");
+        }
+
+        // Trace I-frames past the noise floor but below §7.2.2.5's positive-evidence
+        // threshold: per §7.2.3.1, "Unless you are sure, it is safest to treat the
+        // video as mixed progressive and telecine."  Footnote [3] reinforces this —
+        // pullup is the conservative default unless the source is definitively
+        // verified to be entirely progressive.  Confidence is modest because we are
+        // explicitly in the guide's "not sure" regime.
+        {
+            double conf = Math.Clamp(0.55 + progFrac * 0.15, 0.50, 0.70);
+            return (ContentType.MixedProgressiveTelecine, Penalize(conf),
+                $"Mixed progressive+telecine (§7.2.2.4, §7.2.3.1 safe default): " +
+                $"{intCount:N0} interlaced frame(s) in {totalClassified:N0} classified " +
+                $"({1.0 - progFrac:P3}) — past idet noise floor but below §7.2.2.5 " +
+                $"verification threshold (iInCadence={iInCadence:P1}, cadence={cadenceRate:P2}). " +
+                "Defaulting to pullup per §7.2.3.1.");
         }
     }
 
